@@ -6,9 +6,10 @@
 
 #include <algorithm>
 #include <array>
-#include <charconv>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <limits>
@@ -35,9 +36,11 @@ void printUsage() {
 }
 
 [[nodiscard]] float parseFloat(const std::string_view text) {
-  float value = 0.0f;
-  const auto result = std::from_chars(text.data(), text.data() + text.size(), value);
-  if (result.ec != std::errc{} || result.ptr != text.data() + text.size()) {
+  const std::string source(text);
+  char *end = nullptr;
+  errno = 0;
+  const float value = std::strtof(source.c_str(), &end);
+  if (end == source.c_str() || end != source.c_str() + source.size() || errno == ERANGE) {
     throw std::runtime_error("Invalid floating-point value: " + std::string(text));
   }
   return value;

@@ -39,7 +39,7 @@ struct PluginState {
   bool enabled = true;
   std::uint8_t inputBus = 0;
   std::uint8_t outputBus = 0;
-  std::optional<std::string> channel;
+  std::optional<std::string> channel = std::nullopt;
   std::string parametersJson = "{}";
   bool unknown = false;
   std::string extraJson = "{}";
