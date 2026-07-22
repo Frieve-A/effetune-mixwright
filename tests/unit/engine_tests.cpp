@@ -229,88 +229,79 @@ void testConfigStore() {
 
 void testBlockAdapter() {
   BlockAdapter adapter;
-  adapter.prepare(1, 32);
-  std::array<float, 32> input{};
-  std::array<float, 32> output{};
-  std::vector<float> stream;
-  stream.reserve(256);
-  float next = 1.0f;
-
-  for (int block = 0; block < 8; ++block) {
-    for (auto &sample : input) {
-      sample = next++;
-    }
-    const float *inputs[] = {input.data()};
-    float *outputs[] = {output.data()};
-    const auto ok = adapter.process(
-        inputs, outputs, 32,
-        [](float *const *channels, const std::uint32_t channelCount,
-           const std::uint32_t frames) {
-          for (std::uint32_t channel = 0; channel < channelCount; ++channel) {
-            for (std::uint32_t frame = 0; frame < frames; ++frame) {
-              channels[channel][frame] *= 2.0f;
-            }
+  adapter.prepare(1, 4);
+  std::array<float, 4> input{1.0f, 2.0f, 3.0f, 4.0f};
+  std::array<float, 4> output{};
+  const float *inputs[] = {input.data()};
+  float *outputs[] = {output.data()};
+  std::uint32_t receivedFrames = 0;
+  const auto ok = adapter.process(
+      inputs, outputs, 4,
+      [&receivedFrames](float *const *channels, const std::uint32_t channelCount,
+                        const std::uint32_t frames) {
+        receivedFrames = frames;
+        for (std::uint32_t channel = 0; channel < channelCount; ++channel) {
+          for (std::uint32_t frame = 0; frame < frames; ++frame) {
+            channels[channel][frame] *= 2.0f;
           }
-          return true;
-        });
-    expect(ok, "block adapter processing");
-    stream.insert(stream.end(), output.begin(), output.end());
-  }
-  for (std::size_t index = 0; index < 128; ++index) {
-    expect(stream[index] == 0.0f, "block adapter fixed quantum delay");
-  }
-  for (std::size_t index = 128; index < stream.size(); ++index) {
-    const auto expected = static_cast<float>((index - 128u) + 1u) * 2.0f;
-    expect(stream[index] == expected, "block adapter sample continuity");
-  }
+        }
+        return true;
+      });
+  expect(ok && receivedFrames == 4, "sub-128 host block is processed at its original size");
+  expect(output == std::array<float, 4>{2.0f, 4.0f, 6.0f, 8.0f},
+         "sub-128 host block returns without adapter delay");
+  expect(adapter.latencyFrames() == 0, "direct block adapter has no latency");
 
   BlockAdapter failed;
-  failed.prepare(1, BlockAdapter::kQuantumFrames);
-  std::array<float, BlockAdapter::kQuantumFrames> failedInput{};
-  std::array<float, BlockAdapter::kQuantumFrames> failedOutput{};
+  failed.prepare(1, BlockAdapter::kMaxChunkFrames);
+  std::array<float, BlockAdapter::kMaxChunkFrames> failedInput{};
+  std::array<float, BlockAdapter::kMaxChunkFrames> failedOutput{};
   const float *failedInputs[] = {failedInput.data()};
   float *failedOutputs[] = {failedOutput.data()};
-  expect(!failed.process(failedInputs, failedOutputs, BlockAdapter::kQuantumFrames,
+  expect(!failed.process(failedInputs, failedOutputs, BlockAdapter::kMaxChunkFrames,
                          [](float *const *, std::uint32_t, std::uint32_t) { return false; }),
-         "block adapter propagates a failed DSP quantum");
+         "block adapter propagates a failed DSP chunk");
 }
 
 void testBlockSizeMatrix() {
-  constexpr std::array blockSizes{32u, 64u, 127u, 128u, 255u, 512u, 4096u};
+  constexpr std::array blockSizes{1u, 4u, 32u, 64u, 127u, 128u, 255u, 512u, 4096u};
   for (const auto blockSize : blockSizes) {
     BlockAdapter adapter;
     adapter.prepare(1, blockSize);
-    const auto blocks = std::max(3u, (8192u + blockSize - 1u) / blockSize);
     std::vector<float> input(blockSize);
     std::vector<float> output(blockSize);
-    std::vector<float> stream;
-    stream.reserve(static_cast<std::size_t>(blocks) * blockSize);
-    float next = 1.0f;
-    for (std::uint32_t block = 0; block < blocks; ++block) {
-      for (auto &sample : input) sample = next++;
-      const float *inputs[] = {input.data()};
-      float *outputs[] = {output.data()};
-      expect(adapter.process(
-                 inputs, outputs, blockSize,
-                 [](float *const *channels, const std::uint32_t channelCount,
-                    const std::uint32_t frames) {
-                   for (std::uint32_t channel = 0; channel < channelCount; ++channel) {
-                     for (std::uint32_t frame = 0; frame < frames; ++frame) {
-                       channels[channel][frame] *= 2.0f;
-                     }
-                   }
-                   return true;
-                 }),
-             "block-size matrix processing");
-      stream.insert(stream.end(), output.begin(), output.end());
+    for (std::uint32_t frame = 0; frame < blockSize; ++frame) {
+      input[frame] = static_cast<float>(frame + 1u);
     }
-    for (std::size_t index = 0; index < stream.size(); ++index) {
-      const auto expected = index < BlockAdapter::kQuantumFrames
-                                ? 0.0f
-                                : static_cast<float>(index - BlockAdapter::kQuantumFrames + 1u) *
-                                      2.0f;
-      expect(stream[index] == expected,
-             "block-size independent output for " + std::to_string(blockSize));
+    const float *inputs[] = {input.data()};
+    float *outputs[] = {output.data()};
+    std::vector<std::uint32_t> chunks;
+    expect(adapter.process(
+               inputs, outputs, blockSize,
+               [&chunks](float *const *channels, const std::uint32_t channelCount,
+                         const std::uint32_t frames) {
+                 chunks.push_back(frames);
+                 for (std::uint32_t channel = 0; channel < channelCount; ++channel) {
+                   for (std::uint32_t frame = 0; frame < frames; ++frame) {
+                     channels[channel][frame] *= 2.0f;
+                   }
+                 }
+                 return true;
+               }),
+           "block-size matrix processing");
+    for (std::uint32_t frame = 0; frame < blockSize; ++frame) {
+      expect(output[frame] == static_cast<float>(frame + 1u) * 2.0f,
+             "block-size matrix immediate output for " + std::to_string(blockSize));
+    }
+    expect(chunks.size() ==
+               (blockSize + BlockAdapter::kMaxChunkFrames - 1u) /
+                   BlockAdapter::kMaxChunkFrames,
+           "block-size matrix chunk count for " + std::to_string(blockSize));
+    for (std::size_t chunk = 0; chunk < chunks.size(); ++chunk) {
+      const auto offset = static_cast<std::uint32_t>(chunk) * BlockAdapter::kMaxChunkFrames;
+      expect(chunks[chunk] ==
+                 std::min(BlockAdapter::kMaxChunkFrames, blockSize - offset),
+             "block-size matrix chunk length for " + std::to_string(blockSize));
     }
   }
 }
@@ -324,7 +315,7 @@ void testLatency() {
   const auto latency = aggregatePipelineLatency(
       pipeline, [](const std::uint32_t id) { return id == 1 ? 10u : (id == 2 ? 20u : 5u); });
   expect(latency == 35u, "bus latency aggregation");
-  expect(calculateTotalLatency(63, 128, 2, 35) == 145u, "host latency conversion");
+  expect(calculateTotalLatency(63, 2, 35) == 81u, "host latency conversion");
 }
 
 void testStateCodec() {
@@ -673,18 +664,31 @@ void testEngineHost() {
   expect(engine.rebuild(pipeline, {runtime}, &error),
          "engine rebuild after duplicate logical IDs: " + error);
 
-  std::array<float, EngineHost::kQuantumFrames> left{};
-  std::array<float, EngineHost::kQuantumFrames> right{};
+  std::array<float, EngineHost::kMaxProcessFrames> left{};
+  std::array<float, EngineHost::kMaxProcessFrames> right{};
   left.fill(1.0f);
   right.fill(-1.0f);
   float *channels[] = {left.data(), right.data()};
-  expect(engine.tryProcessQuantum(channels, 2, EngineHost::kQuantumFrames, 0.0, false),
+  expect(engine.tryProcessBlock(channels, 2, EngineHost::kMaxProcessFrames, 0.0, false),
          "engine process");
   for (std::size_t index = 0; index < left.size(); ++index) {
     expect(std::abs(left[index] - 0.5f) < 1.0e-7f &&
                std::abs(right[index] + 0.5f) < 1.0e-7f,
            "native DSP gain output");
   }
+
+  std::array<float, 4> smallLeft{2.0f, 2.0f, 2.0f, 2.0f};
+  std::array<float, 4> smallRight{-2.0f, -2.0f, -2.0f, -2.0f};
+  float *smallChannels[] = {smallLeft.data(), smallRight.data()};
+  expect(engine.tryProcessBlock(smallChannels, 2, 4, 0.1, false),
+         "engine accepts a four-frame host block");
+  expect(smallLeft == std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f} &&
+             smallRight == std::array<float, 4>{-1.0f, -1.0f, -1.0f, -1.0f},
+         "engine processes a four-frame host block immediately");
+  expect(!engine.tryProcessBlock(channels, 2, 0, 0.2, false) &&
+             !engine.tryProcessBlock(channels, 2, EngineHost::kMaxProcessFrames + 1u,
+                                     0.2, false),
+         "engine enforces the variable process-frame bounds");
 
   pipeline.plugins[0].enabled = false;
   AudioCommand descriptorCommand;
@@ -695,8 +699,8 @@ void testEngineHost() {
   expect(descriptorQueue.push(descriptorCommand), "enqueue section disable descriptor");
   left.fill(1.0f);
   right.fill(-1.0f);
-  expect(engine.tryProcessQuantum(channels, 2, EngineHost::kQuantumFrames, 0.0, true,
-                                  &descriptorQueue),
+  expect(engine.tryProcessBlock(channels, 2, EngineHost::kMaxProcessFrames, 0.0, true,
+                                &descriptorQueue),
          "disabled section command under master bypass");
   expect(left[0] == 1.0f && right[0] == -1.0f,
          "descriptor command preserves master-bypassed audio");
@@ -707,8 +711,8 @@ void testEngineHost() {
   expect(descriptorQueue.push(descriptorCommand), "enqueue section enable descriptor");
   left.fill(1.0f);
   right.fill(-1.0f);
-  expect(engine.tryProcessQuantum(channels, 2, EngineHost::kQuantumFrames, 0.0, false,
-                                  &descriptorQueue),
+  expect(engine.tryProcessBlock(channels, 2, EngineHost::kMaxProcessFrames, 0.0, false,
+                                &descriptorQueue),
          "re-enabled section command");
   expect(std::abs(left[0] - 0.5f) < 1.0e-7f,
          "queued section toggle preserves the native instance");
@@ -717,7 +721,7 @@ void testEngineHost() {
   expect(engine.updateDescriptor(pipeline, &error), "direct descriptor update: " + error);
   left.fill(1.0f);
   right.fill(-1.0f);
-  expect(engine.tryProcessQuantum(channels, 2, EngineHost::kQuantumFrames, 0.0, false),
+  expect(engine.tryProcessBlock(channels, 2, EngineHost::kMaxProcessFrames, 0.0, false),
          "direct disabled section process");
   expect(left[0] == 1.0f && right[0] == -1.0f,
          "direct descriptor update remains available off the audio path");
@@ -772,8 +776,8 @@ void testEngineAssetTransferAndReplay() {
   expect((engine.assetState(91, 0) & 0xffu) == ET_ASSET_STATE_PREPARING,
          "IR reverb asset enters preparing state");
 
-  std::array<float, EngineHost::kQuantumFrames> left{};
-  std::array<float, EngineHost::kQuantumFrames> right{};
+  std::array<float, EngineHost::kMaxProcessFrames> left{};
+  std::array<float, EngineHost::kMaxProcessFrames> right{};
   float *channels[] = {left.data(), right.data()};
   const auto prepareAsset = [](EngineHost &target, float *const *targetChannels,
                                const char *context) {
@@ -781,8 +785,8 @@ void testEngineAssetTransferAndReplay() {
     for (; quantum < 128u &&
            (target.assetState(91, 0) & 0xffu) == ET_ASSET_STATE_PREPARING;
          ++quantum) {
-      expect(target.tryProcessQuantum(targetChannels, 2, EngineHost::kQuantumFrames,
-                                      static_cast<double>(quantum) / 375.0, false),
+      expect(target.tryProcessBlock(targetChannels, 2, EngineHost::kMaxProcessFrames,
+                                    static_cast<double>(quantum) / 375.0, false),
              context);
     }
     expect((target.assetState(91, 0) & 0xffu) == ET_ASSET_STATE_ACTIVE, context);
@@ -801,8 +805,8 @@ void testEngineAssetTransferAndReplay() {
     if (quantum == 0u) {
       left[0] = 1.0f;
     }
-    expect(engine.tryProcessQuantum(channels, 2, EngineHost::kQuantumFrames,
-                                    static_cast<double>(quantum) / 375.0, false),
+    expect(engine.tryProcessBlock(channels, 2, EngineHost::kMaxProcessFrames,
+                                  static_cast<double>(quantum) / 375.0, false),
            "preserved IR reverb process");
     wetPeak = std::max(wetPeak, *std::max_element(left.begin(), left.end()));
   }
@@ -837,15 +841,15 @@ void testRuntimeLatencyAndTelemetryPublication() {
          "variable-latency engine rebuild: " + error);
   expect(engine.pipelineLatency() == 144u, "initial limiter lookahead latency");
 
-  std::array<float, EngineHost::kQuantumFrames> left{};
-  std::array<float, EngineHost::kQuantumFrames> right{};
+  std::array<float, EngineHost::kMaxProcessFrames> left{};
+  std::array<float, EngineHost::kMaxProcessFrames> right{};
   float *channels[] = {left.data(), right.data()};
   std::vector<std::uint8_t> telemetry(EngineHost::kDefaultTelemetryBytes);
   std::uint32_t droppedFrames = 0;
   std::uint32_t telemetryBytes = 0;
   for (std::uint32_t quantum = 0; quantum < 8 && telemetryBytes == 0; ++quantum) {
-    expect(engine.tryProcessQuantum(channels, 2, EngineHost::kQuantumFrames,
-                                    static_cast<double>(quantum) / 375.0, false),
+    expect(engine.tryProcessBlock(channels, 2, EngineHost::kMaxProcessFrames,
+                                  static_cast<double>(quantum) / 375.0, false),
            "limiter telemetry process");
     telemetryBytes = engine.readTelemetry(telemetry, droppedFrames);
   }
@@ -856,8 +860,8 @@ void testRuntimeLatencyAndTelemetryPublication() {
                                (static_cast<std::uint32_t>(telemetry[10]) << 16u) |
                                (static_cast<std::uint32_t>(telemetry[11]) << 24u);
   for (std::uint32_t quantum = 8; quantum < 32; ++quantum) {
-    expect(engine.tryProcessQuantum(channels, 2, EngineHost::kQuantumFrames,
-                                    static_cast<double>(quantum) / 375.0, false),
+    expect(engine.tryProcessBlock(channels, 2, EngineHost::kMaxProcessFrames,
+                                  static_cast<double>(quantum) / 375.0, false),
            "queued telemetry process");
   }
   telemetryBytes = engine.readTelemetry(telemetry, droppedFrames);
@@ -870,14 +874,14 @@ void testRuntimeLatencyAndTelemetryPublication() {
   expect(droppedFrames > 0, "skipped telemetry frame count is carried to the delivery");
 
   for (std::uint32_t quantum = 32; quantum < 48; ++quantum) {
-    expect(engine.tryProcessQuantum(channels, 2, EngineHost::kQuantumFrames,
-                                    static_cast<double>(quantum) / 375.0, false),
+    expect(engine.tryProcessBlock(channels, 2, EngineHost::kMaxProcessFrames,
+                                  static_cast<double>(quantum) / 375.0, false),
            "hidden telemetry process");
   }
   engine.discardTelemetry();
   for (std::uint32_t quantum = 48; quantum < 56; ++quantum) {
-    expect(engine.tryProcessQuantum(channels, 2, EngineHost::kQuantumFrames,
-                                    static_cast<double>(quantum) / 375.0, false),
+    expect(engine.tryProcessBlock(channels, 2, EngineHost::kMaxProcessFrames,
+                                  static_cast<double>(quantum) / 375.0, false),
            "resumed telemetry process");
   }
   telemetryBytes = engine.readTelemetry(telemetry, droppedFrames);
@@ -894,7 +898,7 @@ void testRuntimeLatencyAndTelemetryPublication() {
   AudioCommandQueue queue;
   expect(queue.push(command), "enqueue variable-latency parameter update");
   const auto previousRevision = engine.latencyRevision();
-  expect(engine.tryProcessQuantum(channels, 2, EngineHost::kQuantumFrames, 1.0, false, &queue),
+  expect(engine.tryProcessBlock(channels, 2, EngineHost::kMaxProcessFrames, 1.0, false, &queue),
          "apply variable-latency parameter update");
   expect(engine.pipelineLatency() == 480u, "updated limiter lookahead latency");
   expect(engine.latencyRevision() > previousRevision,
@@ -906,7 +910,7 @@ void testRuntimeLatencyAndTelemetryPublication() {
          "limiter bypass descriptor command: " + error);
   expect(queue.push(command), "enqueue limiter bypass descriptor");
   const auto enabledRevision = engine.latencyRevision();
-  expect(engine.tryProcessQuantum(channels, 2, EngineHost::kQuantumFrames, 1.1, false, &queue),
+  expect(engine.tryProcessBlock(channels, 2, EngineHost::kMaxProcessFrames, 1.1, false, &queue),
          "apply limiter bypass descriptor");
   expect(engine.pipelineLatency() == 0u && engine.latencyRevision() > enabledRevision,
          "queued descriptor publishes bypassed pipeline latency");
@@ -932,9 +936,9 @@ void testMasterBypassLatencyAlignment() {
          "master-bypass alignment engine rebuild: " + error);
   expect(engine.pipelineLatency() == 480u, "master-bypass limiter latency");
 
-  constexpr std::uint32_t blockFrames = EngineHost::kQuantumFrames;
-  const auto reportedLatency = calculateTotalLatency(0, blockFrames, 1, engine.pipelineLatency());
-  expect(reportedLatency == 608u, "master-bypass reported total latency");
+  constexpr std::uint32_t blockFrames = EngineHost::kMaxProcessFrames;
+  const auto reportedLatency = calculateTotalLatency(0, 1, engine.pipelineLatency());
+  expect(reportedLatency == 480u, "master-bypass reported total latency");
 
   BlockAdapter adapter;
   adapter.prepare(2, blockFrames);
@@ -962,7 +966,7 @@ void testMasterBypassLatencyAlignment() {
                [&engine, &processedFrames](float *const *channels,
                                            const std::uint32_t channelCount,
                                            const std::uint32_t frames) {
-                 const auto ok = engine.tryProcessQuantum(
+                 const auto ok = engine.tryProcessBlock(
                      channels, channelCount, frames,
                      static_cast<double>(processedFrames) / 48000.0, false);
                  processedFrames += frames;
@@ -988,7 +992,7 @@ void testMasterBypassLatencyAlignment() {
   expect(std::abs(processed[reportedLatency]) > 1.0e-6f && activePeak == reportedLatency,
          "active limiter impulse peak matches reported latency (peak=" +
              std::to_string(activePeak) + ", sample128=" +
-             std::to_string(processed[blockFrames]) + ", sample608=" +
+             std::to_string(processed[blockFrames]) + ", reported=" +
              std::to_string(processed[reportedLatency]) + ")");
   expect(std::abs(bypassed[reportedLatency] - 0.5f) < 1.0e-7f &&
              bypassPeak == reportedLatency,

@@ -84,6 +84,16 @@ if(TARGET effetune_plugin_bundle_assets)
             "${CMAKE_BINARY_DIR}/VST3/$<CONFIG>/${EFFETUNE_PLUGIN_PACKAGE_NAME}.vst3/Contents/Resources/webview")
 endif()
 
+if(APPLE AND TARGET effetune_plugin)
+  add_test(NAME effetune_macos_bundle_info
+    COMMAND "${CMAKE_COMMAND}"
+            "-DBUNDLE_PATH=$<TARGET_BUNDLE_DIR:effetune_plugin>"
+            "-DEXPECTED_EXECUTABLE=${EFFETUNE_PLUGIN_PACKAGE_NAME}"
+            "-DEXPECTED_IDENTIFIER=com.frieve.effetune.plugin"
+            "-DEXPECTED_VERSION=${PROJECT_VERSION}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/verify_macos_bundle_info.cmake")
+endif()
+
 if(WIN32 AND TARGET validator AND TARGET effetune_plugin)
   add_test(NAME effetune_vst3_validator
     COMMAND $<TARGET_FILE:validator>

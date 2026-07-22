@@ -46,7 +46,7 @@ struct SmokeState {
     return "{\"ok\":true,\"sampleRate\":48000,\"engineSampleRate\":" +
            std::to_string(state.engineSampleRate.load(std::memory_order_relaxed)) +
            ",\"channels\":" + std::to_string(state.channels.load(std::memory_order_relaxed)) +
-           ",\"oversamplingFactor\":1,\"latencySamples\":128,\"masterBypass\":false,"
+           ",\"oversamplingFactor\":1,\"latencySamples\":0,\"masterBypass\":false,"
            "\"dspReady\":true,"
            "\"contextGeneration\":" +
            std::to_string(state.contextGeneration.load(std::memory_order_relaxed)) +

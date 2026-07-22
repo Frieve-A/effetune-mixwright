@@ -148,7 +148,7 @@ bool EngineHost::prepare(const double sampleRate, const std::uint32_t channels,
   std::scoped_lock lock(engineMutex_);
   clearInstancesUnlocked();
   const auto status =
-      engine_->prepare(static_cast<float>(sampleRate), channels, kQuantumFrames, telemetryBytes);
+      engine_->prepare(static_cast<float>(sampleRate), channels, kMaxProcessFrames, telemetryBytes);
   if (status != ET_OK) {
     prepared_ = false;
     setError(error, "et_engine_prepare failed with status " + std::to_string(status));
@@ -575,21 +575,21 @@ bool EngineHost::applyCommandUnlocked(const AudioCommand &command) noexcept {
   return false;
 }
 
-bool EngineHost::tryProcessQuantum(float *const *channels, const std::uint32_t channelCount,
-                                   const std::uint32_t frameCount, const double timeSeconds,
-                                   const bool masterBypass,
-                                   AudioCommandQueue *commands) noexcept {
-  return tryProcessQuantum(channels, channelCount, frameCount, timeSeconds, masterBypass,
-                           commands, nullptr);
+bool EngineHost::tryProcessBlock(float *const *channels, const std::uint32_t channelCount,
+                                 const std::uint32_t frameCount, const double timeSeconds,
+                                 const bool masterBypass,
+                                 AudioCommandQueue *commands) noexcept {
+  return tryProcessBlock(channels, channelCount, frameCount, timeSeconds, masterBypass,
+                         commands, nullptr);
 }
 
-bool EngineHost::tryProcessQuantum(float *const *channels, const std::uint32_t channelCount,
-                                   const std::uint32_t frameCount, const double timeSeconds,
-                                   const bool masterBypass,
-                                   AudioCommandQueue *commands,
-                                   LatestParameterMailbox *parameterMailbox) noexcept {
+bool EngineHost::tryProcessBlock(float *const *channels, const std::uint32_t channelCount,
+                                 const std::uint32_t frameCount, const double timeSeconds,
+                                 const bool masterBypass,
+                                 AudioCommandQueue *commands,
+                                 LatestParameterMailbox *parameterMailbox) noexcept {
   if (channels == nullptr || channelCount == 0 || channelCount > channels_ ||
-      frameCount != kQuantumFrames || !std::isfinite(timeSeconds)) {
+      frameCount == 0 || frameCount > kMaxProcessFrames || !std::isfinite(timeSeconds)) {
     return false;
   }
   std::unique_lock lock(engineMutex_, std::try_to_lock);

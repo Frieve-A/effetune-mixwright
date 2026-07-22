@@ -159,8 +159,7 @@ bool EffeTuneProcessor::configureDsp(std::string *error, const bool waitForUiRep
     }
     const auto resamplerLatency = oversampler_.latencyHostFrames();
     const auto totalLatency = calculateTotalLatency(
-        resamplerLatency, EngineHost::kQuantumFrames, snapshot.oversampling.factor,
-        engine_.pipelineLatency());
+        resamplerLatency, snapshot.oversampling.factor, engine_.pipelineLatency());
     if (!dryDelay_.prepare(static_cast<std::uint32_t>(configuredChannels),
                            static_cast<std::uint32_t>(maxHostFrames), totalLatency)) {
       if (error != nullptr) {
@@ -427,7 +426,7 @@ tresult PLUGIN_API EffeTuneProcessor::process(ProcessData &data) {
              const std::uint32_t frames) noexcept {
         const auto time = engineFramesProcessed_ /
                           (hostSampleRate * static_cast<double>(oversamplingFactor));
-        const auto result = engine_.tryProcessQuantum(
+        const auto result = engine_.tryProcessBlock(
             channels, channelCount, frames, time,
             masterBypass, &commandQueue_, &parameterMailbox_);
         engineFramesProcessed_ += frames;
@@ -504,7 +503,7 @@ void EffeTuneProcessor::queueLatencyNotification(const bool restartDebounce) {
 
 bool EffeTuneProcessor::synchronizeLatencyLocked(bool &latencyChanged) {
   const auto next = calculateTotalLatency(
-      resamplerLatencySamples_.load(std::memory_order_acquire), EngineHost::kQuantumFrames,
+      resamplerLatencySamples_.load(std::memory_order_acquire),
       activeOversamplingFactor_.load(std::memory_order_acquire), engine_.pipelineLatency());
   const auto previous = latencySamples_.load(std::memory_order_acquire);
   if (previous != next && !dryDelay_.setDelay(next)) {

@@ -55,7 +55,7 @@ struct RuntimeAsset {
 class EngineHost {
 public:
   static constexpr std::uint32_t kMaxChannels = 8;
-  static constexpr std::uint32_t kQuantumFrames = 128;
+  static constexpr std::uint32_t kMaxProcessFrames = 128;
   static constexpr std::uint32_t kDefaultTelemetryBytes = 256u * 1024u;
   static constexpr std::uint32_t kMaximumAssetPayloadBytes = 32u * 1024u * 1024u;
   static constexpr std::uint32_t kAggregateAssetBudgetBytes = 128u * 1024u * 1024u;
@@ -88,14 +88,14 @@ public:
                                          std::uint32_t slot) const;
   void retainAssets(std::span<const std::uint32_t> logicalIds);
 
-  [[nodiscard]] bool tryProcessQuantum(float *const *channels, std::uint32_t channelCount,
-                                       std::uint32_t frameCount, double timeSeconds,
-                                       bool masterBypass,
-                                       AudioCommandQueue *commands = nullptr) noexcept;
-  [[nodiscard]] bool tryProcessQuantum(float *const *channels, std::uint32_t channelCount,
-                                       std::uint32_t frameCount, double timeSeconds,
-                                       bool masterBypass, AudioCommandQueue *commands,
-                                       LatestParameterMailbox *parameterMailbox) noexcept;
+  [[nodiscard]] bool tryProcessBlock(float *const *channels, std::uint32_t channelCount,
+                                     std::uint32_t frameCount, double timeSeconds,
+                                     bool masterBypass,
+                                     AudioCommandQueue *commands = nullptr) noexcept;
+  [[nodiscard]] bool tryProcessBlock(float *const *channels, std::uint32_t channelCount,
+                                     std::uint32_t frameCount, double timeSeconds,
+                                     bool masterBypass, AudioCommandQueue *commands,
+                                     LatestParameterMailbox *parameterMailbox) noexcept;
 
   [[nodiscard]] std::uint32_t pipelineLatency() const;
   [[nodiscard]] std::uint32_t readTelemetry(std::span<std::uint8_t> destination,

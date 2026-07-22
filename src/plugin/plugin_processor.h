@@ -127,7 +127,7 @@ private:
   double engineFramesProcessed_ = 0.0;
   std::atomic<Steinberg::int32> maxHostFrames_{0};
   std::atomic<Steinberg::int32> configuredChannels_{2};
-  std::atomic<Steinberg::uint32> latencySamples_{EngineHost::kQuantumFrames};
+  std::atomic<Steinberg::uint32> latencySamples_{0};
   std::atomic<std::uint32_t> resamplerLatencySamples_{0};
   std::atomic<std::uint32_t> activeOversamplingFactor_{1};
   std::atomic<std::uint64_t> contextSequence_{0};

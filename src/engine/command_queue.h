@@ -62,7 +62,7 @@ private:
 #endif
 
 // Descriptor commands carry logical plug-in IDs. EngineHost resolves them to the
-// current native instances at the audio-quantum boundary.
+// current native instances at the next DSP block boundary.
 enum class AudioCommandType : std::uint8_t { setParameters, setDescriptor, reset };
 
 struct AudioCommand {

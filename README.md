@@ -36,7 +36,7 @@ build/windows-release/src/tools/effetune-headless.exe \
   --input input.wav --output output.wav --gain-db -6
 ```
 
-The headless host processes WAV files through a fixed Volume pipeline backed by EffeTune's native DSP engine. Audio is processed in 128-frame blocks. Run the executable with `--help` to list all available options.
+The headless host processes WAV files through a fixed Volume pipeline backed by EffeTune's native DSP engine. Audio is processed in blocks of at most 128 frames. Run the executable with `--help` to list all available options.
 
 ## Verification
 

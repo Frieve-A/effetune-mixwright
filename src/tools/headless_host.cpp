@@ -128,33 +128,32 @@ void process(const Options &options) {
 
   choc::buffer::ChannelArrayBuffer<float> output(properties.numChannels,
                                                   input.getNumFrames());
-  std::array<std::array<float, effetune::vst::EngineHost::kQuantumFrames>,
+  std::array<std::array<float, effetune::vst::EngineHost::kMaxProcessFrames>,
              effetune::vst::EngineHost::kMaxChannels>
-      quantum{};
+      block{};
   std::array<float *, effetune::vst::EngineHost::kMaxChannels> pointers{};
   for (std::uint32_t channel = 0; channel < properties.numChannels; ++channel) {
-    pointers[channel] = quantum[channel].data();
+    pointers[channel] = block[channel].data();
   }
 
   const auto frameCount = static_cast<std::uint32_t>(input.getNumFrames());
   for (std::uint32_t offset = 0; offset < frameCount;
-       offset += effetune::vst::EngineHost::kQuantumFrames) {
-    const auto validFrames = std::min(effetune::vst::EngineHost::kQuantumFrames,
+       offset += effetune::vst::EngineHost::kMaxProcessFrames) {
+    const auto validFrames = std::min(effetune::vst::EngineHost::kMaxProcessFrames,
                                       frameCount - offset);
     for (std::uint32_t channel = 0; channel < properties.numChannels; ++channel) {
-      std::fill(quantum[channel].begin(), quantum[channel].end(), 0.0f);
       for (std::uint32_t frame = 0; frame < validFrames; ++frame) {
-        quantum[channel][frame] = input.getView().getSample(channel, offset + frame);
+        block[channel][frame] = input.getView().getSample(channel, offset + frame);
       }
     }
     const auto timeSeconds = static_cast<double>(offset) / properties.sampleRate;
-    if (!engine.tryProcessQuantum(pointers.data(), properties.numChannels,
-                                  effetune::vst::EngineHost::kQuantumFrames, timeSeconds, false)) {
+    if (!engine.tryProcessBlock(pointers.data(), properties.numChannels,
+                                validFrames, timeSeconds, false)) {
       throw std::runtime_error("Native DSP processing failed");
     }
     for (std::uint32_t channel = 0; channel < properties.numChannels; ++channel) {
       for (std::uint32_t frame = 0; frame < validFrames; ++frame) {
-        output.getView().getSample(channel, offset + frame) = quantum[channel][frame];
+        output.getView().getSample(channel, offset + frame) = block[channel][frame];
       }
     }
   }
