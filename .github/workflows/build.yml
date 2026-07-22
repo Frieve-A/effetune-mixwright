@@ -85,10 +85,10 @@ jobs:
           Compress-Archive -LiteralPath $bundle -DestinationPath "artifacts/EffeTune-Mixwright-windows-x64.zip"
 
       - name: Upload VST3
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
-          name: effetune-mixwright-windows-x64
           path: artifacts/EffeTune-Mixwright-windows-x64.zip
+          archive: false
           if-no-files-found: error
           retention-days: 14
 
@@ -129,9 +129,9 @@ jobs:
             "artifacts/EffeTune-Mixwright-macos-universal.zip"
 
       - name: Upload VST3
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
-          name: effetune-mixwright-macos-universal
           path: artifacts/EffeTune-Mixwright-macos-universal.zip
+          archive: false
           if-no-files-found: error
           retention-days: 14
