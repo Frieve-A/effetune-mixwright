@@ -16,6 +16,8 @@ FetchContent_Declare(
 
 if(EFFETUNE_BUILD_PLUGIN)
   FetchContent_MakeAvailable(vst3sdk)
+  # The SDK's plug-in packaging helper reads this in the caller's directory scope.
+  set(public_sdk_SOURCE_DIR "${vst3sdk_SOURCE_DIR}/public.sdk")
 endif()
 
 if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/choc/choc/gui/choc_WebView.h")
