@@ -1,0 +1,137 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Code checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out source and submodules
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          package-manager-cache: false
+
+      - name: Check generated DSP parameters
+        run: node external/effetune/scripts/gen-dsp-params.mjs --check
+
+  build-windows:
+    name: Windows x64
+    needs: checks
+    runs-on: windows-2022
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out source and submodules
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          package-manager-cache: false
+
+      - name: Prepare Windows build environment
+        shell: cmd
+        run: |
+          git config --global core.longpaths true
+          subst W: "%GITHUB_WORKSPACE%"
+
+      - name: Configure, build, and test
+        shell: cmd
+        run: |
+          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64 -no_logo
+          if errorlevel 1 exit /b 1
+          cd /d W:\
+          cmake --preset windows-release
+          if errorlevel 1 exit /b 1
+          cmake --build --preset windows-release
+          if errorlevel 1 exit /b 1
+          ctest --preset windows-release
+
+      - name: Run native DSP parity
+        run: >-
+          node external/effetune/tools/dsp-parity/run.mjs --native
+          --native-runner "../../build/windows-release/external/effetune/dsp/effetune-dsp-parity-runner.exe"
+
+      - name: Package VST3
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          $bundle = "build/windows-release/VST3/Release/EffeTune Mixwright.vst3"
+          if (-not (Test-Path -LiteralPath $bundle)) {
+            throw "VST3 bundle not found: $bundle"
+          }
+          Compress-Archive -LiteralPath $bundle -DestinationPath "artifacts/EffeTune-Mixwright-windows-x64.zip"
+
+      - name: Upload VST3
+        uses: actions/upload-artifact@v6
+        with:
+          name: effetune-mixwright-windows-x64
+          path: artifacts/EffeTune-Mixwright-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  build-macos:
+    name: macOS Universal
+    needs: build-windows
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out source and submodules
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          package-manager-cache: false
+
+      - name: Configure, build, and test
+        run: |
+          cmake --preset mac-release
+          cmake --build --preset mac-release
+          ctest --preset mac-release
+
+      - name: Run native DSP parity
+        run: >-
+          node external/effetune/tools/dsp-parity/run.mjs --native
+          --native-runner "../../build/mac-release/external/effetune/dsp/effetune-dsp-parity-runner"
+
+      - name: Package VST3
+        run: |
+          mkdir -p artifacts
+          ditto -c -k --sequesterRsrc --keepParent \
+            "build/mac-release/VST3/Release/EffeTune Mixwright.vst3" \
+            "artifacts/EffeTune-Mixwright-macos-universal.zip"
+
+      - name: Upload VST3
+        uses: actions/upload-artifact@v6
+        with:
+          name: effetune-mixwright-macos-universal
+          path: artifacts/EffeTune-Mixwright-macos-universal.zip
+          if-no-files-found: error
+          retention-days: 14

@@ -1,0 +1,51 @@
+# CMake, Ninja, and packaged build outputs
+/build/
+/out/
+/dist/
+/artifacts/
+/.cache/
+CMakeUserPresets.json
+CMakeCache.txt
+CMakeFiles/
+CTestTestfile.cmake
+Testing/
+cmake_install.cmake
+compile_commands.json
+.ninja_deps
+.ninja_log
+
+# Local Node.js dependencies
+/node_modules/
+
+# IDE and editor state
+/.vs/
+/.vscode/
+/.idea/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+*.swp
+*.bak
+*~
+
+# Compiler outputs, logs, and crash dumps
+*.obj
+*.o
+*.pdb
+*.ilk
+*.log
+*.tmp
+*.dmp
+
+# OS metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local agent instructions
+/AGENTS.md
+/.agents/
+
+# Generated WebView resources
+/generated/webview-assets/
