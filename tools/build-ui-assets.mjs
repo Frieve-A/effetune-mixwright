@@ -6,6 +6,22 @@ import { fileURLToPath } from 'node:url';
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(scriptDirectory, '..');
 const productName = 'EffeTune Mixwright';
+const vstLocaleAdditions = {
+  en: {
+    'roomEq.action.import': 'Import\u2026',
+    'roomEq.delete.title': 'Delete imported measurement',
+    'roomEq.delete.confirm':
+      'Delete imported measurement \u201c{name}\u201d? This cannot be undone.',
+    'roomEq.delete.error': 'The imported measurement could not be deleted.'
+  },
+  ja: {
+    'roomEq.action.import': '測定をインポート\u2026',
+    'roomEq.delete.title': 'インポートした測定を削除',
+    'roomEq.delete.confirm':
+      'インポートした測定「{name}」を削除しますか？この操作は元に戻せません。',
+    'roomEq.delete.error': 'インポートした測定を削除できませんでした。'
+  }
+};
 
 function applyProductBranding(sourceText) {
   return sourceText
@@ -41,6 +57,9 @@ await cp(path.join(projectRoot, 'ui-shim', 'vst-bootstrap.js'),
          path.join(output, 'vst-bootstrap.js'));
 await cp(path.join(projectRoot, 'ui-shim', 'vst-audio-manager.js'),
          path.join(output, 'vst-audio-manager.js'));
+await mkdir(path.join(output, 'features', 'measurement'), { recursive: true });
+await cp(path.join(source, 'features', 'measurement', 'dataStorage.js'),
+         path.join(output, 'features', 'measurement', 'dataStorage.js'));
 await cp(path.join(projectRoot, 'THIRD-PARTY-NOTICES.txt'),
          path.join(output, 'THIRD-PARTY-NOTICES.txt'));
 
@@ -91,15 +110,24 @@ app = app.replace(startupViewPreference, `    async applyStartupViewPreference()
 const unconditionalPipelineReset = `        // Set the pipeline in audioManager
         this.audioManager.pipelineA = plugins;
         this.audioManager.setCurrentPipeline('A');`;
-if (!app.includes(unconditionalPipelineReset)) {
-  throw new Error('Unable to locate the initial pipeline assignment in js/app.js');
-}
-app = app.replace(unconditionalPipelineReset, `        // A dual-pipeline VST state was already assigned above. Only the
+const upstreamDualPipelineRestore = `        // Set the pipeline in audioManager
+        this.audioManager.pipelineA = plugins;
+        if (restoredDualPipeline) {
+            this.audioManager.pipelineB = restoredPipelineB;
+            this.audioManager.setCurrentPipeline(restoredCurrentPipeline);
+        } else {
+            this.audioManager.setCurrentPipeline('A');
+        }`;
+if (app.includes(unconditionalPipelineReset)) {
+  app = app.replace(unconditionalPipelineReset, `        // A dual-pipeline VST state was already assigned above. Only the
         // legacy single-pipeline path should force pipeline A.
         if (!(savedState && savedState.pipelineA && savedState.pipelineB !== undefined)) {
             this.audioManager.pipelineA = plugins;
             this.audioManager.setCurrentPipeline('A');
         }`);
+} else if (!app.includes(upstreamDualPipelineRestore)) {
+  throw new Error('Unable to locate the initial pipeline assignment in js/app.js');
+}
 const createRestoredPlugin = `const plugin = this.pluginManager.createPlugin(pluginState.name);`;
 const restoredPluginMatches = app.split(createRestoredPlugin).length - 1;
 if (restoredPluginMatches !== 3) {
@@ -205,6 +233,13 @@ await writeFile(pipelineManagerPath, pipelineManager, 'utf8');
 
 const uiManagerPath = path.join(output, 'js', 'ui-manager.js');
 let uiManager = await readFile(uiManagerPath, 'utf8');
+const uiManagerLibraryConstantsImport =
+  `import { normalizeMusicLibraryStartupView } from './library/constants.js';`;
+if (!uiManager.includes(uiManagerLibraryConstantsImport)) {
+  throw new Error('Unable to locate the UI music-library constants import');
+}
+uiManager = uiManager.replace(uiManagerLibraryConstantsImport,
+  `const normalizeMusicLibraryStartupView = () => 'tracks';`);
 for (const excludedImport of [
   `import { AudioPlayer } from './ui/audio-player.js';\n`,
   `import { LibraryManagerV2 } from './library/library-manager-v2.js';\n`,
@@ -333,7 +368,17 @@ for (const localeFile of await readdir(localesPath)) {
   if (!localeFile.endsWith('.json5')) continue;
   const localePath = path.join(localesPath, localeFile);
   const localeSource = await readFile(localePath, 'utf8');
-  await writeFile(localePath, applyProductBranding(localeSource), 'utf8');
+  let localized = applyProductBranding(localeSource);
+  const additions = vstLocaleAdditions[path.basename(localeFile, '.json5')];
+  if (additions) {
+    const closing = localized.match(/\s*}\s*$/);
+    if (!closing) throw new Error(`Unable to extend VST locale: ${localeFile}`);
+    const fields = Object.entries(additions)
+      .map(([key, value]) => `  ${JSON.stringify(key)}: ${JSON.stringify(value)}`)
+      .join(',\n');
+    localized = `${localized.slice(0, closing.index).trimEnd()},\n${fields}\n}\n`;
+  }
+  await writeFile(localePath, localized, 'utf8');
 }
 
 const browserAudioManagerPath = path.join(output, 'js', 'audio-manager.js');

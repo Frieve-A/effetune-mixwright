@@ -47,6 +47,7 @@ private:
 
   MessageHandler handler_;
   std::filesystem::path resourceRoot_;
+  bool resourceBundleAvailable_ = false;
   std::unique_ptr<choc::ui::WebView> webView_;
   void *owner_ = nullptr;
   void *parent_ = nullptr;

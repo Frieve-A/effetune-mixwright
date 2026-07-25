@@ -40,6 +40,10 @@ const dspMetadata = await readFile(
   path.join(assets, 'plugins', 'dsp', 'effetune-dsp.meta.json'), 'utf8');
 const notices = await readFile(path.join(assets, 'THIRD-PARTY-NOTICES.txt'), 'utf8');
 const sourceNotices = await readFile(path.join(projectRoot, 'THIRD-PARTY-NOTICES.txt'), 'utf8');
+const measurementStorage = await readFile(
+  path.join(assets, 'features', 'measurement', 'dataStorage.js'), 'utf8');
+const englishLocale = await readFile(path.join(assets, 'js', 'locales', 'en.json5'), 'utf8');
+const japaneseLocale = await readFile(path.join(assets, 'js', 'locales', 'ja.json5'), 'utf8');
 
 const requiredFiles = [
   'vst-bootstrap.js',
@@ -49,6 +53,7 @@ const requiredFiles = [
   'plugins/lofi/vinyl_simulator.css',
   'plugins/lofi/vinyl_simulator.js',
   'presets/presets.txt',
+  'features/measurement/dataStorage.js',
   'js/locales/en.json5',
   'js/locales/ja.json5'
 ];
@@ -126,7 +131,15 @@ if (!bootstrap.includes('html { background-color: #1e1e1e; }')) {
 if (!app.includes("../vst-audio-manager.js")) {
   throw new Error('The application module was not redirected to the VST audio adapter');
 }
-if (!app.includes('legacy single-pipeline path should force pipeline A')) {
+const hasLegacyVstDualPipelinePatch =
+  app.includes('legacy single-pipeline path should force pipeline A');
+const hasUpstreamDualPipelineRestore =
+  app.includes('let restoredPipelineB = null;') &&
+  app.includes('let restoredCurrentPipeline = \'A\';') &&
+  app.includes('let restoredDualPipeline = false;') &&
+  app.includes('this.audioManager.pipelineB = restoredPipelineB;') &&
+  app.includes('this.audioManager.setCurrentPipeline(restoredCurrentPipeline);');
+if (!hasLegacyVstDualPipelinePatch && !hasUpstreamDualPipelineRestore) {
   throw new Error('The VST dual-pipeline state restoration patch was not applied');
 }
 const appIdReservation = app.indexOf('this.pluginManager.nextPluginId = Math.max(');
@@ -171,8 +184,28 @@ if (!bootstrap.includes('window.electronAPI = {') ||
     bootstrap.includes('readClipboardText:') || bootstrap.includes('writeClipboardText:')) {
   throw new Error('Early config API or audio-only file-drop exclusion is missing');
 }
+if (!bootstrap.includes('const maximumMeasurementImportBytes = 128 * 1024 * 1024;') ||
+    !bootstrap.includes("import('./features/measurement/dataStorage.js')") ||
+    !bootstrap.includes("input.accept = '.json,application/json';") ||
+    !bootstrap.includes('storage.importMeasurementFromJSON(jsonText)') ||
+    !bootstrap.includes('storage.deleteMeasurement(measurementId)') ||
+    !bootstrap.includes('measurement?.imported !== true') ||
+    !bootstrap.includes('confirmImportedMeasurementDeletion(measurement)') ||
+    !bootstrap.includes('clearDeletedMeasurementReferences(measurementId)') ||
+    !bootstrap.includes("ms: ''") ||
+    !bootstrap.includes('targetPlugin.setParameters({') ||
+    !bootstrap.includes('window.__effetuneMeasurementImport = {') ||
+    !measurementStorage.includes('async importMeasurementFromJSON(jsonString)') ||
+    !measurementStorage.includes('data.id = this.generateId();') ||
+    !englishLocale.includes('"roomEq.delete.confirm"') ||
+    !japaneseLocale.includes('"roomEq.delete.confirm"')) {
+  throw new Error(
+    'Room EQ measurement import/deletion is missing or can overwrite a stored measurement');
+}
 if (!bootstrap.includes("const productionUrl = new URL('https://effetune.frieve.com/');") ||
     !bootstrap.includes("url.hostname === 'choc.localhost'") ||
+    !bootstrap.includes("url.protocol === 'effetune-mixwright:'") ||
+    !bootstrap.includes("url.hostname === 'effetune-mixwright.localhost'") ||
     !bootstrap.includes("url.pathname.replace(/\\.md$/, '.html')") ||
     !bootstrap.includes("const openExternalUrl = url => window.__effetuneHostCall('host/openExternal', {") ||
     !bootstrap.includes('url: normalizeExternalUrl(url)') ||

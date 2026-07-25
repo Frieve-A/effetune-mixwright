@@ -63,7 +63,7 @@ if(WIN32 AND TARGET effetune_ui_assets)
   target_compile_options(effetune_webview_smoke PRIVATE /W4 /WX /utf-8)
   add_dependencies(effetune_webview_smoke effetune_ui_assets)
   add_test(NAME effetune_webview_smoke COMMAND effetune_webview_smoke)
-  set_tests_properties(effetune_webview_smoke PROPERTIES TIMEOUT 30)
+  set_tests_properties(effetune_webview_smoke PROPERTIES TIMEOUT 60)
 endif()
 
 if(TARGET effetune_ui_assets)

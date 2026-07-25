@@ -73,6 +73,50 @@
       font-size: 11px;
       display: none;
     }
+    .vst-measurement-delete {
+      color: #ff9b9b !important;
+    }
+    .vst-measurement-delete:disabled {
+      color: var(--et-text-muted) !important;
+    }
+    .vst-measurement-delete-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 1200;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+      background: rgba(0, 0, 0, 0.62);
+    }
+    .vst-measurement-delete-dialog {
+      box-sizing: border-box;
+      width: min(460px, calc(100vw - 32px));
+      padding: 22px;
+      border-radius: 8px;
+      background: var(--et-panel-gradient);
+      color: var(--et-text-primary);
+      box-shadow: 0 22px 54px rgba(0, 0, 0, 0.5),
+                  inset 0 1px 0 rgba(255, 255, 255, 0.065),
+                  inset 0 0 0 1px var(--et-border-strong);
+    }
+    .vst-measurement-delete-dialog h2 {
+      margin: 0 0 12px;
+      font-size: 20px;
+    }
+    .vst-measurement-delete-dialog p {
+      margin: 0 0 20px;
+      color: var(--et-text-secondary);
+      overflow-wrap: anywhere;
+    }
+    .vst-measurement-delete-dialog .dialog-buttons {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+    .vst-measurement-delete-dialog .vst-measurement-delete-confirm {
+      color: #ffb0b0 !important;
+    }
     .vst-third-party-notices-overlay {
       z-index: 1100 !important;
     }
@@ -136,8 +180,9 @@
     const source = String(value || '');
     try {
       let url = new URL(source, productionUrl);
-      if (url.protocol === 'choc:' || url.hostname === 'choc.localhost' ||
-          url.hostname === 'choc.choc') {
+      if (url.protocol === 'choc:' || url.protocol === 'effetune-mixwright:' ||
+          url.hostname === 'choc.localhost' || url.hostname === 'choc.choc' ||
+          url.hostname === 'effetune-mixwright.localhost') {
         url = new URL(`${url.pathname}${url.search}${url.hash}`, productionUrl);
       }
       if (url.origin === productionUrl.origin) {
@@ -278,8 +323,231 @@
     }
   }, true);
 
+  const maximumMeasurementImportBytes = 128 * 1024 * 1024;
+  let measurementStoragePromise = null;
+  const translatedText = (key, fallback, params = {}) => {
+    const translated = window.uiManager?.t?.(key, params);
+    return translated && translated !== key ? translated : fallback;
+  };
+  const getMeasurementStorage = async () => {
+    if (!measurementStoragePromise) {
+      measurementStoragePromise = import('./features/measurement/dataStorage.js')
+        .then(async module => {
+          await module.default.initialize();
+          return module.default;
+        })
+        .catch(error => {
+          measurementStoragePromise = null;
+          throw error;
+        });
+    }
+    return measurementStoragePromise;
+  };
+  const roomEqPlugins = () => {
+    const audio = window.audioManager;
+    return [...new Set([...(audio?.pipelineA || []), ...(audio?.pipelineB || [])])]
+      .filter(plugin => plugin?.constructor === window.RoomEqPlugin);
+  };
+  const roomEqPluginFor = select => {
+    const pluginId = Number(select?.id?.slice('room-eq-measurement-'.length));
+    return roomEqPlugins().find(plugin => plugin.id === pluginId) || null;
+  };
+  const updateImportedDeleteButtons = () => {
+    for (const row of document.querySelectorAll('.room-eq-measurement-row')) {
+      const button = row.querySelector('.vst-measurement-delete');
+      const select = row.querySelector('select[id^="room-eq-measurement-"]');
+      if (!button || !select) continue;
+      const plugin = roomEqPluginFor(select);
+      button.disabled = true;
+      const measurementId = plugin?.measurementId;
+      if (!measurementId) continue;
+      void getMeasurementStorage().then(storage => {
+        if (button.isConnected && roomEqPluginFor(select)?.measurementId === measurementId) {
+          button.disabled = storage.getMeasurementById(measurementId)?.imported !== true;
+        }
+      }).catch(() => {});
+    }
+  };
+  const refreshImportedMeasurement = async (measurementId, targetPlugin, storage) => {
+    const plugins = roomEqPlugins();
+    await Promise.all(plugins.map(plugin => plugin._refreshMeasurements(false)));
+    if (targetPlugin && plugins.includes(targetPlugin)) {
+      const measurement = storage.getMeasurementById(measurementId);
+      targetPlugin.setParameters({
+        ms: measurementId,
+        mn: measurement?.name || 'Measurement',
+        rp: 0
+      });
+      await targetPlugin._renderMeasurement();
+    }
+    updateImportedDeleteButtons();
+  };
+  const importMeasurementText = async (jsonText, targetPlugin = null) => {
+    if (typeof jsonText !== 'string' ||
+        new Blob([jsonText]).size > maximumMeasurementImportBytes) {
+      throw new Error('Measurement files must be at most 128 MB.');
+    }
+    const storage = await getMeasurementStorage();
+    const measurementId = await storage.importMeasurementFromJSON(jsonText);
+    if (!measurementId) {
+      throw new Error('The selected file is not a valid measurement export.');
+    }
+    await refreshImportedMeasurement(measurementId, targetPlugin, storage);
+    return measurementId;
+  };
+  const importMeasurementFile = async (file, targetPlugin = null) => {
+    if (!file || !/\.json$/i.test(file.name || '')) {
+      throw new Error('Select a measurement JSON file exported by the desktop application.');
+    }
+    if (!Number.isFinite(file.size) || file.size > maximumMeasurementImportBytes) {
+      throw new Error('Measurement files must be at most 128 MB.');
+    }
+    return importMeasurementText(await file.text(), targetPlugin);
+  };
+  const confirmImportedMeasurementDeletion = measurement => new Promise(resolve => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay vst-measurement-delete-overlay';
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+    overlay.setAttribute('aria-labelledby', 'vst-measurement-delete-title');
+    overlay.innerHTML = `
+      <div class="vst-measurement-delete-dialog">
+        <h2 id="vst-measurement-delete-title"></h2>
+        <p></p>
+        <div class="dialog-buttons">
+          <button type="button" class="vst-measurement-delete-cancel"></button>
+          <button type="button" class="vst-measurement-delete-confirm"></button>
+        </div>
+      </div>`;
+    const cancel = overlay.querySelector('.vst-measurement-delete-cancel');
+    const confirm = overlay.querySelector('.vst-measurement-delete-confirm');
+    overlay.querySelector('h2').textContent = translatedText(
+      'roomEq.delete.title', 'Delete imported measurement');
+    overlay.querySelector('p').textContent = translatedText(
+      'roomEq.delete.confirm',
+      `Delete imported measurement \u201c${measurement.name}\u201d? This cannot be undone.`,
+      { name: measurement.name });
+    cancel.textContent = translatedText('ui.cancelButton', 'Cancel');
+    confirm.textContent = translatedText('menu.edit.delete', 'Delete');
+    const finish = result => {
+      document.removeEventListener('keydown', handleKeyDown);
+      overlay.remove();
+      resolve(result);
+    };
+    const handleKeyDown = event => {
+      if (event.key === 'Escape') finish(false);
+    };
+    cancel.addEventListener('click', () => finish(false));
+    confirm.addEventListener('click', () => finish(true));
+    document.addEventListener('keydown', handleKeyDown);
+    document.body.appendChild(overlay);
+    cancel.focus();
+  });
+  const clearDeletedMeasurementReferences = async measurementId => {
+    const plugins = roomEqPlugins();
+    const referencingPlugins = plugins.filter(plugin => plugin.measurementId === measurementId);
+    for (const plugin of referencingPlugins) {
+      plugin.setParameters({
+        ms: '',
+        mn: '',
+        rp: 0
+      });
+    }
+    await Promise.all(referencingPlugins.map(plugin => plugin._renderMeasurement()));
+    return plugins;
+  };
+  const deleteImportedMeasurement = async targetPlugin => {
+    const measurementId = targetPlugin?.measurementId;
+    if (!measurementId) return false;
+    const storage = await getMeasurementStorage();
+    const measurement = storage.getMeasurementById(measurementId);
+    if (measurement?.imported !== true) {
+      throw new Error('Only measurements imported into this plug-in can be deleted here.');
+    }
+    if (!await confirmImportedMeasurementDeletion(measurement)) return false;
+    const plugins = await clearDeletedMeasurementReferences(measurementId);
+    if (!await storage.deleteMeasurement(measurementId)) {
+      throw new Error(translatedText(
+        'roomEq.delete.error', 'The imported measurement could not be deleted.'));
+    }
+    await Promise.all(plugins.map(plugin => plugin._refreshMeasurements(false)));
+    updateImportedDeleteButtons();
+    return true;
+  };
+  window.__effetuneMeasurementImport = {
+    maximumBytes: maximumMeasurementImportBytes,
+    deleteImported: deleteImportedMeasurement,
+    importFile: importMeasurementFile,
+    importText: importMeasurementText
+  };
+
+  const enhanceRoomEqMeasurementRows = root => {
+    const rows = [];
+    if (root?.matches?.('.room-eq-measurement-row')) rows.push(root);
+    rows.push(...(root?.querySelectorAll?.('.room-eq-measurement-row') || []));
+    for (const row of rows) {
+      if (row.querySelector('.vst-measurement-import')) continue;
+      const select = row.querySelector('select[id^="room-eq-measurement-"]');
+      if (!select) continue;
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = '.json,application/json';
+      input.hidden = true;
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'room-eq-refresh vst-measurement-import';
+      button.textContent = translatedText('roomEq.action.import', 'Import\u2026');
+      button.title = 'Import a measurement JSON file exported by the desktop application';
+      button.addEventListener('click', () => input.click());
+      input.addEventListener('change', () => {
+        const file = input.files?.[0];
+        input.value = '';
+        if (!file) return;
+        const targetPlugin = roomEqPluginFor(select);
+        button.disabled = true;
+        void importMeasurementFile(file, targetPlugin)
+          .catch(error => {
+            console.error('Measurement import failed:', error);
+            window.uiManager?.setError?.(
+              error?.message || 'The measurement could not be imported.', true);
+          })
+          .finally(() => {
+            if (button.isConnected) button.disabled = false;
+          });
+      });
+      const deleteButton = document.createElement('button');
+      deleteButton.type = 'button';
+      deleteButton.className = 'room-eq-refresh vst-measurement-delete';
+      deleteButton.textContent = translatedText('menu.edit.delete', 'Delete');
+      deleteButton.title = translatedText(
+        'roomEq.delete.title', 'Delete imported measurement');
+      deleteButton.disabled = true;
+      deleteButton.addEventListener('click', () => {
+        deleteButton.disabled = true;
+        void deleteImportedMeasurement(roomEqPluginFor(select))
+          .catch(error => {
+            console.error('Measurement deletion failed:', error);
+            window.uiManager?.setError?.(
+              error?.message || 'The imported measurement could not be deleted.', true);
+          })
+          .finally(updateImportedDeleteButtons);
+      });
+      select.addEventListener('change', updateImportedDeleteButtons);
+      row.append(input, button, deleteButton);
+      updateImportedDeleteButtons();
+    }
+  };
+
   document.addEventListener('DOMContentLoaded', () => {
     document.body.classList.remove('view-library');
+    enhanceRoomEqMeasurementRows(document);
+    new MutationObserver(records => {
+      for (const record of records) {
+        for (const node of record.addedNodes) {
+          if (node.nodeType === Node.ELEMENT_NODE) enhanceRoomEqMeasurementRows(node);
+        }
+      }
+    }).observe(document.body, { childList: true, subtree: true });
     const headerButtons = document.querySelector('.header-buttons');
     if (!headerButtons || document.querySelector('.vst-os-controls')) return;
 

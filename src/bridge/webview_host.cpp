@@ -4,6 +4,7 @@
 #include "choc/text/choc_JSON.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <fstream>
 #include <iterator>
@@ -21,6 +22,14 @@
 
 namespace effetune::vst {
 namespace {
+
+#if defined(_WIN32)
+constexpr std::string_view kWebViewHomeUri =
+    "https://effetune-mixwright.localhost/";
+#else
+constexpr std::string_view kWebViewHomeUri =
+    "effetune-mixwright://app/";
+#endif
 
 [[nodiscard]] std::string lowerExtension(const std::filesystem::path &path) {
   auto extension = path.extension().string();
@@ -56,11 +65,49 @@ namespace {
   });
 }
 
+[[nodiscard]] bool hasRequiredResources(const std::filesystem::path &root) {
+  constexpr std::array required{
+      "effetune.html",
+      "effetune.css",
+      "vst-bootstrap.js",
+      "js/app.js",
+  };
+  return std::all_of(required.begin(), required.end(), [&root](const auto *relative) {
+    std::error_code error;
+    return std::filesystem::is_regular_file(root / relative, error);
+  });
+}
+
+[[nodiscard]] std::string missingResourcePage() {
+  return R"(<!doctype html>
+<html lang="en" data-effetune-load-error="missing-assets">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>EffeTune Mixwright</title>
+<style>
+html,body{height:100%;margin:0;background:#1e1e1e;color:#f0f0f0;font:16px/1.5 system-ui,sans-serif}
+body{display:grid;place-items:center}
+main{max-width:600px;margin:32px;padding:28px;border:1px solid #555;border-radius:8px;background:#292929}
+h1{margin:0 0 16px;font-size:22px}
+p{margin:0;color:#d0d0d0}
+</style>
+</head>
+<body>
+<main>
+<h1>EffeTune Mixwright could not load its interface.</h1>
+<p>Reinstall the complete EffeTune Mixwright.vst3 bundle, then restart your DAW.</p>
+</main>
+</body>
+</html>)";
+}
+
 } // namespace
 
 WebViewHost::WebViewHost(MessageHandler handler, std::filesystem::path resourceRoot)
     : handler_(std::move(handler)),
-      resourceRoot_(resourceRoot.empty() ? locateResourceRoot() : std::move(resourceRoot)) {
+      resourceRoot_(resourceRoot.empty() ? locateResourceRoot() : std::move(resourceRoot)),
+      resourceBundleAvailable_(hasRequiredResources(resourceRoot_)) {
   createWebView();
 }
 
@@ -72,6 +119,10 @@ void WebViewHost::createWebView() {
   options.enableDebugMode = true;
 #endif
   options.transparentBackground = true;
+  // CHOC's default origin is shared by every CHOC WebView in the DAW's
+  // WebView2 profile. Use a product-specific origin so another plug-in's
+  // persisted site data or service worker cannot intercept this UI.
+  options.customSchemeURI = std::string(kWebViewHomeUri);
   options.fetchResource = [this](const std::string &path)
       -> std::optional<choc::ui::WebView::Options::Resource> {
     const auto resource = fetchResource(path);
@@ -158,6 +209,12 @@ std::optional<WebViewHost::ResourceData> WebViewHost::fetchResource(std::string 
   if (containsTraversal(relative)) {
     return std::nullopt;
   }
+  if (!resourceBundleAvailable_) {
+    if (path == "effetune.html") {
+      return ResourceData{"text/html; charset=utf-8", missingResourcePage()};
+    }
+    return std::nullopt;
+  }
   const auto candidate = resourceRoot_ / relative;
   std::error_code error;
   if (!std::filesystem::is_regular_file(candidate, error)) {
@@ -188,11 +245,7 @@ void WebViewHost::configure(choc::ui::WebView &view) {
   (void)view.addInitScript(
       "window.__EFFETUNE_VST__=true;window.pipelineStateLoaded=true;"
       "document.documentElement.classList.add('effetune-vst-host');");
-#if defined(_WIN32)
-  (void)view.navigate("https://choc.localhost/effetune.html");
-#else
-  (void)view.navigate("choc://choc.choc/effetune.html");
-#endif
+  (void)view.navigate(std::string(kWebViewHomeUri) + "effetune.html");
 }
 
 bool WebViewHost::attach(void *owner, void *parent, const std::int32_t width,

@@ -29,6 +29,21 @@ The main build artifacts are:
 - Headless host: `build/windows-release/src/tools/effetune-headless.exe`
 - WebView assets: `build/windows-release/webview-assets`
 
+## Room EQ Measurements
+
+Electron and VST WebViews intentionally keep separate browser-storage profiles and origins.
+To reuse a measurement, export it as JSON from EffeTune, open Room EQ in EffeTune Mixwright,
+and choose **Import...** beside the measurement list. The imported copy receives a new local
+identifier and remains available to other Room EQ instances in the same VST WebView profile.
+Select an imported measurement and choose **Delete** to remove that local copy and its stored
+impulse responses after confirmation. Room EQ instances that reference the selected copy switch
+to **No measurement** and aligned bypass before the local data is removed.
+
+Enable **Include impulse responses in measurement JSON exports** before exporting when Room EQ's
+phase-correction mode needs impulse-response data. Minimum- and linear-phase magnitude correction
+can use exports without impulse responses. Import is limited to explicitly selected JSON files of
+at most 128 MB.
+
 ## Headless Processing
 
 ```sh

@@ -125,6 +125,8 @@ struct SmokeState {
       state.externalAiCalls.fetch_add(1, std::memory_order_relaxed);
     }
     if (request.find("choc.localhost") != std::string_view::npos ||
+        request.find("effetune-mixwright.localhost") != std::string_view::npos ||
+        request.find("effetune-mixwright:") != std::string_view::npos ||
         request.find("analyzer.md") != std::string_view::npos) {
       state.invalidExternalDocumentationCalls.fetch_add(1, std::memory_order_relaxed);
     }
@@ -178,12 +180,15 @@ int main() {
   bool headerControlsAreVstSpecific = false;
   bool configDialogIsLanguageOnly = false;
   bool languageChangedImmediately = false;
+  bool measurementImportAvailable = false;
   bool aboutNoticesReachable = false;
   bool externalLinksRouted = false;
+  bool isolatedWebOrigin = false;
   bool masterToggleReachedNative = false;
   bool defaultViewportFits = false;
   bool reattachedWithFreshWebView = false;
   bool recoveredAfterParentDestruction = false;
+  bool missingResourceGuidanceShown = false;
   bool attached = false;
   {
     int firstEditorOwner = 0;
@@ -277,6 +282,9 @@ int main() {
 
       if (uiReady.load(std::memory_order_acquire)) {
         std::string ignored;
+        isolatedWebOrigin = evaluate(
+            "window.location.origin === 'https://effetune-mixwright.localhost'",
+            ignored) && ignored == "true";
         unsupportedStateWarningShown = waitForJavascript(
             "window.app?.initialized === true && "
             "window.audioManager?.unsupportedWarningShown === true && "
@@ -467,6 +475,92 @@ int main() {
             ignored) && ignored == "true";
         const auto languageFixtureReady = languageFixtureStarted && waitForJavascript(
             "window.__vstLanguageFixtureReady === true", std::chrono::seconds(5));
+        const auto measurementImportStarted = languageFixtureReady && evaluate(
+            R"JS((() => {
+              window.__vstMeasurementImportReady = false;
+              window.__vstMeasurementImportError = '';
+              void (async () => {
+                const importer = window.__effetuneMeasurementImport;
+                if (!importer || importer.maximumBytes !== 134217728) return;
+                const plugin = window.pluginManager.createPlugin('Room EQ');
+                window.audioManager.pipeline.push(plugin);
+                window.uiManager.pipelineManager.updatePipelineUI(true);
+                let invalidRejected = false;
+                try {
+                  await importer.importText('{}', plugin);
+                } catch {
+                  invalidRejected = true;
+                }
+                const measurementId = await importer.importText(JSON.stringify({
+                  name: 'Imported WebView Measurement',
+                  timestamp: '2026-07-25T00:00:00.000Z',
+                  sampleRate: 48000,
+                  averageFrequencyResponse: [
+                    [20, -1], [100, 0], [1000, 1], [5000, -1], [10000, 0], [20000, -2]
+                  ],
+                  points: [{
+                    pointId: 0,
+                    name: 'Center',
+                    frequencyResponse: [
+                      [20, -1], [100, 0], [1000, 1], [5000, -1], [10000, 0], [20000, -2]
+                    ]
+                  }]
+                }), plugin);
+                const option = document.querySelector(
+                  `#room-eq-measurement-${plugin.id} option[value="${measurementId}"]`
+                );
+                const row = document.querySelector(
+                  `#room-eq-measurement-${plugin.id}`
+                )?.parentElement;
+                const importButton = row?.querySelector('.vst-measurement-import');
+                const deleteButton = row?.querySelector('.vst-measurement-delete');
+                for (let attempt = 0; deleteButton?.disabled && attempt < 50; ++attempt) {
+                  await new Promise(resolve => setTimeout(resolve, 10));
+                }
+                const importedUiReady = invalidRejected &&
+                  plugin.measurementId === measurementId &&
+                  option?.textContent.includes('Imported WebView Measurement') &&
+                  importButton?.textContent === 'Import\u2026' &&
+                  deleteButton?.textContent === 'Delete' &&
+                  deleteButton.disabled === false;
+                deleteButton?.click();
+                let confirmation = null;
+                for (let attempt = 0; !confirmation && attempt < 50; ++attempt) {
+                  await new Promise(resolve => setTimeout(resolve, 10));
+                  confirmation = document.querySelector('.vst-measurement-delete-confirm');
+                }
+                const confirmationReady =
+                  document.querySelector('.vst-measurement-delete-dialog p')
+                    ?.textContent.includes('Imported WebView Measurement') &&
+                  confirmation?.textContent === 'Delete';
+                confirmation?.click();
+                let measurementDeleted = false;
+                for (let attempt = 0; attempt < 100; ++attempt) {
+                  await new Promise(resolve => setTimeout(resolve, 10));
+                  const store = await plugin._getMeasurementStore(true);
+                  if (!await store?.getMeasurement(measurementId) &&
+                      deleteButton.disabled && plugin.measurementId === '') {
+                    measurementDeleted = true;
+                    break;
+                  }
+                }
+                const measurementSelect = document.querySelector(
+                  `#room-eq-measurement-${plugin.id}`
+                );
+                const deletedOption = document.querySelector(
+                  `#room-eq-measurement-${plugin.id} option[value="${measurementId}"]`
+                );
+                window.__vstMeasurementImportReady = importedUiReady && confirmationReady &&
+                  measurementDeleted && measurementSelect?.value === '' && !deletedOption;
+              })().catch(error => {
+                window.__vstMeasurementImportError = String(error?.stack || error);
+              });
+              return true;
+            })())JS",
+            ignored) && ignored == "true";
+        measurementImportAvailable = measurementImportStarted && waitForJavascript(
+            "window.__vstMeasurementImportReady === true",
+            std::chrono::seconds(10));
         const auto configDialogOpened = languageFixtureReady && evaluate(
             "(() => { document.getElementById('configSettingsButton')?.click(); return true; })()",
             ignored) && ignored == "true" && waitForJavascript(
@@ -583,7 +677,8 @@ int main() {
         const auto remappedExternalHelpStarted = externalHelpStarted &&
             smokeState.externalHelpCalls.load(std::memory_order_relaxed) == 1 && evaluate(
             "window.electronAPI.openExternalUrl("
-            "'https://choc.localhost/docs/i18n/ja/plugins/analyzer.md#level-meter'); true",
+            "'https://effetune-mixwright.localhost/docs/i18n/ja/plugins/"
+            "analyzer.md#level-meter'); true",
             ignored) && ignored == "true";
         const auto remappedExternalHelpDeadline =
             std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -715,6 +810,50 @@ int main() {
     }
     webView.detach(activeEditorOwner);
   }
+  if (parent != nullptr && IsWindow(parent) != FALSE) {
+    int fallbackOwner = 0;
+    effetune::vst::WebViewHost fallbackWebView(
+        [](const std::string_view) { return R"({"ok":true})"; },
+        std::filesystem::path(EFFETUNE_WEBVIEW_ASSET_DIR) / "missing-resource-root");
+    if (fallbackWebView.attach(
+            &fallbackOwner, parent,
+            effetune::vst::plugin::kDefaultEditorWidth,
+            effetune::vst::plugin::kDefaultEditorHeight)) {
+      ShowWindow(parent, SW_SHOWNOACTIVATE);
+      std::atomic_bool fallbackEvaluationPending{false};
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(10);
+      auto nextFallbackEvaluation =
+          std::chrono::steady_clock::now() + std::chrono::seconds(1);
+      while (!missingResourceGuidanceShown &&
+             std::chrono::steady_clock::now() < deadline) {
+        MSG message{};
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE) != 0) {
+          TranslateMessage(&message);
+          DispatchMessageW(&message);
+        }
+        if (std::chrono::steady_clock::now() >= nextFallbackEvaluation &&
+            !fallbackEvaluationPending.exchange(true, std::memory_order_acq_rel)) {
+          if (!fallbackWebView.evaluate(
+                  "document.documentElement.dataset.effetuneLoadError === "
+                  "'missing-assets' && document.body?.innerText.includes("
+                  "'Reinstall the complete EffeTune Mixwright.vst3 bundle')",
+                  [&](std::string error, std::string result) {
+                    missingResourceGuidanceShown =
+                        error.empty() && result == "true";
+                    fallbackEvaluationPending.store(false,
+                                                    std::memory_order_release);
+                  })) {
+            fallbackEvaluationPending.store(false, std::memory_order_release);
+          }
+          nextFallbackEvaluation =
+              std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+      fallbackWebView.detach(&fallbackOwner);
+    }
+  }
   if (parent != nullptr) {
     DestroyWindow(parent);
   }
@@ -736,6 +875,10 @@ int main() {
     std::cerr << "WebView evaluation error: " << evaluationError << '\n'
               << "Registered plug-ins: " << evaluationResult << '\n'
               << "The EffeTune UI did not finish loading its plug-in catalog\n";
+    return 1;
+  }
+  if (!isolatedWebOrigin) {
+    std::cerr << "The EffeTune UI reused CHOC's shared default WebView origin\n";
     return 1;
   }
   if (!telemetryDelivered) {
@@ -790,6 +933,10 @@ int main() {
     std::cerr << "A language change did not immediately refresh static and dynamic UI\n";
     return 1;
   }
+  if (!measurementImportAvailable) {
+    std::cerr << "Room EQ did not import, delete, and clear an exported measurement JSON file\n";
+    return 1;
+  }
   if (!aboutNoticesReachable) {
     std::cerr << "The About dialog did not show the Mixwright version and complete third-party "
                  "notices\n";
@@ -824,12 +971,17 @@ int main() {
     std::cerr << "A WebView with a destroyed parent was not recreated on reattachment\n";
     return 1;
   }
+  if (!missingResourceGuidanceShown) {
+    std::cerr << "Missing WebView assets did not show actionable reinstall guidance\n";
+    return 1;
+  }
   if (smokeState.prematureEmptyRebuildCalls.load(std::memory_order_relaxed) != 0) {
     std::cerr << "A recreated WebView cleared the native pipeline before restoring its state\n";
     return 1;
   }
   std::cout << "EffeTune WebView exercised telemetry resume, history restore, A/B routing, "
                "unavailable-state warning, clipboard, excluded library, context, language, "
-               "About notices, external links, bypass, and editor reattachment\n";
+               "Room EQ measurement import, About notices, external links, bypass, and editor "
+               "reattachment\n";
   return 0;
 }
