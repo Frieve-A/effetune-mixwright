@@ -51,7 +51,7 @@ struct PipelineState {
 
 struct PluginStateDocument {
   std::uint32_t formatVersion = 1;
-  std::string appVersion = "0.2.0";
+  std::string appVersion = "0.3.0";
   PipelineState pipelineA;
   PipelineState pipelineB;
   bool pipelineBInitialized = false;

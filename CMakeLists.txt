@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(EffeTunePlugin VERSION 0.2.0 LANGUAGES C CXX)
+project(EffeTunePlugin VERSION 0.3.0 LANGUAGES C CXX)
 
 # CMake 4.1.0-rc1 can decode the Japanese MSVC /showIncludes prefix as
 # mojibake, which leaves Ninja with no header dependencies. Repair only that
