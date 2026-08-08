@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(EffeTunePlugin VERSION 0.3.0 LANGUAGES C CXX)
+project(EffeTunePlugin VERSION 0.4.0 LANGUAGES C CXX)
 
 # CMake 4.1.0-rc1 can decode the Japanese MSVC /showIncludes prefix as
 # mojibake, which leaves Ninja with no header dependencies. Repair only that
@@ -33,6 +33,10 @@ include(cmake/Dependencies.cmake)
 if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/effetune/dsp/CMakeLists.txt")
   message(FATAL_ERROR
     "external/effetune is missing. Run: git submodule update --init --recursive")
+endif()
+
+if(MSVC)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/EHsc>)
 endif()
 
 add_subdirectory(external/effetune/dsp)
