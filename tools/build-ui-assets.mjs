@@ -128,6 +128,19 @@ if (app.includes(unconditionalPipelineReset)) {
 } else if (!app.includes(upstreamDualPipelineRestore)) {
   throw new Error('Unable to locate the initial pipeline assignment in js/app.js');
 }
+const dualPipelineRestoreMarker = `        // Handle dual pipeline format
+        if (savedState && savedState.pipelineA && savedState.pipelineB !== undefined) {`;
+if (!app.includes(dualPipelineRestoreMarker)) {
+  throw new Error('Unable to locate the saved-state pipeline restoration');
+}
+app = app.replace(dualPipelineRestoreMarker, `        const automationWatermark =
+            savedState?.automation?.logicalPluginIdWatermark;
+        if (Number.isInteger(automationWatermark) && automationWatermark >= 0) {
+            this.pluginManager.nextPluginId = Math.max(
+                this.pluginManager.nextPluginId, automationWatermark + 1);
+        }
+
+${dualPipelineRestoreMarker}`);
 const createRestoredPlugin = `const plugin = this.pluginManager.createPlugin(pluginState.name);`;
 const restoredPluginMatches = app.split(createRestoredPlugin).length - 1;
 if (restoredPluginMatches !== 3) {
@@ -240,6 +253,14 @@ if (!uiManager.includes(uiManagerLibraryConstantsImport)) {
 }
 uiManager = uiManager.replace(uiManagerLibraryConstantsImport,
   `const normalizeMusicLibraryStartupView = () => 'tracks';`);
+const urlReflectionGate = `        this.urlReflectionEnabled = true;`;
+if (uiManager.split(urlReflectionGate).length - 1 !== 1) {
+  throw new Error('Expected one URL reflection gate in js/ui-manager.js');
+}
+uiManager = uiManager.replace(urlReflectionGate, `        // The VST WebView has no address bar, and its pipeline is persisted in
+        // the plug-in state chunk rather than in localStorage, so reflecting it
+        // would only re-encode the whole pipeline on every parameter change.
+        this.urlReflectionEnabled = false;`);
 for (const excludedImport of [
   `import { AudioPlayer } from './ui/audio-player.js';\n`,
   `import { LibraryManagerV2 } from './library/library-manager-v2.js';\n`,

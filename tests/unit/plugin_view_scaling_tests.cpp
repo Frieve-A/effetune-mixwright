@@ -14,6 +14,8 @@
 #include <string>
 #include <thread>
 
+#include "../support/crt_dialog_suppression.h"
+
 namespace {
 
 using namespace Steinberg;
@@ -268,6 +270,7 @@ void testViewScaling(const char *pluginPath) {
 } // namespace
 
 int main(const int argc, char **argv) {
+  effetune::vst::testing::suppressCrtModalDialogs();
   const auto errorMode = SetErrorMode(0);
   SetErrorMode(errorMode | SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
   try {

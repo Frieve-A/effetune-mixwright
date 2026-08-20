@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cmath>
 #include <limits>
 #include <string>
 #include <string_view>
@@ -238,6 +239,87 @@ void setError(std::string *destination, std::string value) {
   return true;
 }
 
+// The identity every automation message names. A gesture close carries this
+// much and nothing else: ending a touch names no value.
+[[nodiscard]] bool decodeAutomationTarget(const ValueView payload,
+                                          RoutedAutomationEdit &edit,
+                                          std::string *error) {
+  const auto pluginId = payload["pluginId"].getWithDefault<std::int64_t>(0);
+  const auto elementIndex = payload["elementIndex"].getWithDefault<std::int64_t>(0);
+  edit.pipeline = payload["pipeline"].getWithDefault<std::string>("A") == "B" ? 'B' : 'A';
+  edit.pluginType = payload["pluginType"].getWithDefault<std::string>({});
+  edit.parameterKey = payload["parameterKey"].getWithDefault<std::string>({});
+  if (pluginId <= 0 || pluginId > std::numeric_limits<std::uint32_t>::max() ||
+      elementIndex < 0 || elementIndex > std::numeric_limits<std::uint32_t>::max() ||
+      edit.pluginType.empty() || edit.parameterKey.empty()) {
+    setError(error, "Automation edit has an invalid target or value");
+    return false;
+  }
+  edit.pluginId = static_cast<std::uint32_t>(pluginId);
+  edit.elementIndex = static_cast<std::uint32_t>(elementIndex);
+  return true;
+}
+
+[[nodiscard]] bool decodeAutomationEdit(const ValueView payload,
+                                        RoutedAutomationEdit &edit, std::string *error) {
+  edit.normalized = payload["normalized"].getWithDefault<double>(-1.0);
+  edit.bindIfUnbound = payload["bindIfUnbound"].getWithDefault<bool>(true);
+  edit.beginGesture = payload["beginGesture"].getWithDefault<bool>(true);
+  edit.endGesture = payload["endGesture"].getWithDefault<bool>(true);
+  if (!decodeAutomationTarget(payload, edit, error)) {
+    return false;
+  }
+  if (!std::isfinite(edit.normalized) || edit.normalized < 0.0 ||
+      edit.normalized > 1.0) {
+    setError(error, "Automation edit has an invalid target or value");
+    return false;
+  }
+  return true;
+}
+
+// A message without the array comes from an older UI: it simply names no
+// explicit automation intent, so it keeps the previous behaviour.
+[[nodiscard]] bool decodeAutomationEdits(const ValueView array,
+                                         std::vector<RoutedAutomationEdit> &edits,
+                                         std::string *error) {
+  if (array.isVoid()) {
+    return true;
+  }
+  if (!array.isArray()) {
+    setError(error, "Automation edits payload must be an array");
+    return false;
+  }
+  edits.reserve(array.size());
+  for (std::uint32_t index = 0; index < array.size(); ++index) {
+    RoutedAutomationEdit edit;
+    if (!decodeAutomationEdit(array[index], edit, error)) {
+      return false;
+    }
+    edits.push_back(std::move(edit));
+  }
+  return true;
+}
+
+// The identities one closing touch releases. A malformed entry aborts the whole
+// message, exactly as it does for the value-carrying array above.
+[[nodiscard]] bool decodeAutomationTargets(const ValueView array,
+                                           std::vector<RoutedAutomationEdit> &targets,
+                                           std::string *error) {
+  if (!array.isArray()) {
+    setError(error, "Automation gesture targets must be an array");
+    return false;
+  }
+  targets.reserve(array.size());
+  for (std::uint32_t index = 0; index < array.size(); ++index) {
+    RoutedAutomationEdit target;
+    if (!decodeAutomationTarget(array[index], target, error)) {
+      return false;
+    }
+    targets.push_back(std::move(target));
+  }
+  return true;
+}
+
 void decodeOversampling(const ValueView payload, OversamplingSettings &settings) {
   const auto factor = payload["factor"].getWithDefault<std::int64_t>(1);
   if (factor == 1 || factor == 2 || factor == 4 || factor == 8) {
@@ -274,6 +356,7 @@ bool MessageRouter::decode(const std::string_view json, RoutedUiMessage &message
 
     if (type == "host/getInfo") {
       decoded.action = UiAction::hostInfo;
+      decoded.startupHandshake = payload["startup"].getWithDefault<bool>(false);
     } else if (type == "host/openExternal") {
       decoded.action = UiAction::openExternalUrl;
       decoded.url = payload["url"].getWithDefault<std::string>({});
@@ -285,7 +368,9 @@ bool MessageRouter::decode(const std::string_view json, RoutedUiMessage &message
       decoded.action = UiAction::rebuildPipeline;
       decoded.pipeline = payload["pipeline"].getWithDefault<std::string>("A") == "B" ? 'B' : 'A';
       decoded.masterBypass = payload["masterBypass"].getWithDefault<bool>(false);
-      if (!decodePlugins(payload["plugins"], decoded.plugins, error)) {
+      if (!decodePlugins(payload["plugins"], decoded.plugins, error) ||
+          !decodeAutomationEdits(payload["automationEdits"], decoded.automationEdits,
+                                 error)) {
         return false;
       }
     } else if (type == "pipeline/restoreHistory") {
@@ -300,15 +385,45 @@ bool MessageRouter::decode(const std::string_view json, RoutedUiMessage &message
           !decodePlugins(payload["pipelineB"], decoded.pipelineB, error)) {
         return false;
       }
+      if (!decodeAutomationEdits(payload["automationEdits"], decoded.automationEdits,
+                                 error)) {
+        return false;
+      }
     } else if (type == "pipeline/updatePlugin") {
       decoded.action = UiAction::updatePlugin;
       decoded.pipeline = payload["pipeline"].getWithDefault<std::string>("A") == "B" ? 'B' : 'A';
       RoutedPlugin plugin;
       const auto value = payload["plugin"].isObject() ? payload["plugin"] : payload;
-      if (!decodePlugin(value, plugin, error)) {
+      if (!decodePlugin(value, plugin, error) ||
+          !decodeAutomationEdits(payload["automationEdits"], decoded.automationEdits,
+                                 error)) {
         return false;
       }
       decoded.plugins.push_back(std::move(plugin));
+    } else if (type == "automation/edit") {
+      decoded.action = UiAction::editAutomationParameter;
+      RoutedAutomationEdit edit;
+      if (!decodeAutomationEdit(payload, edit, error)) {
+        return false;
+      }
+      // A single gesture keeps its flat shape: the bulk array exists only so a
+      // message that also carries pipelines can name several targets at once.
+      decoded.pipeline = edit.pipeline;
+      decoded.pluginId = edit.pluginId;
+      decoded.elementIndex = edit.elementIndex;
+      decoded.normalizedValue = edit.normalized;
+      decoded.pluginType = std::move(edit.pluginType);
+      decoded.parameterKey = std::move(edit.parameterKey);
+    } else if (type == "automation/endGesture") {
+      // The release of a pointer gesture, which names only the targets it
+      // moved. There is no value here on purpose: the values already travelled
+      // with the plug-in images that carried them, and a close that restated
+      // one would write an automation point the user never performed.
+      decoded.action = UiAction::endAutomationGesture;
+      if (!decodeAutomationTargets(payload["targets"], decoded.automationEdits,
+                                   error)) {
+        return false;
+      }
     } else if (type == "pipeline/assetBegin") {
       decoded.action = UiAction::beginPluginAsset;
       if (!decodeAssetBegin(payload, decoded, error)) {

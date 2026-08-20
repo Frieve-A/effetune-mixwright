@@ -1,5 +1,7 @@
 #include "bridge/state_codec.h"
 
+#include "engine/automation_binding.h"
+
 #include "choc/text/choc_JSON.h"
 
 #include <algorithm>
@@ -26,6 +28,54 @@ Value objectFromJson(const std::string &json) {
   } catch (const choc::json::ParseError &) {
   }
   return choc::value::createObject({});
+}
+
+Value mergeJsonValues(const ValueView preserved, const ValueView incoming) {
+  if (preserved.isObject() && incoming.isObject()) {
+    auto merged = choc::value::createObject({});
+    for (std::uint32_t index = 0; index < preserved.size(); ++index) {
+      const auto member = preserved.getObjectMemberAt(index);
+      if (!incoming.hasObjectMember(member.name)) {
+        merged.addMember(member.name, Value(member.value));
+      }
+    }
+    for (std::uint32_t index = 0; index < incoming.size(); ++index) {
+      const auto member = incoming.getObjectMemberAt(index);
+      const auto oldValue = preserved[member.name];
+      merged.addMember(member.name, oldValue.isVoid()
+                                        ? Value(member.value)
+                                        : mergeJsonValues(oldValue, member.value));
+    }
+    return merged;
+  }
+
+  if (preserved.isArray() && incoming.isArray()) {
+    auto merged = choc::value::createEmptyArray();
+    for (std::uint32_t index = 0; index < incoming.size(); ++index) {
+      merged.addArrayElement(index < preserved.size()
+                                 ? mergeJsonValues(preserved[index], incoming[index])
+                                 : Value(incoming[index]));
+    }
+    return merged;
+  }
+
+  return Value(incoming);
+}
+
+std::string serializedPluginType(const PluginState &plugin) {
+  return objectFromJson(plugin.extraJson)["type"].getWithDefault<std::string>({});
+}
+
+bool samePluginIdentity(const PluginState &left, const PluginState &right) {
+  if (left.id != right.id) {
+    return false;
+  }
+  const auto leftType = serializedPluginType(left);
+  const auto rightType = serializedPluginType(right);
+  if (!leftType.empty() && !rightType.empty()) {
+    return leftType == rightType;
+  }
+  return left.name == right.name;
 }
 
 std::string unknownMembersJson(const ValueView object,
@@ -56,6 +106,48 @@ std::string qualityToString(const FilterQuality quality) {
   default:
     return "medium";
   }
+}
+
+std::string lifecycleToString(const AutomationBindingLifecycle lifecycle) {
+  switch (lifecycle) {
+  case AutomationBindingLifecycle::active:
+    return "active";
+  case AutomationBindingLifecycle::tombstone:
+    return "tombstone";
+  case AutomationBindingLifecycle::dormant:
+  default:
+    return "dormant";
+  }
+}
+
+AutomationBindingLifecycle lifecycleFromString(const std::string_view lifecycle) noexcept {
+  if (lifecycle == "active") {
+    return AutomationBindingLifecycle::active;
+  }
+  if (lifecycle == "tombstone") {
+    return AutomationBindingLifecycle::tombstone;
+  }
+  return AutomationBindingLifecycle::dormant;
+}
+
+Value encodeAutomation(const AutomationState &automation) {
+  auto object = objectFromJson(automation.extraJson);
+  object.addMember("logicalPluginIdWatermark",
+                   static_cast<std::int64_t>(automation.logicalPluginIdWatermark));
+  auto bindings = choc::value::createEmptyArray();
+  for (const auto &binding : automation.bindings) {
+    auto encoded = objectFromJson(binding.extraJson);
+    encoded.addMember("slot", static_cast<std::int64_t>(binding.slot));
+    encoded.addMember("pipeline", std::string(1, binding.pipeline == 'B' ? 'B' : 'A'));
+    encoded.addMember("pluginId", static_cast<std::int64_t>(binding.pluginId));
+    encoded.addMember("pluginType", binding.pluginType);
+    encoded.addMember("parameterKey", binding.parameterKey);
+    encoded.addMember("elementIndex", static_cast<std::int64_t>(binding.elementIndex));
+    encoded.addMember("lifecycle", lifecycleToString(binding.lifecycle));
+    bindings.addArrayElement(std::move(encoded));
+  }
+  object.addMember("bindings", std::move(bindings));
+  return object;
 }
 
 Value encodePipeline(const PipelineState &pipeline) {
@@ -140,8 +232,16 @@ bool decodePipeline(const ValueView array, PipelineState &pipeline, std::uint32_
       continue;
     }
     PluginState plugin;
-    plugin.id = readId(item, nextId++);
-    nextId = std::max(nextId, plugin.id + 1u);
+    const auto encodedId = item["id"].getWithDefault<std::int64_t>(0);
+    if ((encodedId <= 0 || encodedId > UINT32_MAX) && nextId == 0) {
+      continue;
+    }
+    plugin.id = readId(item, nextId);
+    if (plugin.id == UINT32_MAX) {
+      nextId = 0;
+    } else if (nextId != 0) {
+      nextId = std::max(nextId, plugin.id + 1u);
+    }
     plugin.name = item["name"].getWithDefault<std::string>({});
     const bool shortForm = plugin.name.empty();
     if (shortForm) {
@@ -195,6 +295,64 @@ void decodeOversampling(const ValueView object, OversamplingSettings &settings) 
   }
 }
 
+bool decodeAutomation(const ValueView object, AutomationState &automation) {
+  if (!object.isObject()) {
+    return true;
+  }
+  automation.initialized = true;
+  const auto watermark =
+      object["logicalPluginIdWatermark"].getWithDefault<std::int64_t>(0);
+  if (watermark >= 0 && watermark <= UINT32_MAX) {
+    automation.logicalPluginIdWatermark = static_cast<std::uint32_t>(watermark);
+  }
+  static const std::unordered_set<std::string_view> knownAutomationFields{
+      "logicalPluginIdWatermark", "bindings"};
+  automation.extraJson = unknownMembersJson(object, knownAutomationFields);
+
+  const auto bindings = object["bindings"];
+  if (!bindings.isArray()) {
+    return true;
+  }
+  if (bindings.size() > kAutomationSlotCount) {
+    return false;
+  }
+  automation.bindings.reserve(bindings.size());
+  for (std::uint32_t index = 0; index < bindings.size(); ++index) {
+    const auto encoded = bindings[index];
+    if (!encoded.isObject()) {
+      continue;
+    }
+    const auto slot = encoded["slot"].getWithDefault<std::int64_t>(-1);
+    const auto pluginId = encoded["pluginId"].getWithDefault<std::int64_t>(0);
+    const auto elementIndex = encoded["elementIndex"].getWithDefault<std::int64_t>(0);
+    const auto pluginType = encoded["pluginType"].getWithDefault<std::string>({});
+    const auto parameterKey = encoded["parameterKey"].getWithDefault<std::string>({});
+    if (slot >= static_cast<std::int64_t>(kAutomationSlotCount)) {
+      return false;
+    }
+    if (slot < 0 || pluginId <= 0 || pluginId > UINT32_MAX ||
+        elementIndex < 0 || elementIndex > UINT32_MAX || pluginType.empty() ||
+        parameterKey.empty()) {
+      continue;
+    }
+    AutomationBindingState binding;
+    binding.slot = static_cast<std::uint32_t>(slot);
+    binding.pipeline = encoded["pipeline"].getWithDefault<std::string>("A") == "B" ? 'B' : 'A';
+    binding.pluginId = static_cast<std::uint32_t>(pluginId);
+    binding.pluginType = pluginType;
+    binding.parameterKey = parameterKey;
+    binding.elementIndex = static_cast<std::uint32_t>(elementIndex);
+    binding.lifecycle = lifecycleFromString(
+        encoded["lifecycle"].getWithDefault<std::string>("dormant"));
+    static const std::unordered_set<std::string_view> knownBindingFields{
+        "slot",       "pipeline",     "pluginId",  "pluginType",
+        "parameterKey", "elementIndex", "lifecycle"};
+    binding.extraJson = unknownMembersJson(encoded, knownBindingFields);
+    automation.bindings.push_back(std::move(binding));
+  }
+  return true;
+}
+
 } // namespace
 
 std::string StateCodec::encode(const PluginStateDocument &state) {
@@ -214,6 +372,9 @@ std::string StateCodec::encode(const PluginStateDocument &state) {
   ui.addMember("columns", static_cast<std::int64_t>(state.ui.columns));
   ui.addMember("zoom", state.ui.zoom);
   root.addMember("ui", std::move(ui));
+  if (state.automation.initialized) {
+    root.addMember("automation", encodeAutomation(state.automation));
+  }
   return choc::json::toString(root, true);
 }
 
@@ -240,8 +401,23 @@ bool StateCodec::decode(const std::string_view json, PluginStateDocument &state,
       decoded.appVersion = root["appVersion"].getWithDefault<std::string>("unknown");
       static const std::unordered_set<std::string_view> knownRootFields{
           "formatVersion", "appVersion", "pipelineA", "pipelineB", "pipeline",
-          "plugins", "currentPipeline", "masterBypass", "oversampling", "ui"};
+          "plugins", "currentPipeline", "masterBypass", "oversampling", "ui",
+          "automation"};
       decoded.extraJson = unknownMembersJson(root, knownRootFields);
+
+      // Reserve every historical logical ID before assigning IDs to legacy
+      // pipeline entries which did not serialize one themselves.
+      if (!decodeAutomation(root["automation"], decoded.automation)) {
+        if (error != nullptr) {
+          *error = "Invalid automation bindings";
+        }
+        return false;
+      }
+      if (decoded.automation.logicalPluginIdWatermark == UINT32_MAX) {
+        nextId = 0;
+      } else if (decoded.automation.logicalPluginIdWatermark != 0) {
+        nextId = decoded.automation.logicalPluginIdWatermark + 1u;
+      }
 
       if (root["pipelineA"].isArray()) {
         (void)decodePipeline(root["pipelineA"], decoded.pipelineA, nextId);
@@ -287,13 +463,9 @@ bool StateCodec::decode(const std::string_view json, PluginStateDocument &state,
 
 std::string mergeExtraJsonObjects(const std::string_view preserved,
                                   const std::string_view incoming) {
-  auto merged = objectFromJson(std::string(preserved));
+  const auto base = objectFromJson(std::string(preserved));
   const auto overlay = objectFromJson(std::string(incoming));
-  for (std::uint32_t index = 0; index < overlay.size(); ++index) {
-    const auto member = overlay.getObjectMemberAt(index);
-    merged.setMember(member.name, member.value);
-  }
-  return choc::json::toString(merged);
+  return choc::json::toString(mergeJsonValues(base, overlay));
 }
 
 PipelineState reconcilePipelineSnapshot(const PipelineState &preserved, PipelineState incoming,
@@ -304,8 +476,7 @@ PipelineState reconcilePipelineSnapshot(const PipelineState &preserved, Pipeline
   for (auto &plugin : incoming.plugins) {
     const auto old = std::find_if(preserved.plugins.begin(), preserved.plugins.end(),
                                   [&plugin](const PluginState &candidate) {
-                                    return candidate.id == plugin.id &&
-                                           candidate.name == plugin.name;
+                                    return samePluginIdentity(candidate, plugin);
                                   });
     if (old != preserved.plugins.end()) {
       plugin.extraJson = mergeExtraJsonObjects(old->extraJson, plugin.extraJson);
@@ -319,8 +490,7 @@ PipelineState reconcilePipelineSnapshot(const PipelineState &preserved, Pipeline
     const auto &old = preserved.plugins[oldIndex];
     const auto restored = std::find_if(merged.plugins.begin(), merged.plugins.end(),
                                        [&old](const PluginState &candidate) {
-                                         return candidate.id == old.id &&
-                                                candidate.name == old.name;
+                                         return samePluginIdentity(old, candidate);
                                        });
     if (restored != merged.plugins.end() || (!old.unknown && !preserveAllMissing)) {
       continue;
@@ -334,7 +504,7 @@ PipelineState reconcilePipelineSnapshot(const PipelineState &preserved, Pipeline
       const auto &next = preserved.plugins[nextIndex];
       insertion = std::find_if(merged.plugins.begin(), merged.plugins.end(),
                                [&next](const PluginState &candidate) {
-                                 return candidate.id == next.id && candidate.name == next.name;
+                                 return samePluginIdentity(next, candidate);
                                });
       if (insertion != merged.plugins.end()) {
         break;
@@ -353,8 +523,7 @@ PipelineState UndoOpaqueStateStore::reconcile(const char pipeline,
     const auto recovered = std::find_if(entries_.rbegin(), entries_.rend(),
                                         [pipeline, &plugin](const Entry &entry) {
                                           return entry.pipeline == pipeline &&
-                                                 entry.plugin.id == plugin.id &&
-                                                 entry.plugin.name == plugin.name;
+                                                 samePluginIdentity(entry.plugin, plugin);
                                         });
     if (recovered == entries_.rend()) {
       continue;
@@ -369,14 +538,13 @@ PipelineState UndoOpaqueStateStore::reconcile(const char pipeline,
     for (const auto &old : preserved.plugins) {
       const auto retained = std::find_if(incoming.plugins.begin(), incoming.plugins.end(),
                                          [&old](const PluginState &plugin) {
-                                           return plugin.id == old.id && plugin.name == old.name;
+                                           return samePluginIdentity(old, plugin);
                                          });
       if (old.unknown || retained != incoming.plugins.end()) {
         continue;
       }
       std::erase_if(entries_, [pipeline, &old](const Entry &entry) {
-        return entry.pipeline == pipeline && entry.plugin.id == old.id &&
-               entry.plugin.name == old.name;
+        return entry.pipeline == pipeline && samePluginIdentity(entry.plugin, old);
       });
       if (entries_.size() == kMaxEntries) {
         entries_.erase(entries_.begin());

@@ -49,6 +49,26 @@ struct PipelineState {
   std::vector<PluginState> plugins;
 };
 
+enum class AutomationBindingLifecycle { active, dormant, tombstone };
+
+struct AutomationBindingState {
+  std::uint32_t slot = 0;
+  char pipeline = 'A';
+  std::uint32_t pluginId = 0;
+  std::string pluginType;
+  std::string parameterKey;
+  std::uint32_t elementIndex = 0;
+  AutomationBindingLifecycle lifecycle = AutomationBindingLifecycle::dormant;
+  std::string extraJson = "{}";
+};
+
+struct AutomationState {
+  bool initialized = false;
+  std::uint32_t logicalPluginIdWatermark = 0;
+  std::vector<AutomationBindingState> bindings;
+  std::string extraJson = "{}";
+};
+
 struct PluginStateDocument {
   std::uint32_t formatVersion = 1;
   std::string appVersion = "0.4.0";
@@ -59,6 +79,7 @@ struct PluginStateDocument {
   bool masterBypass = false;
   OversamplingSettings oversampling;
   UiSettings ui;
+  AutomationState automation;
   std::string extraJson = "{}";
 };
 

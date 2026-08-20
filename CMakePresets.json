@@ -15,7 +15,8 @@
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "EFFETUNE_BUILD_PLUGIN": "ON",
         "EFFETUNE_BUILD_TESTS": "ON",
-        "EFFETUNE_BUILD_TOOLS": "ON"
+        "EFFETUNE_BUILD_TOOLS": "ON",
+        "EFFETUNE_AUTOMATION_HOST_GATE_FIXTURE": "OFF"
       },
       "condition": {
         "type": "equals",
@@ -35,6 +36,15 @@
       "inherits": "windows-base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "windows-automation-host-gate",
+      "inherits": "windows-base",
+      "binaryDir": "${sourceDir}/build/windows-automation-host-gate",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "EFFETUNE_AUTOMATION_HOST_GATE_FIXTURE": "ON"
       }
     },
     {
@@ -72,6 +82,10 @@
   "buildPresets": [
     { "name": "windows-debug", "configurePreset": "windows-debug" },
     { "name": "windows-release", "configurePreset": "windows-release" },
+    {
+      "name": "windows-automation-host-gate",
+      "configurePreset": "windows-automation-host-gate"
+    },
     { "name": "mac-debug", "configurePreset": "mac-debug" },
     { "name": "mac-release", "configurePreset": "mac-release" }
   ],
@@ -84,6 +98,11 @@
     {
       "name": "windows-release",
       "configurePreset": "windows-release",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "windows-automation-host-gate",
+      "configurePreset": "windows-automation-host-gate",
       "output": { "outputOnFailure": true }
     },
     {

@@ -2,17 +2,209 @@
 #include "plugin/editor_size.h"
 
 #include <Windows.h>
+#include <TlHelp32.h>
 
 #include <atomic>
 #include <chrono>
-#include <filesystem>
 #include <exception>
+#include <filesystem>
 #include <iostream>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_set>
+#include <vector>
+
+#include "../support/crt_dialog_suppression.h"
 
 namespace {
+
+class ScopedWebViewProfile {
+public:
+  ScopedWebViewProfile() {
+    constexpr wchar_t environmentName[] = L"WEBVIEW2_USER_DATA_FOLDER";
+    const auto previousLength =
+        GetEnvironmentVariableW(environmentName, nullptr, 0);
+    if (previousLength != 0) {
+      previousValue_.resize(previousLength);
+      const auto copied = GetEnvironmentVariableW(
+          environmentName, previousValue_.data(), previousLength);
+      if (copied != 0 && copied < previousLength) {
+        previousValue_.resize(copied);
+        hadPreviousValue_ = true;
+      }
+    }
+    std::error_code error;
+    const auto tempRoot = std::filesystem::temp_directory_path(error);
+    if (error) {
+      return;
+    }
+    const auto prefix = L"effetune-webview-smoke-" +
+                        std::to_wstring(GetCurrentProcessId()) + L"-" +
+                        std::to_wstring(GetTickCount64());
+    for (std::uint32_t attempt = 0; attempt < 32; ++attempt) {
+      auto candidate = tempRoot / (prefix + L"-" + std::to_wstring(attempt));
+      error.clear();
+      if (std::filesystem::create_directory(candidate, error)) {
+        path_ = std::move(candidate);
+        break;
+      }
+      if (error) {
+        return;
+      }
+    }
+    if (path_.empty() ||
+        SetEnvironmentVariableW(environmentName, path_.c_str()) == FALSE) {
+      (void)SetEnvironmentVariableW(
+          environmentName, hadPreviousValue_ ? previousValue_.c_str() : nullptr);
+      error.clear();
+      if (!path_.empty()) {
+        std::filesystem::remove(path_, error);
+      }
+      path_.clear();
+      return;
+    }
+    configured_ = true;
+  }
+
+  ~ScopedWebViewProfile() {
+    if (!cleanupAttempted_) {
+      (void)cleanup();
+    }
+  }
+
+  ScopedWebViewProfile(const ScopedWebViewProfile &) = delete;
+  ScopedWebViewProfile &operator=(const ScopedWebViewProfile &) = delete;
+
+  [[nodiscard]] bool configured() const noexcept { return configured_; }
+  [[nodiscard]] const std::filesystem::path &path() const noexcept { return path_; }
+
+  void captureChildProcesses() {
+    bool scanSucceeded = false;
+    const auto descendants = currentDescendants(scanSucceeded);
+    if (!scanSucceeded) {
+      processScanFailed_ = true;
+      return;
+    }
+    for (const auto processId : descendants) {
+      if (capturedProcessIds_.contains(processId)) {
+        continue;
+      }
+      const auto process = OpenProcess(SYNCHRONIZE, FALSE, processId);
+      if (process != nullptr) {
+        capturedProcessIds_.insert(processId);
+        childProcesses_.push_back(process);
+      }
+    }
+  }
+
+  [[nodiscard]] bool cleanup() {
+    cleanupAttempted_ = true;
+    restoreEnvironment();
+    captureChildProcesses();
+
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(10);
+    bool childrenExited = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+      captureChildProcesses();
+      childrenExited = true;
+      for (const auto process : childProcesses_) {
+        if (WaitForSingleObject(process, 0) == WAIT_TIMEOUT) {
+          childrenExited = false;
+          break;
+        }
+      }
+      bool scanSucceeded = false;
+      const auto descendants = currentDescendants(scanSucceeded);
+      if (childrenExited && scanSucceeded && descendants.empty()) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    for (const auto process : childProcesses_) {
+      CloseHandle(process);
+    }
+    childProcesses_.clear();
+
+    bool finalScanSucceeded = false;
+    const auto finalDescendants = currentDescendants(finalScanSucceeded);
+    if (processScanFailed_ || !childrenExited || !finalScanSucceeded ||
+        !finalDescendants.empty()) {
+      return false;
+    }
+    std::error_code error;
+    std::filesystem::remove_all(path_, error);
+    return !error && !std::filesystem::exists(path_, error);
+  }
+
+private:
+  [[nodiscard]] static std::unordered_set<DWORD>
+  currentDescendants(bool &scanSucceeded) {
+    std::unordered_set<DWORD> descendants;
+    const auto snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+      return descendants;
+    }
+
+    struct ProcessEntry {
+      DWORD id = 0;
+      DWORD parentId = 0;
+      std::wstring executable;
+    };
+    std::vector<ProcessEntry> processes;
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    if (Process32FirstW(snapshot, &entry) == FALSE) {
+      CloseHandle(snapshot);
+      return descendants;
+    }
+    do {
+      processes.push_back({entry.th32ProcessID, entry.th32ParentProcessID,
+                           entry.szExeFile});
+    } while (Process32NextW(snapshot, &entry) != FALSE);
+    CloseHandle(snapshot);
+    scanSucceeded = true;
+
+    std::unordered_set<DWORD> ancestry{GetCurrentProcessId()};
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (const auto &process : processes) {
+        if (ancestry.contains(process.parentId) &&
+            ancestry.insert(process.id).second) {
+          changed = true;
+        }
+      }
+    }
+    for (const auto &process : processes) {
+      if (process.id != GetCurrentProcessId() && ancestry.contains(process.id) &&
+          _wcsicmp(process.executable.c_str(), L"msedgewebview2.exe") == 0) {
+        descendants.insert(process.id);
+      }
+    }
+    return descendants;
+  }
+
+  void restoreEnvironment() noexcept {
+    if (!configured_) {
+      return;
+    }
+    constexpr wchar_t environmentName[] = L"WEBVIEW2_USER_DATA_FOLDER";
+    (void)SetEnvironmentVariableW(
+        environmentName, hadPreviousValue_ ? previousValue_.c_str() : nullptr);
+    configured_ = false;
+  }
+
+  std::filesystem::path path_;
+  std::wstring previousValue_;
+  std::unordered_set<DWORD> capturedProcessIds_;
+  std::vector<HANDLE> childProcesses_;
+  bool hadPreviousValue_ = false;
+  bool configured_ = false;
+  bool cleanupAttempted_ = false;
+  bool processScanFailed_ = false;
+};
 
 LRESULT CALLBACK parentWindowProcedure(HWND window, const UINT message, const WPARAM wParam,
                                        const LPARAM lParam) {
@@ -138,8 +330,14 @@ struct SmokeState {
 } // namespace
 
 int main() {
+  effetune::vst::testing::suppressCrtModalDialogs();
   const auto errorMode = SetErrorMode(0);
   SetErrorMode(errorMode | SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+  ScopedWebViewProfile webViewProfile;
+  if (!webViewProfile.configured()) {
+    std::cerr << "Unable to create an isolated WebView2 user-data profile\n";
+    return 1;
+  }
   const auto instance = GetModuleHandleW(nullptr);
   constexpr wchar_t className[] = L"EffeTuneWebViewSmokeParent";
   WNDCLASSW windowClass{};
@@ -167,6 +365,7 @@ int main() {
   std::atomic_bool uiReady{false};
   std::string evaluationError;
   std::string evaluationResult;
+  std::string readinessDiagnostics;
   bool telemetryDelivered = false;
   bool dynamicLatencyServiced = false;
   bool historyUsedSingleNativeRestore = false;
@@ -188,18 +387,22 @@ int main() {
   bool defaultViewportFits = false;
   bool reattachedWithFreshWebView = false;
   bool recoveredAfterParentDestruction = false;
+  bool reopenedReadyEditorWasRebuilt = false;
   bool missingResourceGuidanceShown = false;
+  bool multiThreadedApartmentDiagnosed = false;
+  bool editorReportedReady = false;
   bool attached = false;
   {
     int firstEditorOwner = 0;
     int secondEditorOwner = 0;
     int thirdEditorOwner = 0;
+    int fourthEditorOwner = 0;
     void *activeEditorOwner = &firstEditorOwner;
     effetune::vst::WebViewHost webView(
         [&smokeState](const std::string_view request) {
           return responseFor(request, smokeState);
         },
-        std::filesystem::path(EFFETUNE_WEBVIEW_ASSET_DIR));
+        std::filesystem::path(EFFETUNE_WEBVIEW_ASSET_DIR), false);
     attached = webView.attach(activeEditorOwner, parent,
                               effetune::vst::plugin::kDefaultEditorWidth,
                               effetune::vst::plugin::kDefaultEditorHeight);
@@ -280,11 +483,22 @@ int main() {
         return false;
       };
 
+      if (!uiReady.load(std::memory_order_acquire)) {
+        (void)evaluate(
+            "JSON.stringify({href:window.location.href,readyState:document.readyState,"
+            "title:document.title,loadError:document.documentElement.dataset.effetuneLoadError||'',"
+            "body:(document.body?.innerText||'').slice(0,240)})",
+            readinessDiagnostics);
+      }
+
       if (uiReady.load(std::memory_order_acquire)) {
         std::string ignored;
         isolatedWebOrigin = evaluate(
             "window.location.origin === 'https://effetune-mixwright.localhost'",
             ignored) && ignored == "true";
+        webView.serviceInitialisation();
+        editorReportedReady =
+            webView.status() == effetune::vst::WebViewStatus::ready;
         unsupportedStateWarningShown = waitForJavascript(
             "window.app?.initialized === true && "
             "window.audioManager?.unsupportedWarningShown === true && "
@@ -348,28 +562,59 @@ int main() {
         historyUsedSingleNativeRestore =
             historyReady && historyRestoreStarted && historyRequestVerified && historyWrapperRestored;
 
-        const auto updateRoutingChecked = evaluate(
-            "(() => { const audio = window.audioManager; if (!audio?.nativePort) return false; "
-            "const originalHostCall = window.__effetuneHostCall; "
-            "const originalState = { pipelineA: audio.pipelineA, pipelineB: audio.pipelineB, "
-            "pipeline: audio.pipeline, currentPipeline: audio.currentPipeline }; "
-            "const calls = []; window.__effetuneHostCall = (type, payload) => { "
-            "if (type === 'pipeline/updatePlugin') { calls.push(payload); "
-            "return Promise.resolve({ ok: true }); } return originalHostCall(type, payload); }; "
-            "try { audio.pipelineA = [{ id: 6101, name: 'Active A' }]; "
-            "audio.pipelineB = [{ id: 6102, name: 'Inactive B' }]; "
-            "audio.currentPipeline = 'A'; audio.pipeline = audio.pipelineA; "
-            "audio.nativePort.postMessage({ type: 'updatePlugin', plugin: { id: 6102, "
-            "type: 'Gain', enabled: true, parameters: {} } }); "
-            "audio.nativePort.postMessage({ type: 'updatePlugin', plugin: { id: 6103, "
-            "type: 'Gain', enabled: true, parameters: {} } }); "
-            "return calls.length === 1 && calls[0].pipeline === 'B' && "
-            "calls[0].plugin.name === 'Inactive B'; } finally { "
-            "audio.pipelineA = originalState.pipelineA; audio.pipelineB = originalState.pipelineB; "
-            "audio.pipeline = originalState.pipeline; audio.currentPipeline = "
-            "originalState.currentPipeline; window.__effetuneHostCall = originalHostCall; } })()",
-            ignored);
-        updatePluginRoutedByOwnership = updateRoutingChecked && ignored == "true";
+        // What is under test here is which pipeline an individual update is
+        // routed to, not when the coalesced image leaves. This WebView is parented
+        // offscreen and never composited, so it may receive no animation frames at
+        // all while document.hidden stays false; publishing the queue explicitly
+        // keeps the verdict independent of that. The per-frame coalescing itself is
+        // verified deterministically in tests/esm/vst-audio-manager.test.mjs.
+        // Staying synchronous also confines the window in which the real pipelines
+        // and the real bridge are replaced by stubs to this single evaluation, so a
+        // concurrent update from the live UI cannot be silently dropped.
+        std::string updateRouteResult;
+        updatePluginRoutedByOwnership = evaluate(
+            R"JS((() => {
+              const audio = window.audioManager;
+              if (!audio?.nativePort) return false;
+              // Anything the running UI already queued belongs to the real bridge,
+              // so it leaves before the stub is installed.
+              audio.nativePort.flushPluginUpdates();
+              const originalHostCall = window.__effetuneHostCall;
+              const restored = {
+                pipelineA: audio.pipelineA,
+                pipelineB: audio.pipelineB,
+                pipeline: audio.pipeline,
+                currentPipeline: audio.currentPipeline
+              };
+              const calls = [];
+              try {
+                window.__effetuneHostCall = (type, payload) => {
+                  if (type !== 'pipeline/updatePlugin') return originalHostCall(type, payload);
+                  calls.push(payload);
+                  return Promise.resolve({ ok: true });
+                };
+                audio.pipelineA = [{ id: 6101, name: 'Active A' }];
+                audio.pipelineB = [{ id: 6102, name: 'Inactive B' }];
+                audio.currentPipeline = 'A';
+                audio.pipeline = audio.pipelineA;
+                audio.nativePort.postMessage({ type: 'updatePlugin',
+                  plugin: { id: 6102, type: 'Gain', enabled: true, parameters: {} } });
+                audio.nativePort.postMessage({ type: 'updatePlugin',
+                  plugin: { id: 6103, type: 'Gain', enabled: true, parameters: {} } });
+                audio.nativePort.flushPluginUpdates();
+              } finally {
+                audio.pipelineA = restored.pipelineA;
+                audio.pipelineB = restored.pipelineB;
+                audio.pipeline = restored.pipeline;
+                audio.currentPipeline = restored.currentPipeline;
+                window.__effetuneHostCall = originalHostCall;
+              }
+              // The update owned by the inactive pipeline is routed to B, and the
+              // one owned by neither is dropped rather than routed anywhere.
+              return calls.length === 1 && calls[0].pipeline === 'B' &&
+                calls[0].plugin.name === 'Inactive B';
+            })())JS",
+            updateRouteResult) && updateRouteResult == "true";
 
         const auto installedTelemetrySubscriber = evaluate(
             "(() => { window.__vstSmokeTelemetryFrames = 0; "
@@ -806,15 +1051,59 @@ int main() {
                     rebuildCallsBeforeRecovery;
           }
         }
+
+        // Every reattachment above reopens before the replacement WebView has
+        // finished starting, which is the one case attach() is allowed to reuse
+        // it. Let it become fully ready first, so this covers the other case: a
+        // WebView whose controller was created under the previous parent must be
+        // rebuilt rather than reparented, or some hosts show a blank editor on
+        // the second open.
+        if (recoveredAfterParentDestruction) {
+          webView.detach(&thirdEditorOwner);
+          // sessionStorage is the discriminator that matters here: it belongs to
+          // the WebView's browsing context, so it survives a navigation but not a
+          // replacement. A document-level marker would prove nothing, because
+          // navigating a reused WebView clears that too.
+          std::string idleMarker;
+          const auto replacementFinishedLoading = waitForJavascript(
+              "window.app?.initialized === true", std::chrono::seconds(20)) &&
+              evaluate("sessionStorage.setItem('vstIdleReopenProbe', 'stale'); "
+                       "sessionStorage.getItem('vstIdleReopenProbe') === 'stale'",
+                       idleMarker) &&
+              idleMarker == "true";
+          const auto idleParent = createParent();
+          const auto idleParentHandleChanged =
+              idleParent != nullptr && idleParent != parent;
+          DestroyWindow(parent);
+          parent = idleParent;
+          smokeState.pipelineStateRead.store(false, std::memory_order_release);
+          activeEditorOwner = &fourthEditorOwner;
+          if (replacementFinishedLoading && idleParentHandleChanged &&
+              webView.attach(activeEditorOwner, parent,
+                             effetune::vst::plugin::kDefaultEditorWidth,
+                             effetune::vst::plugin::kDefaultEditorHeight)) {
+            ShowWindow(parent, SW_SHOWNOACTIVATE);
+            const auto child = GetWindow(parent, GW_CHILD);
+            reopenedReadyEditorWasRebuilt = child != nullptr &&
+                GetParent(child) == parent &&
+                waitForJavascript(
+                    "sessionStorage.getItem('vstIdleReopenProbe') === null && "
+                    "window.app?.initialized === true && "
+                    "Object.keys(window.pluginManager?.pluginClasses || {}).length >= 60",
+                    std::chrono::seconds(15));
+          }
+        }
       }
     }
     webView.detach(activeEditorOwner);
+    webViewProfile.captureChildProcesses();
   }
   if (parent != nullptr && IsWindow(parent) != FALSE) {
     int fallbackOwner = 0;
     effetune::vst::WebViewHost fallbackWebView(
         [](const std::string_view) { return R"({"ok":true})"; },
-        std::filesystem::path(EFFETUNE_WEBVIEW_ASSET_DIR) / "missing-resource-root");
+        std::filesystem::path(EFFETUNE_WEBVIEW_ASSET_DIR) / "missing-resource-root",
+        false);
     if (fallbackWebView.attach(
             &fallbackOwner, parent,
             effetune::vst::plugin::kDefaultEditorWidth,
@@ -853,11 +1142,117 @@ int main() {
       }
       fallbackWebView.detach(&fallbackOwner);
     }
+    webViewProfile.captureChildProcesses();
   }
+  // CHOC discards the result of every asynchronous WebView2 construction step, so
+  // a runtime that starts but never completes leaves an editor that is attached,
+  // reports success, and stays empty forever. Pointing the loader at a runtime
+  // that does not exist reproduces exactly that, and the editor has to end up
+  // showing readable native text instead.
+  bool initialisationTimeoutDiagnosed = false;
+  {
+    constexpr wchar_t browserFolderVariable[] = L"WEBVIEW2_BROWSER_EXECUTABLE_FOLDER";
+    const auto stalledParent = createParent();
+    if (stalledParent != nullptr &&
+        SetEnvironmentVariableW(browserFolderVariable,
+                                L"C:\\effetune-nonexistent-webview2-runtime") != FALSE) {
+      int stalledOwner = 0;
+      {
+        effetune::vst::WebViewHost stalled(
+            [](const std::string_view) { return R"({"ok":true})"; },
+            std::filesystem::path(EFFETUNE_WEBVIEW_ASSET_DIR), false);
+        if (stalled.attach(&stalledOwner, stalledParent,
+                           effetune::vst::plugin::kDefaultEditorWidth,
+                           effetune::vst::plugin::kDefaultEditorHeight)) {
+          ShowWindow(stalledParent, SW_SHOWNOACTIVATE);
+          const auto deadline = std::chrono::steady_clock::now() +
+                                effetune::vst::kWebViewInitialisationTimeout +
+                                std::chrono::seconds(15);
+          while (!initialisationTimeoutDiagnosed &&
+                 std::chrono::steady_clock::now() < deadline) {
+            // Dispatch everything, including the null-window WM_TIMER the editor
+            // watchdog relies on.
+            MSG message{};
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE) != 0) {
+              TranslateMessage(&message);
+              DispatchMessageW(&message);
+            }
+            const auto diagnostic =
+                FindWindowExW(stalledParent, nullptr, L"EDIT", nullptr);
+            if (diagnostic != nullptr) {
+              std::wstring text(4096, L'\0');
+              const auto length = GetWindowTextW(diagnostic, text.data(),
+                                                 static_cast<int>(text.size()));
+              text.resize(static_cast<std::size_t>(length));
+              initialisationTimeoutDiagnosed =
+                  stalled.status() ==
+                      effetune::vst::WebViewStatus::initialisationTimedOut &&
+                  text.find(L"EFFETUNE-UI-TIMEOUT") != std::wstring::npos;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+          }
+        }
+        stalled.detach(&stalledOwner);
+      }
+      (void)SetEnvironmentVariableW(browserFolderVariable, nullptr);
+    }
+    if (stalledParent != nullptr) {
+      DestroyWindow(stalledParent);
+    }
+    webViewProfile.captureChildProcesses();
+  }
+
+  // A host that opens the editor from a multi-threaded apartment can never run
+  // WebView2, so the editor has to say so natively instead of handing back an
+  // empty window that no one can diagnose.
+  std::thread apartmentProbe([&] {
+    if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) {
+      return;
+    }
+    const auto probeParent =
+        CreateWindowExW(0, className, L"EffeTune WebView MTA Probe",
+                        WS_OVERLAPPEDWINDOW, -30000, -30000, 900, 650, nullptr,
+                        nullptr, instance, nullptr);
+    if (probeParent != nullptr) {
+      int probeOwner = 0;
+      {
+        effetune::vst::WebViewHost probe(
+            [](const std::string_view) { return R"({"ok":true})"; },
+            std::filesystem::path(EFFETUNE_WEBVIEW_ASSET_DIR), false);
+        if (probe.attach(&probeOwner, probeParent,
+                         effetune::vst::plugin::kDefaultEditorWidth,
+                         effetune::vst::plugin::kDefaultEditorHeight) &&
+            probe.status() == effetune::vst::WebViewStatus::unsupportedApartment) {
+          std::wstring text(4096, L'\0');
+          const auto diagnostic = GetWindow(probeParent, GW_CHILD);
+          const auto length =
+              diagnostic == nullptr
+                  ? 0
+                  : GetWindowTextW(diagnostic, text.data(),
+                                   static_cast<int>(text.size()));
+          text.resize(static_cast<std::size_t>(length));
+          multiThreadedApartmentDiagnosed =
+              text.find(L"EFFETUNE-UI-MTA") != std::wstring::npos &&
+              text.find(L"multi-threaded apartment") != std::wstring::npos;
+        }
+        probe.detach(&probeOwner);
+      }
+      DestroyWindow(probeParent);
+    }
+    CoUninitialize();
+  });
+  apartmentProbe.join();
+
   if (parent != nullptr) {
     DestroyWindow(parent);
   }
   UnregisterClassW(className, instance);
+
+  if (!webViewProfile.cleanup()) {
+    std::cerr << "WebView2 child processes did not release the isolated profile: "
+              << webViewProfile.path().string() << '\n';
+    return 1;
+  }
 
   if (!attached) {
     std::cerr << "WebView2 could not be attached\n";
@@ -866,7 +1261,8 @@ int main() {
   if (smokeState.hostInfoCalls.load(std::memory_order_relaxed) == 0) {
     if (evaluationComplete.load(std::memory_order_acquire)) {
       std::cerr << "WebView evaluation error: " << evaluationError << '\n'
-                << "WebView state: " << evaluationResult << '\n';
+                << "WebView state: " << evaluationResult << '\n'
+                << "Readiness diagnostics: " << readinessDiagnostics << '\n';
     }
     std::cerr << "The EffeTune UI did not reach the native bridge\n";
     return 1;
@@ -874,6 +1270,7 @@ int main() {
   if (!uiReady.load(std::memory_order_acquire)) {
     std::cerr << "WebView evaluation error: " << evaluationError << '\n'
               << "Registered plug-ins: " << evaluationResult << '\n'
+              << "Readiness diagnostics: " << readinessDiagnostics << '\n'
               << "The EffeTune UI did not finish loading its plug-in catalog\n";
     return 1;
   }
@@ -971,8 +1368,27 @@ int main() {
     std::cerr << "A WebView with a destroyed parent was not recreated on reattachment\n";
     return 1;
   }
+  if (!reopenedReadyEditorWasRebuilt) {
+    std::cerr << "Reopening the editor reused a WebView whose controller belonged to the "
+                 "previous parent instead of rebuilding it\n";
+    return 1;
+  }
   if (!missingResourceGuidanceShown) {
     std::cerr << "Missing WebView assets did not show actionable reinstall guidance\n";
+    return 1;
+  }
+  if (!editorReportedReady) {
+    std::cerr << "A working editor did not report a ready WebView status\n";
+    return 1;
+  }
+  if (!multiThreadedApartmentDiagnosed) {
+    std::cerr << "An editor opened from a multi-threaded apartment showed no native "
+                 "diagnostics\n";
+    return 1;
+  }
+  if (!initialisationTimeoutDiagnosed) {
+    std::cerr << "A WebView2 construction that never completed left an unexplained "
+                 "empty editor\n";
     return 1;
   }
   if (smokeState.prematureEmptyRebuildCalls.load(std::memory_order_relaxed) != 0) {

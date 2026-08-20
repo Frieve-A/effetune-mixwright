@@ -34,6 +34,7 @@ const history = await readFile(
 const pluginList = await readFile(path.join(assets, 'plugins', 'plugins.txt'), 'utf8');
 const vinylSimulator = await readFile(
   path.join(assets, 'plugins', 'lofi', 'vinyl_simulator.js'), 'utf8');
+const pluginBase = await readFile(path.join(assets, 'plugins', 'plugin-base.js'), 'utf8');
 const dspParams = await readFile(
   path.join(assets, 'js', 'audio', 'dsp-params.generated.js'), 'utf8');
 const dspMetadata = await readFile(
@@ -143,8 +144,13 @@ if (!hasLegacyVstDualPipelinePatch && !hasUpstreamDualPipelineRestore) {
   throw new Error('The VST dual-pipeline state restoration patch was not applied');
 }
 const appIdReservation = app.indexOf('this.pluginManager.nextPluginId = Math.max(');
+const savedStateDeclaration = app.indexOf('let savedState = transientPipelineState;');
+const automationWatermarkReservation =
+  app.indexOf('savedState?.automation?.logicalPluginIdWatermark');
 const appPluginCreation = app.indexOf('this.pluginManager.createPlugin(pluginState.name)');
 if (!app.includes('plugin.id = pluginState.id') || appIdReservation < 0 ||
+    savedStateDeclaration < 0 || automationWatermarkReservation < savedStateDeclaration ||
+    automationWatermarkReservation > appPluginCreation ||
     appPluginCreation < 0 || appIdReservation > appPluginCreation ||
     !app.includes('restoreDoubleBlindTestFromUrl() {}')) {
   throw new Error('Stable restored plug-in IDs or the VST DBT URL exclusion is missing');
@@ -337,6 +343,273 @@ if (fullRebuild < 0 || fullRebuildLatency < fullRebuild ||
     !audioAdapter.includes('pipelineBInitialized: this.pipelineB !== null')) {
   throw new Error('Full rebuild latency service or dual-pipeline history synchronization is missing');
 }
+const historyRouteStart = audioAdapter.indexOf('  synchronizeHistoryState()');
+const historyRouteEnd = audioAdapter.indexOf('}).then(result =>', historyRouteStart);
+const historyRoute = historyRouteStart < 0 || historyRouteEnd < 0
+  ? '' : audioAdapter.slice(historyRouteStart, historyRouteEnd);
+// Splits an object literal into its own properties, so a contract about a
+// request can name the property it means instead of matching text that happens
+// to appear anywhere in the surrounding route.
+const objectLiteralProperties = literal => {
+  const properties = [];
+  let depth = 0;
+  let start = 0;
+  for (let index = 0; index < literal.length; index++) {
+    const character = literal[index];
+    if ('([{'.includes(character)) depth += 1;
+    else if (')]}'.includes(character)) depth -= 1;
+    else if (character === ',' && depth === 0) {
+      properties.push(literal.slice(start, index));
+      start = index + 1;
+    }
+  }
+  properties.push(literal.slice(start));
+  return properties;
+};
+// Reads what a bridge request actually binds to one of its payload properties:
+// the inline expression where there is one, and otherwise the local that a
+// shorthand property names. Stating a contract about this value is what keeps it
+// from being satisfied by an identifier that merely occurs in the route.
+const requestPayloadValue = (route, name) => {
+  const call = audioAdapter.indexOf(`__effetuneHostCall('${route}'`);
+  const open = call < 0 ? -1 : audioAdapter.indexOf('{', call);
+  if (open < 0) return null;
+  let depth = 0;
+  let close = -1;
+  for (let index = open; index < audioAdapter.length && close < 0; index++) {
+    if (audioAdapter[index] === '{') depth += 1;
+    else if (audioAdapter[index] === '}' && --depth === 0) close = index;
+  }
+  if (close < 0) return null;
+  for (const property of objectLiteralProperties(audioAdapter.slice(open + 1, close))) {
+    const separator = property.indexOf(':');
+    if ((separator < 0 ? property : property.slice(0, separator)).trim() !== name) continue;
+    if (separator >= 0) return property.slice(separator + 1);
+    const declaration = audioAdapter.lastIndexOf(`const ${name} =`, call);
+    return declaration < 0
+      ? null
+      : audioAdapter.slice(declaration, audioAdapter.indexOf(';', declaration));
+  }
+  return null;
+};
+// A bound target is overlaid with the value automation is playing unless the
+// request names it, so every route that publishes a pipeline image has to carry
+// the gestures it collected -- the edits themselves, mapped to their payloads,
+// however the expression is spelled. Without them a preset load, an undo, or a
+// correction moves the UI alone.
+for (const route of ['pipeline/rebuild', 'pipeline/updatePlugin', 'pipeline/restoreHistory']) {
+  const automationEdits = requestPayloadValue(route, 'automationEdits');
+  if (automationEdits === null || !/(\w+)\s*=>\s*\1\.payload/.test(automationEdits)) {
+    throw new Error(`${route} does not carry the automation edits it collected`);
+  }
+}
+if (!historyRoute.includes("this.nativePort.collectAutomationEdits('A', plugin)") ||
+    !historyRoute.includes("this.nativePort.collectAutomationEdits('B', plugin)")) {
+  throw new Error('History synchronization does not collect both pipelines of automation edits');
+}
+// Collecting an edit has already advanced the adopted baseline to the value it
+// carries, and that baseline is the only record of what the native side holds.
+// A route whose request is refused therefore has to put every collected edit
+// back, or the baseline claims a value only the editor has: a later user edit
+// to that same value is read as agreement and never emitted, and nothing
+// afterwards can notice the editor, the DSP and the saved project have parted.
+const historyFailureLog = audioAdapter.indexOf('[EffeTune Mixwright] history restore failed');
+const historyReconcile = historyFailureLog < 0
+  ? -1
+  : audioAdapter.lastIndexOf('this.nativePort.reconcileAutomationEdits(edits);',
+    historyFailureLog);
+if (historyRouteStart < 0 || historyFailureLog < 0 || historyReconcile < historyRouteStart) {
+  throw new Error('A refused history restore strands the adopted baseline on values ' +
+    'the native side never received');
+}
+const coalescedUpdate = audioAdapter.indexOf("__effetuneHostCall('pipeline/updatePlugin'");
+const coalescedUpdateEnd = audioAdapter.indexOf('parameter update failed', coalescedUpdate);
+const coalescedUpdateRoute = coalescedUpdate < 0 || coalescedUpdateEnd < 0
+  ? '' : audioAdapter.slice(coalescedUpdate, coalescedUpdateEnd);
+if (!/automationEdits: \w+\.map\(\w+ => \w+\.payload\)/.test(coalescedUpdateRoute) ||
+    audioAdapter.includes("__effetuneHostCall('automation/edit'")) {
+  throw new Error('A coalesced plug-in update does not carry its gestures in one request');
+}
+// The plug-in adopts the user's value as its own DSP value whether or not the
+// host takes the edit transaction, so a request that was answered at all leaves
+// both sides on the value it carried. There is no second authority for the
+// editor to converge on, and therefore no rollback, no correction and nothing
+// the answer has to say about the individual edits.
+//
+// The grace timer this replaced was not merely redundant. A bridge round trip
+// slower than its 250 ms deadline made it republish the value the user had
+// moved away from, and a republished value reaches performEdit -- so a
+// Write-armed lane recorded a reverse-motion point the user never performed,
+// purely because the native side was busy. Nothing here may come back.
+const withdrawnRollbackMachinery = [
+  'AUTOMATION_EDIT_GRACE_MS', 'automationEditGraceMs', 'pendingAutomationEdits',
+  'trackPendingAutomationEdit', 'takePendingAutomationEdit',
+  'resolvePendingAutomationDelta', 'restoreRolledBackAutomationEdit',
+  'rejectPendingAutomationEdit', 'rolledBackTo', 'automationCorrections',
+  'automationCorrection', 'reconcileUnappliedCorrection',
+  'republishAdoptedPlugin', 'restoredAutomationValues',
+  'automationEditsAccepted', 'automationEditsRestored'
+].filter(name => audioAdapter.includes(name));
+if (withdrawnRollbackMachinery.length > 0) {
+  throw new Error('The shim still carries automation rollback machinery: ' +
+    withdrawnRollbackMachinery.join(', '));
+}
+// The upstream controls report values only, so the touch boundary a host records
+// automation inside is derived from the pointer and from nothing else. Which
+// phase each listener is registered in is therefore part of the contract, not an
+// implementation detail. The four pointer events are taken in the capture phase,
+// so a control that stops propagation, or one inside a subtree we never see,
+// cannot hide the boundary. 'blur' must be taken in neither phase: it does not
+// bubble but it does traverse capture, and upstream renders every parameter as
+// focusable inputs -- so a capturing listener fires for the blur that pressing
+// on one control dispatches on the control that held the focus, ending the touch
+// that press had just opened and degrading the rest of the drag into one-shots.
+const pointerGestureStart = audioAdapter.indexOf('this.pointerGestureListeners = [');
+const pointerGestureEnd = audioAdapter.indexOf('];', pointerGestureStart);
+const pointerGestureListeners = pointerGestureStart < 0 || pointerGestureEnd < 0
+  ? '' : audioAdapter.slice(pointerGestureStart, pointerGestureEnd);
+const requiredPointerGestureListeners = [
+  "['pointerdown', this.beginPointerGesture, true]",
+  "['pointerup', this.endPointerGesture, true]",
+  "['pointercancel', this.endPointerGesture, true]",
+  "['lostpointercapture', this.endPointerGesture, true]",
+  "['blur', this.abandonPointerGesture, false]"
+];
+if (pointerGestureListeners === '' ||
+    requiredPointerGestureListeners.some(entry => !pointerGestureListeners.includes(entry)) ||
+    !/for \(const \[type, listener, capture\] of this\.pointerGestureListeners\) \{\s*window\.addEventListener\?\.\(type, listener, capture\);/
+      .test(audioAdapter)) {
+  throw new Error(
+    'The pointer gesture listeners are not registered in the phases the touch boundary needs');
+}
+// One pointer stopping being down is one pointer, not the gesture: a second
+// finger releasing mid-drag leaves the user still holding the control, and a
+// touch ended there loses the rest of the drag. A mouse reports every one of
+// its buttons under a single pointer id, so the id alone cannot answer that
+// question either -- what remains down after a release is what buttons names.
+//
+// The record of which pointers are down is a hint the platform can strip, and
+// never an authority. Chromium opens a <select> popup on the press and takes
+// capture, so the page sees the pointerdown and no release of any kind: no
+// pointerup, no pointercancel, no lostpointercapture, and the focus never
+// leaves the page, so no window blur either. Upstream renders filter types,
+// crossover slopes and oversampling factors as <select>, and a native context
+// menu loses the release the same way. An id left behind by one of those makes
+// "no pointer is down" unreachable, so the close is never reached again: every
+// control the user touches afterwards keeps a host write lane open, and the
+// block keeps ignoring the automation the host plays back into it.
+//
+// So the set is rebuilt by the press that starts the next interaction -- a
+// primary press, which a second contact is explicitly not -- and emptied by the
+// close itself. What it may never be is trusted to drain on its own.
+const beginPointerGestureStart = audioAdapter.indexOf('this.beginPointerGesture = event => {');
+const beginPointerGestureEnd =
+  audioAdapter.indexOf('this.endPointerGesture', beginPointerGestureStart);
+const beginPointerGestureBody = beginPointerGestureStart < 0 || beginPointerGestureEnd < 0
+  ? '' : audioAdapter.slice(beginPointerGestureStart, beginPointerGestureEnd);
+const closeGestureStart = audioAdapter.indexOf('  closePointerGesture() {');
+const closeGestureEnd = audioAdapter.indexOf('\n  postMessage(', closeGestureStart);
+const closeGestureBody = closeGestureStart < 0 || closeGestureEnd < 0
+  ? '' : audioAdapter.slice(closeGestureStart, closeGestureEnd);
+if (beginPointerGestureBody === '' || closeGestureBody === '' ||
+    !/if \(event\?\.isPrimary !== false\) this\.livePointerIds\.clear\(\);[\s\S]{0,120}?livePointerIds\.add\(/
+      .test(beginPointerGestureBody) ||
+    !closeGestureBody.includes('this.livePointerIds.clear();')) {
+  throw new Error('A pointer release the page never receives poisons every later touch');
+}
+if (!/endPointerGesture = event => \{[\s\S]{0,400}?if \(event\?\.type === 'pointerup' && \(event\.buttons \?\? 0\) !== 0\) return;[\s\S]{0,200}?livePointerIds\.delete\([\s\S]{0,200}?if \(this\.livePointerIds\.size === 0\) this\.closePointerGesture\(\);/
+  .test(audioAdapter)) {
+  throw new Error('An open touch does not survive a second pointer releasing inside it');
+}
+// A state restore ends every open touch and then asks the editor to reload, but
+// the reload is a request the old context outlives: a drag still in progress
+// there can flush one more value across it, and that value reopens a touch the
+// reloaded page -- which starts with no gesture targets at all -- can never
+// name to close. The page announcing its own startup is the boundary that ends
+// it, and it is a boundary only because no other host/getInfo carries the flag.
+const startupHandshakes =
+  audioAdapter.split("__effetuneHostCall('host/getInfo', { startup: true })").length - 1;
+if (startupHandshakes !== 1 ||
+    !/initAudio\(\) \{[\s\S]{0,700}?__effetuneHostCall\('host\/getInfo', \{ startup: true \}\)/
+      .test(audioAdapter)) {
+  throw new Error('A reloaded page does not announce itself, so a touch the ' +
+    'destroyed context left open can never be ended');
+}
+// Every value of a drag asks for the touch, not only the first. The native open
+// is idempotent, so the drag is still one beginEdit, and a close the native side
+// made on its own -- a suspend, a state restore -- is recovered from on the very
+// next value instead of leaving the rest of the drag with no touch window.
+if (!/markAutomationGesture\(edit\) \{[\s\S]*?edit\.payload\.beginGesture = true;/
+      .test(audioAdapter)) {
+  throw new Error('A dragged value does not ask for the touch it belongs to');
+}
+// The port is the last thing that can end a touch, because it releases the
+// listeners that would otherwise have derived the close.
+const portCloseStart = audioAdapter.indexOf('\n  close() {');
+const portCloseEnd = audioAdapter.indexOf('\n  dispatch(', portCloseStart);
+const portCloseBody = portCloseStart < 0 || portCloseEnd < 0
+  ? '' : audioAdapter.slice(portCloseStart, portCloseEnd);
+if (!portCloseBody.includes('this.closePointerGesture();') ||
+    !/for \(const \[type, listener, capture\] of this\.pointerGestureListeners\) \{\s*window\.removeEventListener\?\.\(type, listener, capture\);/
+      .test(portCloseBody)) {
+  throw new Error('A closed port can leave a touch open for the rest of the session');
+}
+// A failed frame carries every value the drag emitted for an identity, and each
+// edit names only the value the edit before it replaced -- so the first is the
+// only one that still names what the native side holds.
+const reconcileStart = audioAdapter.indexOf('  reconcileAutomationEdits(');
+const reconcileEnd = audioAdapter.indexOf('\n  assetKey(', reconcileStart);
+const reconcileBody = reconcileStart < 0 || reconcileEnd < 0
+  ? '' : audioAdapter.slice(reconcileStart, reconcileEnd);
+if (reconcileBody === '' ||
+    !/new Set\(\)/.test(reconcileBody) ||
+    !/\.has\(identity\)\) continue;/.test(reconcileBody)) {
+  throw new Error(
+    'A failed frame does not return each identity to the one value the native side holds');
+}
+// One ordered list still holds every gesture a frame collected, because the
+// native side applies it from the front: the entry it ends on is the value the
+// block-start pin keeps playing, so a gesture kept anywhere else would be
+// applied out of the order the user made it in.
+const queuePluginUpdateStart = audioAdapter.indexOf('  queuePluginUpdate(');
+const queuePluginUpdateEnd =
+  audioAdapter.indexOf('\n  schedulePluginUpdateFlush()', queuePluginUpdateStart);
+const queuePluginUpdateBody = queuePluginUpdateStart < 0 || queuePluginUpdateEnd < 0
+  ? '' : audioAdapter.slice(queuePluginUpdateStart, queuePluginUpdateEnd);
+if (queuePluginUpdateBody === '' ||
+    (queuePluginUpdateBody.match(/\.push\(/g) || []).length !== 1 ||
+    !/queuePluginUpdate\(pipeline, \w+, edits\)/.test(updatePluginRoute)) {
+  throw new Error('The gestures of one frame do not share a single ordered queue');
+}
+// Change detection adopts the value where it detects it, not where an answer
+// for it comes back. Two answers that arrive out of order would otherwise move
+// the baseline backwards, and a knob returned to where it started inside one
+// frame would emit no edit to return it.
+const collectStart = audioAdapter.indexOf('  collectAutomationEdits(');
+const collectEnd = audioAdapter.indexOf('\n  reconcileAutomationEdits(', collectStart);
+const collectBody = collectStart < 0 || collectEnd < 0
+  ? '' : audioAdapter.slice(collectStart, collectEnd);
+if (collectBody === '' ||
+    !/adoptedAutomationValues\.set\(identity, normalized\);\s*edits\.push\(/.test(collectBody)) {
+  throw new Error('A detected automation change is not adopted where it is detected');
+}
+// One displayed frame costs one bridge request no matter how many events a drag
+// emitted: an individual update joins a per-plug-in queue that a scheduled flush
+// publishes. Every other request drains that queue first, so a coalesced image
+// can never land after the rebuild, restore, or asset operation that replaced it.
+const postMessageStart = audioAdapter.indexOf('  postMessage(message');
+const bridgeOrdering = postMessageStart < 0 || updatePluginRouteStart < 0
+  ? '' : audioAdapter.slice(postMessageStart, updatePluginRouteStart);
+const historyFlush = historyRoute.indexOf('this.nativePort.flushPluginUpdates();');
+if (!updatePluginRoute.includes('this.queuePluginUpdate(') ||
+    !/queuePluginUpdate\([^)]*\) \{[\s\S]*?this\.pendingPluginUpdates\.set\([\s\S]*?this\.schedulePluginUpdateFlush\(\);/
+      .test(audioAdapter) ||
+    !/flushPluginUpdates\(\) \{[\s\S]*?this\.pendingPluginUpdates\.clear\(\);/.test(audioAdapter) ||
+    !/message\.type !== 'updatePlugin'[\s\S]{0,40}flushPluginUpdates\(\);/.test(bridgeOrdering) ||
+    historyFlush < 0 || historyFlush > historyRoute.indexOf('this.serializePipeline(')) {
+  throw new Error(
+    'Coalesced plug-in updates are not published once per frame ahead of every other request');
+}
 if (!updatePluginRoute.includes('this.owner.scheduleLatencyService();') ||
     !audioAdapter.includes('now - this.lastHiddenContextPoll < 250') ||
     !/scheduleLatencyService\(\) \{[\s\S]*?setTimeout\([\s\S]*?host\/getInfo[\s\S]*?\}, 250\);/.test(audioAdapter)) {
@@ -346,6 +619,32 @@ if (!app.includes("localStorage.setItem('pipelineColumns', String(config.columns
     !columns.includes('window.electronIntegration.saveConfig({ columns })')) {
   throw new Error('The VST UI preference bridge patch was not applied');
 }
+// Host automation playback, preset recall and undo/redo all reach the editor
+// through setParameters() followed by syncUIControls(). Widgets a plug-in builds
+// by hand are invisible to the control registry, so they only follow through the
+// refresh-hook registry. These three properties are what make that path exist at
+// all; losing any one of them silently freezes every hand-built control again.
+if (!/registerUIRefresh\(fn\) \{/.test(pluginBase) ||
+    !/isGraphPointerActive\(\) \{/.test(pluginBase) ||
+    !pluginBase.includes('this._uiRefreshHooks = []') ||
+    !pluginBase.includes('this._graphPointerProbes')) {
+  throw new Error('PluginBase no longer exposes the UI refresh-hook registry');
+}
+// The early return in syncUIControls() must consider both registries. Guarding it
+// on the control registry alone is the original defect: a plug-in that registers
+// no helper controls never reaches the hook loop, which is exactly the case for
+// the hand-built graph editors.
+if (!/syncUIControls\(\) \{\s*if \(!this\._syncedUIControls\.length && !this\._uiRefreshHooks\.length\) return;/
+      .test(pluginBase) ||
+    !/if \(this\.isGraphPointerActive\(\)\) return;/.test(pluginBase)) {
+  throw new Error('syncUIControls() no longer runs the refresh hooks for control-less plug-ins');
+}
+// A rebuilt UI must not inherit hooks or pointer probes bound to detached DOM.
+if ((pluginBase.match(/this\._uiRefreshHooks = \[\]/g) || []).length < 3 ||
+    (pluginBase.match(/this\._graphPointerProbes(?: = new Set\(\)|\.clear\(\))/g) || []).length < 3) {
+  throw new Error('The UI refresh registries are not reset on createUI() and cleanup()');
+}
+
 if (!uiManager.includes('this.refreshDynamicLocalizedUI();') ||
     !uiManager.includes('refreshDynamicLocalizedUI() {') ||
     !uiManager.includes('searchManager.switchToTab(currentTab);') ||

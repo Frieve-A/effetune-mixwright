@@ -27,6 +27,8 @@
 #include <utility>
 #include <vector>
 
+#include "../support/crt_dialog_suppression.h"
+
 namespace {
 
 using namespace effetune::vst;
@@ -421,6 +423,22 @@ void testStateCodec() {
              knownBParameters["futureParam"].isObject(),
          "incoming parameters win while future logical fields survive reconciliation");
 
+  const auto recursiveParameters = choc::json::parse(mergeExtraJsonObjects(
+      R"({"future":{"mode":"preserved","nested":{"keep":2,"replace":3},"items":[{"keep":4,"replace":5},{"deletedTail":true}]}})",
+      R"({"future":{"nested":{"replace":9},"items":[{"replace":10}]}})"));
+  expect(recursiveParameters["future"]["mode"].getWithDefault<std::string>({}) ==
+                 "preserved" &&
+             recursiveParameters["future"]["nested"]["keep"]
+                     .getWithDefault<std::int64_t>(0) == 2 &&
+             recursiveParameters["future"]["nested"]["replace"]
+                     .getWithDefault<std::int64_t>(0) == 9 &&
+             recursiveParameters["future"]["items"].size() == 1 &&
+             recursiveParameters["future"]["items"][0]["keep"]
+                     .getWithDefault<std::int64_t>(0) == 4 &&
+             recursiveParameters["future"]["items"][0]["replace"]
+                     .getWithDefault<std::int64_t>(0) == 10,
+         "recursive parameter merge preserves future members without restoring deleted array tails");
+
   PipelineState inserted;
   inserted.plugins = {PluginState{19, "Known B"}, PluginState{23, "Inserted"},
                       PluginState{7, "Known A"}};
@@ -431,31 +449,58 @@ void testStateCodec() {
              reconciled.plugins[3].name == "Known A",
          "normal rebuild keeps incoming reorder and intermediate insertion");
 
+  PipelineState beforeRename;
+  beforeRename.plugins = {PluginState{27, "Old Name", true, 0, 0, std::nullopt,
+                                      R"({"futureParam":{"keep":2}})", false,
+                                      R"({"type":"KnownPlugin","future":3})"}};
+  PipelineState renameIncoming;
+  renameIncoming.plugins = {PluginState{27, "New Name", true, 0, 0, std::nullopt,
+                                        R"({"gain":4})", false,
+                                        R"({"type":"KnownPlugin"})"}};
+  const auto renamed =
+      reconcilePipelineSnapshot(beforeRename, std::move(renameIncoming), true);
+  expect(renamed.plugins.size() == 1 && renamed.plugins[0].name == "New Name" &&
+             renamed.plugins[0].parametersJson.find("futureParam") != std::string::npos &&
+             renamed.plugins[0].extraJson.find("future") != std::string::npos,
+         "serialized type keeps renamed logical plug-in identity without duplicates");
+
   UndoOpaqueStateStore undoOpaqueState;
   PipelineState beforeDelete;
   beforeDelete.plugins = {PluginState{31, "Known", true, 0, 0, std::nullopt,
-                                      R"({"gain":1,"futureParam":{"v":2}})", false,
+                                      R"({"gain":1,"futureParam":{"v":2,"nested":{"keep":4},"items":[{"future":5,"value":1},{"deletedTail":true}]}})", false,
                                       R"({"type":"KnownPlugin","future":3,"override":1})"}};
   auto deleted = undoOpaqueState.reconcile('A', beforeDelete, {}, false);
   expect(deleted.plugins.empty(), "delete removes known plug-in from current state");
 
   PipelineState undoIncoming;
-  undoIncoming.plugins = {PluginState{31, "Known", true, 0, 0, std::nullopt,
-                                      R"({"gain":9})"}};
+  undoIncoming.plugins = {PluginState{31, "Known Renamed", true, 0, 0, std::nullopt,
+                                      R"({"gain":9,"futureParam":{"nested":{"edited":6},"items":[{"value":7}]}})", false,
+                                      R"({"type":"KnownPlugin","override":8})"}};
   auto undone = undoOpaqueState.reconcile('A', deleted, std::move(undoIncoming), false);
   const auto undoParameters = choc::json::parse(undone.plugins[0].parametersJson);
   const auto undoExtra = choc::json::parse(undone.plugins[0].extraJson);
-  expect(undoParameters["gain"].getWithDefault<std::int64_t>(0) == 9 &&
+  expect(undone.plugins.size() == 1 && undone.plugins[0].name == "Known Renamed" &&
+             undoParameters["gain"].getWithDefault<std::int64_t>(0) == 9 &&
              undoParameters["futureParam"]["v"].getWithDefault<std::int64_t>(0) == 2 &&
+             undoParameters["futureParam"]["nested"]["keep"]
+                     .getWithDefault<std::int64_t>(0) == 4 &&
+             undoParameters["futureParam"]["nested"]["edited"]
+                     .getWithDefault<std::int64_t>(0) == 6 &&
+             undoParameters["futureParam"]["items"].size() == 1 &&
+             undoParameters["futureParam"]["items"][0]["future"]
+                     .getWithDefault<std::int64_t>(0) == 5 &&
+             undoParameters["futureParam"]["items"][0]["value"]
+                     .getWithDefault<std::int64_t>(0) == 7 &&
              undoExtra["future"].getWithDefault<std::int64_t>(0) == 3 &&
-             undoExtra["override"].getWithDefault<std::int64_t>(0) == 1,
-         "undo restores opaque fields while incoming values win");
+             undoExtra["override"].getWithDefault<std::int64_t>(0) == 8,
+         "rename undo restores nested opaque fields while incoming values win without duplicates");
 
   auto redone = undoOpaqueState.reconcile('A', undone, {}, false);
   expect(redone.plugins.empty(), "redo delete records opaque state again");
   PipelineState secondUndoIncoming;
-  secondUndoIncoming.plugins = {PluginState{31, "Known", true, 0, 0, std::nullopt,
-                                            R"({"gain":5})"}};
+  secondUndoIncoming.plugins = {PluginState{31, "Known Renamed", true, 0, 0, std::nullopt,
+                                            R"({"gain":5})", false,
+                                            R"({"type":"KnownPlugin"})"}};
   auto secondUndo =
       undoOpaqueState.reconcile('A', redone, std::move(secondUndoIncoming), false);
   const auto secondUndoParameters = choc::json::parse(secondUndo.plugins[0].parametersJson);
@@ -517,6 +562,69 @@ void testMessageRouter() {
              message.pipelineB[0].logical.id == 44 &&
              message.pipelineB[0].runtime.packedParameters == std::vector<float>{2.0f},
          "history restore carries an edited inactive pipeline in the same request");
+  expect(MessageRouter::decode(
+             R"({"type":"automation/edit","payload":{"pipeline":"B","pluginId":44,"pluginType":"TestGainPlugin","parameterKey":"gain","elementIndex":2,"normalized":0.75}})",
+             message, &error) && message.action == UiAction::editAutomationParameter &&
+             message.pipeline == 'B' && message.pluginId == 44 &&
+             message.pluginType == "TestGainPlugin" && message.parameterKey == "gain" &&
+             message.elementIndex == 2 && message.normalizedValue == 0.75,
+         "automation edit routes a complete stable target identity");
+  expect(!MessageRouter::decode(
+             R"({"type":"automation/edit","payload":{"pluginId":44,"pluginType":"TestGainPlugin","parameterKey":"gain","normalized":1.01}})",
+             message, &error),
+         "automation edit rejects values outside the normalized host domain");
+  expect(MessageRouter::decode(
+             R"({"type":"pipeline/rebuild","payload":{"pipeline":"A","plugins":[],"automationEdits":[{"pipeline":"B","pluginId":44,"pluginType":"TestGainPlugin","parameterKey":"gain","elementIndex":2,"normalized":0.75}]}})",
+             message, &error) && message.action == UiAction::rebuildPipeline &&
+             message.automationEdits.size() == 1 &&
+             message.automationEdits[0].pipeline == 'B' &&
+             message.automationEdits[0].pluginId == 44 &&
+             message.automationEdits[0].pluginType == "TestGainPlugin" &&
+             message.automationEdits[0].parameterKey == "gain" &&
+             message.automationEdits[0].elementIndex == 2 &&
+             message.automationEdits[0].normalized == 0.75,
+         "a preset load carries the automation targets it explicitly names");
+  expect(MessageRouter::decode(
+             R"({"type":"pipeline/restoreHistory","payload":{"pipelineA":[],"pipelineB":null,"pipelineBInitialized":false,"currentPipeline":"A","automationEdits":[{"pipeline":"A","pluginId":9,"pluginType":"DCOffsetPlugin","parameterKey":"of","elementIndex":0,"normalized":0.25}]}})",
+             message, &error) && message.action == UiAction::restoreHistory &&
+             message.automationEdits.size() == 1 &&
+             message.automationEdits[0].pluginId == 9 &&
+             message.automationEdits[0].normalized == 0.25,
+         "an undo carries the automation targets it explicitly names");
+  expect(MessageRouter::decode(
+             R"({"type":"pipeline/rebuild","payload":{"pipeline":"A","plugins":[]}})",
+             message, &error) && message.action == UiAction::rebuildPipeline &&
+             message.automationEdits.empty(),
+         "a bulk message from an older UI names no automation target");
+  expect(MessageRouter::decode(
+             R"({"type":"pipeline/updatePlugin","payload":{"pipeline":"A","plugin":{"id":44,"type":"TestGainPlugin","name":"Gain","parameters":{"gain":2},"wasmParams":[2],"wasmParamsHash":9},"automationEdits":[{"pipeline":"A","pluginId":44,"pluginType":"TestGainPlugin","parameterKey":"gain","elementIndex":2,"normalized":0.25},{"pipeline":"A","pluginId":44,"pluginType":"TestGainPlugin","parameterKey":"gain","elementIndex":2,"normalized":0.5}]}})",
+             message, &error) && message.action == UiAction::updatePlugin &&
+             message.plugins.size() == 1 && message.plugins[0].logical.id == 44 &&
+             message.automationEdits.size() == 2 &&
+             message.automationEdits[0].normalized == 0.25 &&
+             message.automationEdits[1].normalized == 0.5 &&
+             message.automationEdits[1].elementIndex == 2 &&
+             message.automationEdits[0].bindIfUnbound &&
+             message.automationEdits[1].bindIfUnbound,
+         "a coalesced plug-in update carries every gesture of its frame in order");
+  expect(MessageRouter::decode(
+             R"({"type":"pipeline/updatePlugin","payload":{"pipeline":"A","plugin":{"id":44,"type":"TestGainPlugin","name":"Gain","parameters":{"gain":2},"wasmParams":[2],"wasmParamsHash":9},"automationEdits":[{"pipeline":"A","pluginId":44,"pluginType":"TestGainPlugin","parameterKey":"gain","elementIndex":2,"normalized":0.25,"bindIfUnbound":false},{"pipeline":"A","pluginId":44,"pluginType":"TestGainPlugin","parameterKey":"gain","elementIndex":2,"normalized":0.5}]}})",
+             message, &error) && message.action == UiAction::updatePlugin &&
+             message.automationEdits.size() == 2 &&
+             !message.automationEdits[0].bindIfUnbound &&
+             message.automationEdits[1].bindIfUnbound,
+         "a correction keeps its place in the ordered list and claims no lane, "
+         "while an edit that omits the field stays a gesture");
+  expect(MessageRouter::decode(
+             R"({"type":"pipeline/updatePlugin","payload":{"pipeline":"A","plugin":{"id":44,"type":"TestGainPlugin","name":"Gain","parameters":{"gain":2},"wasmParams":[2],"wasmParamsHash":9}}})",
+             message, &error) && message.action == UiAction::updatePlugin &&
+             message.automationEdits.empty(),
+         "a plug-in update from an older UI names no automation target");
+  expect(!MessageRouter::decode(
+             R"({"type":"pipeline/rebuild","payload":{"pipeline":"A","plugins":[],"automationEdits":[{"pipeline":"A","pluginId":9,"pluginType":"DCOffsetPlugin","parameterKey":"of","elementIndex":0,"normalized":1.5}]}})",
+             message, &error) &&
+             error == "Automation edit has an invalid target or value",
+         "a named automation target is validated exactly like a single gesture");
 
   expect(MessageRouter::decode(
              R"({"type":"pipeline/assetBegin","payload":{"pluginId":44,"slot":0,"formatTag":1,"channels":1,"frames":600,"topology":1,"headBlock":128,"rateDivider":1,"pathCount":0,"inputCount":0,"processingChannels":2,"footprintBytes":4194304,"byteSize":2432,"operationRevision":7}})",
@@ -695,12 +803,12 @@ void testEngineHost() {
   expect(engine.makeDescriptorCommand(pipeline, std::span<const RuntimePlugin>(&runtime, 1),
                                       descriptorCommand, &error),
          "section disable descriptor command: " + error);
-  AudioCommandQueue descriptorQueue;
-  expect(descriptorQueue.push(descriptorCommand), "enqueue section disable descriptor");
+  std::uint64_t appliedDescriptorRevision = 0;
+  expect(engine.applyDescriptorCommand(descriptorCommand, appliedDescriptorRevision, &error),
+         "apply section disable descriptor off the audio path: " + error);
   left.fill(1.0f);
   right.fill(-1.0f);
-  expect(engine.tryProcessBlock(channels, 2, EngineHost::kMaxProcessFrames, 0.0, true,
-                                &descriptorQueue),
+  expect(engine.tryProcessBlock(channels, 2, EngineHost::kMaxProcessFrames, 0.0, true),
          "disabled section command under master bypass");
   expect(left[0] == 1.0f && right[0] == -1.0f,
          "descriptor command preserves master-bypassed audio");
@@ -708,11 +816,11 @@ void testEngineHost() {
   expect(engine.makeDescriptorCommand(pipeline, std::span<const RuntimePlugin>(&runtime, 1),
                                       descriptorCommand, &error),
          "section enable descriptor command: " + error);
-  expect(descriptorQueue.push(descriptorCommand), "enqueue section enable descriptor");
+  expect(engine.applyDescriptorCommand(descriptorCommand, appliedDescriptorRevision, &error),
+         "apply section enable descriptor off the audio path: " + error);
   left.fill(1.0f);
   right.fill(-1.0f);
-  expect(engine.tryProcessBlock(channels, 2, EngineHost::kMaxProcessFrames, 0.0, false,
-                                &descriptorQueue),
+  expect(engine.tryProcessBlock(channels, 2, EngineHost::kMaxProcessFrames, 0.0, false),
          "re-enabled section command");
   expect(std::abs(left[0] - 0.5f) < 1.0e-7f,
          "queued section toggle preserves the native instance");
@@ -743,7 +851,7 @@ void testEngineAssetTransferAndReplay() {
   RuntimePlugin runtime;
   runtime.logicalId = 91;
   runtime.type = "IRReverbPlugin";
-  runtime.packedParameters = {0.0f, 1.0f, 1.0f, 0.0f, -96.0f, 0.0f};
+  runtime.packedParameters = {0.0f, 1.0f, 1.0f, 0.0f, 1.0f, -96.0f, 0.0f};
   runtime.paramsHash = kernel->second.paramsHash;
   expect(engine.rebuild(pipeline, {runtime}, &error), "IR reverb engine rebuild: " + error);
 
@@ -791,8 +899,19 @@ void testEngineAssetTransferAndReplay() {
     }
     expect((target.assetState(91, 0) & 0xffu) == ET_ASSET_STATE_ACTIVE, context);
   };
+  const auto stagedPlanRevision = engine.pipelinePlanRevision();
   prepareAsset(engine, channels, "IR reverb asset becomes active");
-  expect(engine.pipelineLatency() == 128u, "active IR reverb publishes its native latency");
+  expect(engine.pipelineLatency() == 128u &&
+             engine.pipelinePlanRevision() > stagedPlanRevision,
+         "active IR reverb publishes latency and requests compensation refresh");
+  const auto activeAssetRefreshes = engine.processCounters().latencyRefreshes;
+  for (std::uint32_t quantum = 0; quantum < 4u; ++quantum) {
+    expect(engine.tryProcessBlock(channels, 2, EngineHost::kMaxProcessFrames,
+                                  static_cast<double>(quantum) / 375.0, false),
+           "active IR reverb latency polling remains idle");
+  }
+  expect(engine.processCounters().latencyRefreshes == activeAssetRefreshes,
+         "persistent active asset cache does not keep latency polling alive");
   expect(engine.setAsset(asset, &error), "identical IR reverb asset replay: " + error);
   expect((engine.assetState(91, 0) & 0xffu) == ET_ASSET_STATE_ACTIVE,
          "identical IR reverb asset replay preserves the active convolution");
@@ -816,10 +935,13 @@ void testEngineAssetTransferAndReplay() {
   expect((engine.assetState(91, 0) & 0xffu) == ET_ASSET_STATE_PREPARING,
          "cached IR reverb asset is replayed after a topology rebuild");
   prepareAsset(engine, channels, "replayed IR reverb asset becomes active");
+  const auto activePlanRevision = engine.pipelinePlanRevision();
   expect(engine.clearAsset(91, 0), "IR reverb asset clear");
   expect((engine.assetState(91, 0) & 0xffu) == ET_ASSET_STATE_NONE,
          "IR reverb asset clear resets native state");
-  expect(engine.pipelineLatency() == 0u, "cleared IR reverb removes native latency");
+  expect(engine.pipelineLatency() == 0u &&
+             engine.pipelinePlanRevision() > activePlanRevision,
+         "cleared IR reverb removes latency and requests compensation refresh");
 }
 
 void testRuntimeLatencyAndTelemetryPublication() {
@@ -908,12 +1030,12 @@ void testRuntimeLatencyAndTelemetryPublication() {
   expect(engine.makeDescriptorCommand(pipeline, std::span<const RuntimePlugin>(&runtime, 1),
                                       command, &error),
          "limiter bypass descriptor command: " + error);
-  expect(queue.push(command), "enqueue limiter bypass descriptor");
   const auto enabledRevision = engine.latencyRevision();
-  expect(engine.tryProcessBlock(channels, 2, EngineHost::kMaxProcessFrames, 1.1, false, &queue),
-         "apply limiter bypass descriptor");
+  std::uint64_t appliedDescriptorRevision = 0;
+  expect(engine.applyDescriptorCommand(command, appliedDescriptorRevision, &error),
+         "apply limiter bypass descriptor off the audio path: " + error);
   expect(engine.pipelineLatency() == 0u && engine.latencyRevision() > enabledRevision,
-         "queued descriptor publishes bypassed pipeline latency");
+         "non-RT descriptor publishes bypassed pipeline latency");
 }
 
 void testMasterBypassLatencyAlignment() {
@@ -1003,6 +1125,7 @@ void testMasterBypassLatencyAlignment() {
 } // namespace
 
 int main() {
+  effetune::vst::testing::suppressCrtModalDialogs();
   try {
     testDescriptor();
     testQueue();

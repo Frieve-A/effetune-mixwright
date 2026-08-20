@@ -4,6 +4,7 @@
 /dist/
 /artifacts/
 /.cache/
+/tmp/
 CMakeUserPresets.json
 CMakeCache.txt
 CMakeFiles/

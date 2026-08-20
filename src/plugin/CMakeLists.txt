@@ -1,5 +1,7 @@
 set(effetune_plugin_sources
   ${vst3sdk_SOURCE_DIR}/public.sdk/source/vst/vstsinglecomponenteffect.cpp
+  automation_parameters.cpp
+  automation_parameters.h
   external_url.cpp
   external_url.h
   factory.cpp
@@ -94,12 +96,17 @@ elseif(APPLE)
 endif()
 
 if(SMTG_MAC)
+  if(EFFETUNE_AUTOMATION_HOST_GATE_FIXTURE)
+    set(effetune_bundle_identifier "com.frieve.effetune.automation-host-gate")
+  else()
+    set(effetune_bundle_identifier "com.frieve.effetune.plugin")
+  endif()
   smtg_target_set_bundle(effetune_plugin
-    BUNDLE_IDENTIFIER "com.frieve.effetune.plugin"
+    BUNDLE_IDENTIFIER "${effetune_bundle_identifier}"
     COMPANY_NAME "Frieve")
   set_target_properties(effetune_plugin PROPERTIES
     MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/Info.plist.in"
-    MACOSX_BUNDLE_GUI_IDENTIFIER "com.frieve.effetune.plugin"
+    MACOSX_BUNDLE_GUI_IDENTIFIER "${effetune_bundle_identifier}"
     MACOSX_BUNDLE_BUNDLE_NAME "${EFFETUNE_PLUGIN_PACKAGE_NAME}"
     MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
     MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"

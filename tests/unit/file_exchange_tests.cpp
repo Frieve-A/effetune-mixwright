@@ -6,6 +6,8 @@
 #include <stdexcept>
 #include <string>
 
+#include "../support/crt_dialog_suppression.h"
+
 namespace {
 
 using namespace effetune::vst::plugin;
@@ -17,6 +19,7 @@ void expect(const bool condition, const std::string &message) {
 } // namespace
 
 int main() {
+  effetune::vst::testing::suppressCrtModalDialogs();
   const auto path = std::filesystem::current_path() / "effetune-file-exchange-test.effetune_preset";
   std::error_code cleanupError;
   std::filesystem::remove(path, cleanupError);

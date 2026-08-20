@@ -198,7 +198,15 @@ void EngineHost::clearInstancesUnlocked() noexcept {
     }
   }
   instances_.clear();
+  // Without an instance there is no kernel to hold a preparation state, so the
+  // projection has to say so until the assets are staged again.
+  for (auto &[key, asset] : assets_) {
+    (void)key;
+    asset.state.store(static_cast<std::uint32_t>(ET_ASSET_STATE_NONE),
+                      std::memory_order_release);
+  }
   activeDescriptorByteCount_ = 0;
+  assetPreparationLatencyPolling_ = false;
 }
 
 std::uint32_t EngineHost::resolveInstance(const std::uint32_t logicalId) const noexcept {
@@ -302,10 +310,10 @@ bool EngineHost::rebuild(const PipelineState &pipeline,
       setError(error, "Unable to track the DSP instance");
       return false;
     }
-    for (const auto &[key, asset] : assets_) {
+    for (const auto &[key, entry] : assets_) {
       (void)key;
-      if (asset.logicalId == runtime.logicalId) {
-        (void)stageAssetUnlocked(asset);
+      if (entry.asset.logicalId == runtime.logicalId) {
+        (void)stageAssetUnlocked(entry.asset);
       }
     }
   }
@@ -329,7 +337,8 @@ bool EngineHost::rebuild(const PipelineState &pipeline,
   }
 
   combined_ = engine_->combined();
-  refreshLatencyUnlocked();
+  (void)refreshLatencyUnlocked();
+  (void)refreshAssetStatesUnlocked();
   return combined_ != nullptr;
 }
 
@@ -354,7 +363,7 @@ bool EngineHost::updateDescriptor(const PipelineState &pipeline, std::string *er
     setError(error, exception.what());
     return false;
   }
-  refreshLatencyUnlocked();
+  (void)refreshLatencyUnlocked();
   return true;
 }
 
@@ -388,6 +397,42 @@ bool EngineHost::makeDescriptorCommand(
   }
 }
 
+bool EngineHost::applyDescriptorCommand(const AudioCommand &command,
+                                        std::uint64_t &appliedRevision,
+                                        std::string *error) {
+  std::scoped_lock lock(engineMutex_);
+  if (!prepared_ || command.type != AudioCommandType::setDescriptor ||
+      command.descriptorByteCount > command.descriptor.size() ||
+      !validDescriptor(command.descriptor.data(), command.descriptorByteCount)) {
+    setError(error, "Native DSP topology command is invalid");
+    return false;
+  }
+
+  auto descriptor = command.descriptor;
+  const auto nodeCount = readUint32(descriptor.data() + 4u);
+  for (std::uint32_t index = 0; index < nodeCount; ++index) {
+    auto *node = descriptor.data() + kPipelineDescriptorHeaderBytes +
+                 index * kPipelineDescriptorNodeBytes;
+    const auto instance = instances_.find(readUint32(node));
+    if (instance == instances_.end()) {
+      setError(error, "Native DSP topology references an unavailable instance");
+      return false;
+    }
+    writeUint32(node, instance->second.instance);
+  }
+  const auto status = engine_->configurePipeline(descriptor.data(),
+                                                  command.descriptorByteCount);
+  if (status != ET_OK) {
+    setError(error, "et_pipeline_configure failed with status " +
+                        std::to_string(status));
+    return false;
+  }
+  storeActiveDescriptorUnlocked(descriptor.data(), command.descriptorByteCount);
+  (void)refreshLatencyUnlocked();
+  appliedRevision = pipelinePlanRevision_.fetch_add(1, std::memory_order_acq_rel) + 1u;
+  return true;
+}
+
 bool EngineHost::updateParametersUnlocked(const std::uint32_t logicalId,
                                           const std::span<const float> packed,
                                           const std::uint32_t paramsHash,
@@ -414,8 +459,21 @@ bool EngineHost::updateParameters(const std::uint32_t logicalId,
                                   const std::uint32_t paramsHash,
                                   const std::span<const std::uint8_t> parameterBytes) {
   std::scoped_lock lock(engineMutex_);
-  return prepared_ &&
-         updateParametersUnlocked(logicalId, packed, paramsHash, parameterBytes);
+  const auto instance = instances_.find(logicalId);
+  const auto previousLatency =
+      instance == instances_.end() ? 0u : engine_->instanceLatency(instance->second.instance);
+  if (!prepared_) {
+    return false;
+  }
+  const auto updated = updateParametersUnlocked(logicalId, packed, paramsHash, parameterBytes);
+  const auto latencyChanged = instance != instances_.end() &&
+                              engine_->instanceLatency(instance->second.instance) !=
+                                  previousLatency;
+  if (latencyChanged) {
+    pipelinePlanRevision_.fetch_add(1, std::memory_order_acq_rel);
+    (void)refreshLatencyUnlocked();
+  }
+  return updated;
 }
 
 bool EngineHost::stageAssetUnlocked(const RuntimeAsset &asset, std::string *error) {
@@ -454,7 +512,25 @@ bool EngineHost::stageAssetUnlocked(const RuntimeAsset &asset, std::string *erro
     setError(error, "DSP asset could not be committed");
     return false;
   }
+  assetPreparationLatencyPolling_ = true;
   return true;
+}
+
+bool EngineHost::refreshAssetStatesUnlocked() noexcept {
+  auto pending = false;
+  for (auto &[key, entry] : assets_) {
+    (void)key;
+    const auto instance = instances_.find(entry.asset.logicalId);
+    const auto state = instance == instances_.end()
+                           ? static_cast<std::uint32_t>(ET_ASSET_STATE_NONE)
+                           : engine_->instanceAssetState(instance->second.instance,
+                                                         entry.asset.slot);
+    entry.state.store(state, std::memory_order_release);
+    const auto phase = state & 0xffu;
+    pending = pending || phase == ET_ASSET_STATE_STAGED ||
+              phase == ET_ASSET_STATE_PREPARING;
+  }
+  return pending;
 }
 
 bool EngineHost::setAsset(RuntimeAsset asset, std::string *error) {
@@ -463,7 +539,7 @@ bool EngineHost::setAsset(RuntimeAsset asset, std::string *error) {
   std::uint64_t aggregate = asset.footprintBytes;
   for (const auto &[cachedKey, cached] : assets_) {
     if (cachedKey != key) {
-      aggregate += cached.footprintBytes;
+      aggregate += cached.asset.footprintBytes;
     }
   }
   if (aggregate > kAggregateAssetBudgetBytes) {
@@ -472,9 +548,11 @@ bool EngineHost::setAsset(RuntimeAsset asset, std::string *error) {
   }
   const auto cached = assets_.find(key);
   const auto instance = instances_.find(asset.logicalId);
-  if (cached != assets_.end() && instance != instances_.end() && sameAsset(cached->second, asset)) {
+  if (cached != assets_.end() && instance != instances_.end() &&
+      sameAsset(cached->second.asset, asset)) {
     const auto state = engine_->instanceAssetState(instance->second.instance, asset.slot) & 0xffu;
     if (state >= ET_ASSET_STATE_STAGED && state <= ET_ASSET_STATE_ACTIVE) {
+      (void)refreshAssetStatesUnlocked();
       return true;
     }
   }
@@ -484,91 +562,99 @@ bool EngineHost::setAsset(RuntimeAsset asset, std::string *error) {
   const auto logicalId = asset.logicalId;
   const auto slot = asset.slot;
   try {
-    assets_.insert_or_assign(key, std::move(asset));
+    assets_[key].asset = std::move(asset);
   } catch (const std::bad_alloc &) {
     const auto found = instances_.find(logicalId);
     if (found != instances_.end()) {
       engine_->abortInstanceAsset(found->second.instance, slot);
     }
+    assetPreparationLatencyPolling_ = refreshAssetStatesUnlocked();
     setError(error, "DSP asset cache could not be allocated");
     return false;
   }
+  // Staging leaves the latency polling flag set on purpose: the state the
+  // block-end scan will observe is published here so the UI can follow the
+  // preparation without opening a window of its own.
+  (void)refreshAssetStatesUnlocked();
   return true;
 }
 
 bool EngineHost::clearAsset(const std::uint32_t logicalId, const std::uint32_t slot) {
   std::scoped_lock lock(engineMutex_);
   const auto found = instances_.find(logicalId);
+  const auto previousLatency =
+      found == instances_.end() ? 0u : engine_->instanceLatency(found->second.instance);
   if (found != instances_.end()) {
     engine_->abortInstanceAsset(found->second.instance, slot);
   }
   const auto key = (static_cast<std::uint64_t>(logicalId) << 32u) | slot;
   assets_.erase(key);
-  refreshLatencyUnlocked();
+  assetPreparationLatencyPolling_ = refreshAssetStatesUnlocked();
+  const auto instanceLatencyChanged =
+      found != instances_.end() &&
+      engine_->instanceLatency(found->second.instance) != previousLatency;
+  (void)refreshLatencyUnlocked();
+  if (instanceLatencyChanged) {
+    pipelinePlanRevision_.fetch_add(1, std::memory_order_acq_rel);
+  }
   return found != instances_.end();
 }
 
 std::uint32_t EngineHost::assetState(const std::uint32_t logicalId,
                                      const std::uint32_t slot) const {
+  // Reads the published projection instead of the kernel, so the caller needs
+  // no quiet engine: polling the preparation state must never cost a block.
   std::scoped_lock lock(engineMutex_);
-  const auto found = instances_.find(logicalId);
-  return found == instances_.end()
+  const auto found =
+      assets_.find((static_cast<std::uint64_t>(logicalId) << 32u) | slot);
+  return found == assets_.end()
              ? static_cast<std::uint32_t>(ET_ASSET_STATE_NONE)
-             : engine_->instanceAssetState(found->second.instance, slot);
+             : found->second.state.load(std::memory_order_acquire);
 }
 
 void EngineHost::retainAssets(const std::span<const std::uint32_t> logicalIds) {
   std::scoped_lock lock(engineMutex_);
   for (auto item = assets_.begin(); item != assets_.end();) {
-    const auto retained = std::find(logicalIds.begin(), logicalIds.end(), item->second.logicalId) !=
-                          logicalIds.end();
+    const auto retained =
+        std::find(logicalIds.begin(), logicalIds.end(), item->second.asset.logicalId) !=
+        logicalIds.end();
     if (!retained) {
       item = assets_.erase(item);
     } else {
       ++item;
     }
   }
+  assetPreparationLatencyPolling_ = refreshAssetStatesUnlocked();
 }
 
-bool EngineHost::applyCommandUnlocked(const AudioCommand &command) noexcept {
+bool EngineHost::applyCommandUnlocked(const AudioCommand &command,
+                                      bool *pipelinePlanDirty) noexcept {
   switch (command.type) {
   case AudioCommandType::setParameters:
     if (command.floatCount > command.packed.size() ||
         command.parameterByteCount > command.parameterBytes.size()) {
       return false;
     }
-    if (!updateParametersUnlocked(
-        command.logicalId,
-        std::span<const float>(command.packed.data(), command.floatCount), command.paramsHash,
-        std::span<const std::uint8_t>(command.parameterBytes.data(),
-                                     command.parameterByteCount))) {
-      return false;
-    }
-    refreshLatencyUnlocked();
-    return true;
-  case AudioCommandType::setDescriptor:
-    if (command.descriptorByteCount > command.descriptor.size() ||
-        !validDescriptor(command.descriptor.data(), command.descriptorByteCount)) {
-      return false;
-    }
     {
-      auto descriptor = command.descriptor;
-      const auto nodeCount = readUint32(descriptor.data() + 4u);
-      for (std::uint32_t index = 0; index < nodeCount; ++index) {
-        auto *node = descriptor.data() + kPipelineDescriptorHeaderBytes +
-                     index * kPipelineDescriptorNodeBytes;
-        const auto instance = instances_.find(readUint32(node));
-        if (instance == instances_.end()) {
-          return false;
-        }
-        writeUint32(node, instance->second.instance);
+      const auto instance = instances_.find(command.logicalId);
+      const auto previousLatency =
+          instance == instances_.end() ? 0u : engine_->instanceLatency(instance->second.instance);
+      const auto updated = updateParametersUnlocked(
+          command.logicalId,
+          std::span<const float>(command.packed.data(), command.floatCount), command.paramsHash,
+          std::span<const std::uint8_t>(command.parameterBytes.data(),
+                                        command.parameterByteCount));
+      if (pipelinePlanDirty != nullptr && instance != instances_.end() &&
+          engine_->instanceLatency(instance->second.instance) != previousLatency) {
+        *pipelinePlanDirty = true;
       }
-      if (engine_->configurePipeline(descriptor.data(), command.descriptorByteCount) != ET_OK) {
-        return false;
-      }
-      storeActiveDescriptorUnlocked(descriptor.data(), command.descriptorByteCount);
-      return true;
+      return updated;
     }
+  case AudioCommandType::setDescriptor:
+    // Pipeline configuration may allocate compensation delay storage. Descriptor
+    // commands are therefore serviced only by the processor's non-real-time
+    // control service and are rejected from ProcessBatch.
+    return false;
   case AudioCommandType::reset:
     return engine_->reset() == ET_OK;
   }
@@ -589,49 +675,250 @@ bool EngineHost::tryProcessBlock(float *const *channels, const std::uint32_t cha
                                  AudioCommandQueue *commands,
                                  LatestParameterMailbox *parameterMailbox) noexcept {
   if (channels == nullptr || channelCount == 0 || channelCount > channels_ ||
-      frameCount == 0 || frameCount > kMaxProcessFrames || !std::isfinite(timeSeconds)) {
+      frameCount == 0 || frameCount > kMaxProcessFrames ||
+      !std::isfinite(timeSeconds)) {
     return false;
   }
-  std::unique_lock lock(engineMutex_, std::try_to_lock);
-  if (!lock.owns_lock() || !prepared_ || combined_ == nullptr) {
+  ProcessBatch batch;
+  if (!beginProcessBatch(batch, commands, parameterMailbox)) {
     return false;
   }
+  const auto processed =
+      batch.processChunk(channels, channelCount, frameCount, timeSeconds, masterBypass);
+  return batch.finish() && processed;
+}
 
+EngineHost::ProcessBatch::~ProcessBatch() { (void)finish(); }
+
+bool EngineHost::ProcessBatch::stageParameters(
+    const std::uint32_t logicalId, const std::span<const float> packed,
+    const std::uint32_t paramsHash,
+    const std::span<const std::uint8_t> parameterBytes) noexcept {
+  ResolvedParameterTarget target;
+  if (!resolveParameterTarget(logicalId, paramsHash, target)) {
+    return false;
+  }
+  return stageParameters(target, packed, parameterBytes);
+}
+
+bool EngineHost::ProcessBatch::resolveParameterTarget(
+    const std::uint32_t logicalId, const std::uint32_t paramsHash,
+    ResolvedParameterTarget &target) noexcept {
+  target = {};
+  if (host_ == nullptr || failed_) {
+    return false;
+  }
+  const auto found = host_->instances_.find(logicalId);
+  if (found == host_->instances_.end() || found->second.paramsHash != paramsHash) {
+    host_->processCounterAtoms_.parameterStageFailures.fetch_add(
+        1, std::memory_order_relaxed);
+    host_->recordProcessFailure(ProcessError::parameterTargetUnavailable);
+    failed_ = true;
+    return false;
+  }
+  target = {logicalId, found->second.instance, paramsHash};
+  return true;
+}
+
+bool EngineHost::ProcessBatch::stageParameters(
+    const ResolvedParameterTarget &target, const std::span<const float> packed,
+    const std::span<const std::uint8_t> parameterBytes) noexcept {
+  if (host_ == nullptr || failed_ || !target ||
+      packed.size() > std::numeric_limits<std::uint32_t>::max() ||
+      parameterBytes.size() > std::numeric_limits<std::uint32_t>::max()) {
+    if (host_ != nullptr) {
+      host_->processCounterAtoms_.parameterStageFailures.fetch_add(
+          1, std::memory_order_relaxed);
+      host_->recordProcessFailure(ProcessError::parameterStageRejected);
+    }
+    failed_ = true;
+    return false;
+  }
+  const auto previousLatency = host_->engine_->instanceLatency(target.instance);
+  const auto parametersStaged =
+      host_->engine_->setInstanceParams(
+          target.instance, packed.empty() ? nullptr : packed.data(),
+          static_cast<std::uint32_t>(packed.size()), target.paramsHash, 0) == ET_OK;
+  const auto bytesStaged =
+      parametersStaged && (parameterBytes.empty() ||
+                           host_->engine_->setInstanceParamBytes(
+                               target.instance, parameterBytes.data(),
+                               static_cast<std::uint32_t>(parameterBytes.size()),
+                               target.paramsHash, 0) == ET_OK);
+  if (host_->engine_->instanceLatency(target.instance) != previousLatency) {
+    pipelinePlanDirty_ = true;
+  }
+  if (!parametersStaged || !bytesStaged) {
+    host_->processCounterAtoms_.parameterStageFailures.fetch_add(
+        1, std::memory_order_relaxed);
+    host_->recordProcessFailure(ProcessError::parameterStageRejected);
+    failed_ = true;
+    return false;
+  }
+  return true;
+}
+
+bool EngineHost::ProcessBatch::processChunk(float *const *channels,
+                                            const std::uint32_t channelCount,
+                                            const std::uint32_t frameCount,
+                                            const double timeSeconds,
+                                            const bool masterBypass) noexcept {
+  if (host_ == nullptr || failed_ || channels == nullptr || channelCount == 0 ||
+      channelCount > host_->channels_ || frameCount == 0 ||
+      frameCount > kMaxProcessFrames || !std::isfinite(timeSeconds)) {
+    if (host_ != nullptr) {
+      host_->processCounterAtoms_.processFailures.fetch_add(1,
+                                                            std::memory_order_relaxed);
+      host_->recordProcessFailure(ProcessError::invalidProcessChunk);
+    }
+    failed_ = true;
+    return false;
+  }
+  for (std::uint32_t channel = 0; channel < channelCount; ++channel) {
+    if (channels[channel] == nullptr) {
+      host_->processCounterAtoms_.processFailures.fetch_add(1,
+                                                            std::memory_order_relaxed);
+      host_->recordProcessFailure(ProcessError::invalidProcessChunk);
+      failed_ = true;
+      return false;
+    }
+    std::memcpy(host_->combined_ + static_cast<std::size_t>(channel) * frameCount,
+                channels[channel], sizeof(float) * frameCount);
+  }
+  const auto status = host_->engine_->processPipeline(
+      channelCount, frameCount, timeSeconds, masterBypass ? 1u : 0u);
+  if (status != ET_OK) {
+    host_->processCounterAtoms_.processFailures.fetch_add(1,
+                                                          std::memory_order_relaxed);
+    host_->recordProcessFailure(ProcessError::engineProcessRejected);
+    failed_ = true;
+    return false;
+  }
+  for (std::uint32_t channel = 0; channel < channelCount; ++channel) {
+    std::memcpy(channels[channel],
+                host_->combined_ + static_cast<std::size_t>(channel) * frameCount,
+                sizeof(float) * frameCount);
+  }
+  host_->processedFrames_ += frameCount;
+  return true;
+}
+
+bool EngineHost::ProcessBatch::finish(const bool refreshLatency) noexcept {
+  if (host_ == nullptr) {
+    return !failed_;
+  }
+  auto *host = host_;
+  const auto assetLatencyMayHaveChanged = host->assetPreparationLatencyPolling_;
+  auto instanceLatencyChanged = false;
+  if (latencyDirty_ || refreshLatency) {
+    (void)host->refreshLatencyUnlocked(&instanceLatencyChanged);
+    host->processCounterAtoms_.latencyRefreshes.fetch_add(1,
+                                                          std::memory_order_relaxed);
+  }
+  if (pipelinePlanDirty_ ||
+      (assetLatencyMayHaveChanged && instanceLatencyChanged)) {
+    host->pipelinePlanRevision_.fetch_add(1, std::memory_order_acq_rel);
+  }
+  if (host->assetPreparationLatencyPolling_) {
+    host->assetPreparationLatencyPolling_ = host->refreshAssetStatesUnlocked();
+  }
+  host->drainTelemetryUnlocked();
+  host->processCounterAtoms_.telemetryDrains.fetch_add(1,
+                                                       std::memory_order_relaxed);
+  host->processCounterAtoms_.completedBatches.fetch_add(1,
+                                                        std::memory_order_relaxed);
+  const auto succeeded = !failed_;
+  host_ = nullptr;
+  return succeeded;
+}
+
+bool EngineHost::beginProcessBatch(
+    ProcessBatch &batch, AudioCommandQueue *commands,
+    LatestParameterMailbox *parameterMailbox) noexcept {
+  if (batch.active()) {
+    return false;
+  }
+  processCounterAtoms_.batchAttempts.fetch_add(1, std::memory_order_relaxed);
+  // No lock is taken here. The owner only mutates the engine from a control
+  // thread after it has proven that no block is in flight, so concurrent
+  // control work can never cost the audio callback a block.
+  if (!prepared_ || combined_ == nullptr) {
+    recordProcessFailure(ProcessError::notPrepared);
+    return false;
+  }
+  batch.host_ = this;
+  // Asset preparation becomes active from processPipeline(), so its latency
+  // must be observed at block housekeeping until it reaches a terminal state.
+  batch.latencyDirty_ = assetPreparationLatencyPolling_;
+  batch.pipelinePlanDirty_ = false;
+  batch.failed_ = false;
+
+  const auto apply = [this, &batch](const AudioCommand &command) noexcept {
+    if (applyCommandUnlocked(command, &batch.pipelinePlanDirty_)) {
+      batch.latencyDirty_ = true;
+    } else {
+      batch.failed_ = true;
+      processCounterAtoms_.commandFailures.fetch_add(1,
+                                                      std::memory_order_relaxed);
+      recordProcessFailure(ProcessError::commandRejected);
+    }
+  };
   if (commands != nullptr) {
     AudioCommand command;
     while (commands->pop(command)) {
-      (void)applyCommandUnlocked(command);
+      apply(command);
     }
   }
   if (parameterMailbox != nullptr) {
-    parameterMailbox->consumePending(
-        [this](const AudioCommand &command) noexcept { (void)applyCommandUnlocked(command); });
+    parameterMailbox->consumePending(apply);
   }
-
-  for (std::uint32_t channel = 0; channel < channelCount; ++channel) {
-    if (channels[channel] == nullptr) {
-      return false;
-    }
-    std::memcpy(combined_ + static_cast<std::size_t>(channel) * frameCount, channels[channel],
-                sizeof(float) * frameCount);
-  }
-  const auto status =
-      engine_->processPipeline(channelCount, frameCount, timeSeconds, masterBypass ? 1u : 0u);
-  if (status != ET_OK) {
+  if (batch.failed_) {
+    (void)batch.finish();
     return false;
   }
-  refreshLatencyUnlocked();
-  for (std::uint32_t channel = 0; channel < channelCount; ++channel) {
-    std::memcpy(channels[channel], combined_ + static_cast<std::size_t>(channel) * frameCount,
-                sizeof(float) * frameCount);
-  }
-  processedFrames_ += frameCount;
-  drainTelemetryUnlocked();
   return true;
+}
+
+EngineHost::ProcessCounters EngineHost::processCounters() const noexcept {
+  return {processCounterAtoms_.batchAttempts.load(std::memory_order_relaxed),
+          processCounterAtoms_.commandFailures.load(std::memory_order_relaxed),
+          processCounterAtoms_.parameterStageFailures.load(std::memory_order_relaxed),
+          processCounterAtoms_.processFailures.load(std::memory_order_relaxed),
+          processCounterAtoms_.completedBatches.load(std::memory_order_relaxed),
+          processCounterAtoms_.telemetryDrains.load(std::memory_order_relaxed),
+          processCounterAtoms_.latencyRefreshes.load(std::memory_order_relaxed)};
+}
+
+void EngineHost::recordProcessFailure(const ProcessError error) noexcept {
+  lastProcessError_.store(error, std::memory_order_relaxed);
+  processFailureSequence_.fetch_add(1, std::memory_order_release);
+}
+
+EngineHost::ProcessFailureDiagnostic EngineHost::processFailureDiagnostic() const noexcept {
+  const auto sequence = processFailureSequence_.load(std::memory_order_acquire);
+  return {sequence, lastProcessError_.load(std::memory_order_relaxed)};
 }
 
 std::uint32_t EngineHost::pipelineLatency() const {
   return pipelineLatency_.load(std::memory_order_acquire);
+}
+
+bool EngineHost::refreshPipelinePlan(std::uint64_t &refreshedRevision,
+                                     std::string *error) {
+  std::scoped_lock lock(engineMutex_);
+  if (!prepared_ || !validDescriptor(activeDescriptor_.data(), activeDescriptorByteCount_)) {
+    setError(error, "DSP pipeline is not configured");
+    return false;
+  }
+  const auto status = engine_->configurePipeline(activeDescriptor_.data(),
+                                                  activeDescriptorByteCount_);
+  if (status != ET_OK) {
+    setError(error, "et_pipeline_configure failed with status " + std::to_string(status));
+    return false;
+  }
+  refreshedRevision = pipelinePlanRevision_.load(std::memory_order_acquire);
+  (void)refreshLatencyUnlocked();
+  return true;
 }
 
 void EngineHost::storeActiveDescriptorUnlocked(const std::uint8_t *descriptor,
@@ -644,14 +931,25 @@ void EngineHost::storeActiveDescriptorUnlocked(const std::uint8_t *descriptor,
   activeDescriptorByteCount_ = byteCount;
 }
 
-void EngineHost::refreshLatencyUnlocked() noexcept {
-  std::array<std::uint32_t, 5> busLatency{};
+bool EngineHost::refreshLatencyUnlocked(bool *instanceLatencyChanged) noexcept {
+  if (instanceLatencyChanged != nullptr) {
+    *instanceLatencyChanged = false;
+  }
+  std::array<std::array<std::uint32_t, kMaxChannels>, kMaxBus + 1u> latency{};
+  std::array<std::array<bool, kMaxChannels>, kMaxBus + 1u> hasContent{};
   if (!validDescriptor(activeDescriptor_.data(), activeDescriptorByteCount_)) {
+    observedLatencyNodes_.fill(false);
     const auto previous = pipelineLatency_.exchange(0, std::memory_order_acq_rel);
     if (previous != 0) {
       latencyRevision_.fetch_add(1, std::memory_order_acq_rel);
     }
-    return;
+    return previous != 0;
+  }
+  const auto previousLatencies = observedInstanceLatencies_;
+  const auto previousNodes = observedLatencyNodes_;
+  observedLatencyNodes_.fill(false);
+  for (std::uint32_t channel = 0; channel < channels_; ++channel) {
+    hasContent[0][channel] = true;
   }
   const auto nodeCount = readUint32(activeDescriptor_.data() + 4u);
   for (std::uint32_t index = 0; index < nodeCount; ++index) {
@@ -659,19 +957,65 @@ void EngineHost::refreshLatencyUnlocked() noexcept {
                        index * kPipelineDescriptorNodeBytes;
     const auto inputBus = node[5];
     const auto outputBus = node[6];
-    if (node[4] == 0 || inputBus > kMaxBus || outputBus > kMaxBus) {
+    if (node[4] == 0 || node[8] == 0 || inputBus > kMaxBus || outputBus > kMaxBus) {
       continue;
     }
+
+    const auto channelSpec = static_cast<std::int8_t>(node[7]);
+    std::uint32_t firstChannel = 0;
+    std::uint32_t routedChannels = channels_;
+    if (channelSpec != -2) {
+      if (channelSpec == -1) {
+        routedChannels = 2;
+      } else if (channelSpec >= 16 && channelSpec <= 19) {
+        firstChannel = static_cast<std::uint32_t>(channelSpec - 16) * 2u;
+        routedChannels = 2;
+      } else if (channelSpec >= 0 && channelSpec < 8) {
+        firstChannel = static_cast<std::uint32_t>(channelSpec);
+        routedChannels = 1;
+      } else {
+        continue;
+      }
+    }
+    if (firstChannel + routedChannels > channels_) {
+      continue;
+    }
+
     const auto instanceLatency = engine_->instanceLatency(readUint32(node));
-    const auto routedLatency = busLatency[inputBus] + instanceLatency;
-    if (inputBus == outputBus || routedLatency > busLatency[outputBus]) {
-      busLatency[outputBus] = routedLatency;
+    observedInstanceLatencies_[index] = instanceLatency;
+    observedLatencyNodes_[index] = true;
+    if (instanceLatencyChanged != nullptr &&
+        ((!previousNodes[index] && instanceLatency != 0u) ||
+         (previousNodes[index] && previousLatencies[index] != instanceLatency))) {
+      *instanceLatencyChanged = true;
+    }
+    for (std::uint32_t offset = 0; offset < routedChannels; ++offset) {
+      const auto channel = firstChannel + offset;
+      const auto inputLatency = hasContent[inputBus][channel] ? latency[inputBus][channel] : 0u;
+      const auto incomingLatency =
+          instanceLatency > std::numeric_limits<std::uint32_t>::max() - inputLatency
+              ? std::numeric_limits<std::uint32_t>::max()
+              : inputLatency + instanceLatency;
+      if (inputBus == outputBus || !hasContent[outputBus][channel]) {
+        latency[outputBus][channel] = incomingLatency;
+        hasContent[outputBus][channel] = true;
+      } else if (incomingLatency > latency[outputBus][channel]) {
+        latency[outputBus][channel] = incomingLatency;
+      }
     }
   }
-  const auto previous = pipelineLatency_.exchange(busLatency[0], std::memory_order_acq_rel);
-  if (previous != busLatency[0]) {
+
+  std::uint32_t pipelineLatency = 0;
+  for (std::uint32_t channel = 0; channel < channels_; ++channel) {
+    if (hasContent[0][channel] && latency[0][channel] > pipelineLatency) {
+      pipelineLatency = latency[0][channel];
+    }
+  }
+  const auto previous = pipelineLatency_.exchange(pipelineLatency, std::memory_order_acq_rel);
+  if (previous != pipelineLatency) {
     latencyRevision_.fetch_add(1, std::memory_order_acq_rel);
   }
+  return previous != pipelineLatency;
 }
 
 void EngineHost::drainTelemetryUnlocked() noexcept {

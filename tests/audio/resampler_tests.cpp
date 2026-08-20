@@ -16,6 +16,8 @@
 #include <string>
 #include <vector>
 
+#include "../support/crt_dialog_suppression.h"
+
 namespace {
 
 using namespace effetune::vst;
@@ -307,6 +309,7 @@ void testRoundTripTransparency() {
 } // namespace
 
 int main() {
+  effetune::vst::testing::suppressCrtModalDialogs();
   try {
     testFilterDesign();
     testOffBitTransparency();

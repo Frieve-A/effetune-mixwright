@@ -10,8 +10,6 @@ if(MSVC AND CMAKE_GENERATOR MATCHES "^Ninja" AND
   set(CMAKE_CL_SHOWINCLUDES_PREFIX "メモ: インクルード ファイル:  ")
 endif()
 
-set(EFFETUNE_PLUGIN_PACKAGE_NAME "EffeTune Mixwright")
-
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
@@ -23,6 +21,21 @@ option(EFFETUNE_BUILD_PLUGIN "Build the VST3 plug-in" ON)
 option(EFFETUNE_BUILD_TESTS "Build EffeTune VST unit tests" ON)
 option(EFFETUNE_BUILD_TOOLS "Build EffeTune VST command-line tools" ON)
 option(EFFETUNE_ENABLE_AVX2 "Use AVX2/FMA for the Windows x64 resampler" ON)
+option(EFFETUNE_AUTOMATION_HOST_GATE_FIXTURE
+  "Build the non-shipping automation registration host-gate fixture" OFF)
+
+if(EFFETUNE_AUTOMATION_HOST_GATE_FIXTURE)
+  if(NOT EFFETUNE_BUILD_PLUGIN OR NOT EFFETUNE_BUILD_TESTS)
+    message(FATAL_ERROR
+      "The automation host-gate fixture requires plug-in and test targets")
+  endif()
+  set(EFFETUNE_PLUGIN_PACKAGE_NAME "EffeTune Mixwright Automation Host Gate")
+  add_compile_definitions(EFFETUNE_AUTOMATION_HOST_GATE_FIXTURE=1)
+  message(WARNING
+    "Building the non-shipping automation host-gate fixture with an isolated VST identity")
+else()
+  set(EFFETUNE_PLUGIN_PACKAGE_NAME "EffeTune Mixwright")
+endif()
 
 if(EFFETUNE_BUILD_TESTS)
   include(CTest)

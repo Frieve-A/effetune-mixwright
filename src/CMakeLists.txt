@@ -1,4 +1,7 @@
 add_library(effetune_engine STATIC
+  engine/automation_catalog.cpp
+  engine/automation_binding.cpp
+  engine/automation_scheduler.cpp
   engine/block_adapter.cpp
   engine/dry_delay.cpp
   engine/engine_host.cpp
@@ -13,7 +16,9 @@ add_library(effetune_engine STATIC
 
 target_include_directories(effetune_engine
   PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}"
-  PRIVATE "${PROJECT_SOURCE_DIR}/external/effetune/dsp/core")
+  PRIVATE
+    "${PROJECT_SOURCE_DIR}/external/effetune/dsp/core"
+    "${PROJECT_SOURCE_DIR}/external/effetune/dsp/generated/cpp")
 target_link_libraries(effetune_engine PUBLIC effetune_dsp_core effetune_choc)
 target_compile_features(effetune_engine PUBLIC cxx_std_20)
 

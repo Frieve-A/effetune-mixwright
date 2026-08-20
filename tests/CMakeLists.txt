@@ -10,6 +10,57 @@ endif()
 
 add_test(NAME effetune_vst_unit_tests COMMAND effetune_vst_unit_tests)
 
+add_executable(effetune_automation_binding_tests unit/automation_binding_tests.cpp)
+target_link_libraries(effetune_automation_binding_tests PRIVATE effetune_engine)
+target_compile_features(effetune_automation_binding_tests PRIVATE cxx_std_20)
+if(MSVC)
+  target_compile_options(effetune_automation_binding_tests PRIVATE /W4 /WX /utf-8)
+else()
+  target_compile_options(effetune_automation_binding_tests PRIVATE
+    -Wall -Wextra -Wpedantic -Werror)
+endif()
+add_test(NAME effetune_automation_binding_tests COMMAND effetune_automation_binding_tests)
+
+add_executable(effetune_automation_scheduler_tests
+  unit/automation_scheduler_tests.cpp)
+target_link_libraries(effetune_automation_scheduler_tests PRIVATE effetune_engine)
+target_compile_features(effetune_automation_scheduler_tests PRIVATE cxx_std_20)
+if(MSVC)
+  target_compile_options(effetune_automation_scheduler_tests PRIVATE /W4 /WX /utf-8)
+else()
+  target_compile_options(effetune_automation_scheduler_tests PRIVATE
+    -Wall -Wextra -Wpedantic -Werror)
+endif()
+add_test(NAME effetune_automation_scheduler_tests
+  COMMAND effetune_automation_scheduler_tests)
+
+add_executable(effetune_engine_batch_tests unit/engine_batch_tests.cpp)
+target_link_libraries(effetune_engine_batch_tests PRIVATE effetune_engine)
+target_compile_features(effetune_engine_batch_tests PRIVATE cxx_std_20)
+if(MSVC)
+  target_compile_options(effetune_engine_batch_tests PRIVATE /W4 /WX /utf-8)
+else()
+  target_compile_options(effetune_engine_batch_tests PRIVATE
+    -Wall -Wextra -Wpedantic -Werror)
+endif()
+add_test(NAME effetune_engine_batch_tests COMMAND effetune_engine_batch_tests)
+
+add_executable(effetune_automation_parameter_bank_tests
+  unit/automation_parameter_bank_tests.cpp
+  ${PROJECT_SOURCE_DIR}/src/plugin/automation_parameters.cpp)
+target_link_libraries(effetune_automation_parameter_bank_tests PRIVATE sdk effetune_engine)
+target_include_directories(effetune_automation_parameter_bank_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/src)
+target_compile_features(effetune_automation_parameter_bank_tests PRIVATE cxx_std_20)
+if(MSVC)
+  target_compile_options(effetune_automation_parameter_bank_tests PRIVATE /W4 /WX /utf-8)
+else()
+  target_compile_options(effetune_automation_parameter_bank_tests PRIVATE
+    -Wall -Wextra -Wpedantic -Werror)
+endif()
+add_test(NAME effetune_automation_parameter_bank_tests
+  COMMAND effetune_automation_parameter_bank_tests)
+
 add_executable(effetune_resampler_tests audio/resampler_tests.cpp)
 target_link_libraries(effetune_resampler_tests PRIVATE effetune_engine)
 target_compile_features(effetune_resampler_tests PRIVATE cxx_std_20)
@@ -38,6 +89,28 @@ endif()
 add_test(NAME effetune_file_exchange_tests COMMAND effetune_file_exchange_tests)
 
 if(WIN32 AND TARGET effetune_plugin)
+  add_executable(effetune_plugin_processing_lifecycle_tests
+    unit/plugin_processing_lifecycle_tests.cpp
+    ${vst3sdk_SOURCE_DIR}/public.sdk/source/vst/hosting/parameterchanges.cpp
+    ${vst3sdk_SOURCE_DIR}/public.sdk/source/vst/vstsinglecomponenteffect.cpp
+    ${PROJECT_SOURCE_DIR}/src/plugin/automation_parameters.cpp
+    ${PROJECT_SOURCE_DIR}/src/plugin/external_url.cpp
+    ${PROJECT_SOURCE_DIR}/src/plugin/native_file_dialog.cpp
+    ${PROJECT_SOURCE_DIR}/src/plugin/plugin_processor.cpp
+    ${PROJECT_SOURCE_DIR}/src/plugin/plugin_view.cpp
+    ${PROJECT_SOURCE_DIR}/src/bridge/webview_host.cpp)
+  target_link_libraries(effetune_plugin_processing_lifecycle_tests PRIVATE
+    sdk effetune_engine user32 ole32 shell32 shlwapi)
+  target_include_directories(effetune_plugin_processing_lifecycle_tests PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/external/effetune/dsp/core)
+  target_compile_features(effetune_plugin_processing_lifecycle_tests PRIVATE cxx_std_20)
+  target_compile_definitions(effetune_plugin_processing_lifecycle_tests PRIVATE
+    EFFETUNE_PROCESSOR_TEST_HOOKS=1)
+  target_compile_options(effetune_plugin_processing_lifecycle_tests PRIVATE /W4 /WX /utf-8)
+  add_test(NAME effetune_plugin_processing_lifecycle_tests
+    COMMAND effetune_plugin_processing_lifecycle_tests)
+
   add_executable(effetune_plugin_view_scaling_tests
     unit/plugin_view_scaling_tests.cpp)
   target_link_libraries(effetune_plugin_view_scaling_tests PRIVATE sdk)
@@ -63,7 +136,9 @@ if(WIN32 AND TARGET effetune_ui_assets)
   target_compile_options(effetune_webview_smoke PRIVATE /W4 /WX /utf-8)
   add_dependencies(effetune_webview_smoke effetune_ui_assets)
   add_test(NAME effetune_webview_smoke COMMAND effetune_webview_smoke)
-  set_tests_properties(effetune_webview_smoke PROPERTIES TIMEOUT 60)
+  # The suite deliberately waits out a full WebView2 initialisation timeout to
+  # prove the editor reports it instead of staying blank.
+  set_tests_properties(effetune_webview_smoke PROPERTIES TIMEOUT 120)
 endif()
 
 if(TARGET effetune_ui_assets)

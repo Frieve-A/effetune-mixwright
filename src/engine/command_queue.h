@@ -61,8 +61,8 @@ private:
 #pragma warning(pop)
 #endif
 
-// Descriptor commands carry logical plug-in IDs. EngineHost resolves them to the
-// current native instances at the next DSP block boundary.
+// Descriptor commands carry logical plug-in IDs. The processor's non-real-time
+// control service resolves them to current native instances before publication.
 enum class AudioCommandType : std::uint8_t { setParameters, setDescriptor, reset };
 
 struct AudioCommand {
@@ -162,6 +162,17 @@ public:
       const auto published = entry.published.load(std::memory_order_acquire);
       entry.consumed.store(published, std::memory_order_release);
     }
+  }
+
+  [[nodiscard]] bool hasPending() const noexcept {
+    for (const auto &entry : entries_) {
+      if (entry.logicalId.load(std::memory_order_acquire) != 0 &&
+          entry.published.load(std::memory_order_acquire) !=
+              entry.consumed.load(std::memory_order_acquire)) {
+        return true;
+      }
+    }
+    return false;
   }
 
 private:
