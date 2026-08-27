@@ -260,7 +260,7 @@ private:
   // that already exists but never open one.
   [[nodiscard]] AutomationEditOutcome applyAutomationEdit(
       const AutomationTargetIdentity &identity, double normalized,
-      AutomationEditIntent intent = {});
+      AutomationEditIntent intent);
   // Return the VST restart flags earned by the publication. Value changes and
   // parameter-info changes are separate; callers notify only after unlocking.
   [[nodiscard]] Steinberg::int32

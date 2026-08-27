@@ -3594,7 +3594,7 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
   }
   drainAutomationValues();
 
-  const auto pauseBulkRequestBeforeCommitForTesting = [this] {
+  const auto pauseBulkRequestBeforeCommitForTesting = [&] {
 #if defined(EFFETUNE_PROCESSOR_TEST_HOOKS)
     if (pauseNextBulkRequestBeforeCommitForTesting_.exchange(
             false, std::memory_order_acq_rel)) {
@@ -4035,7 +4035,7 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     const auto outcome = applyAutomationEdit(
         {message.pipeline, message.pluginId, message.pluginType, message.parameterKey,
          message.elementIndex},
-        message.normalizedValue);
+        message.normalizedValue, {});
     return automationEditResult(outcome == AutomationEditOutcome::bound);
   }
 
@@ -4589,7 +4589,7 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
              edit.elementIndex});
       }
     };
-    const auto pauseBeforeAutomationEditsForTesting = [this] {
+    const auto pauseBeforeAutomationEditsForTesting = [&] {
 #if defined(EFFETUNE_PROCESSOR_TEST_HOOKS)
       if (pausePluginUpdateBeforeAutomationEditsForTesting_.load(
               std::memory_order_acquire)) {
