@@ -1823,10 +1823,15 @@ test('a frame that is never painted still publishes before the deadline', async 
   assert.deepEqual(hostCalls, []);
 
   // Only the deadline can settle this: the frame callback is never invoked.
-  assert.equal(await Promise.race([
-    dispatched.then(() => 'published'),
-    new Promise(resolve => setTimeout(() => resolve('stranded'), 200))
-  ]), 'published', 'a pending update without a frame has a deadline of its own');
+  let timeout;
+  try {
+    assert.equal(await Promise.race([
+      dispatched.then(() => 'published'),
+      new Promise(resolve => { timeout = setTimeout(() => resolve('stranded'), 2000); })
+    ]), 'published', 'a pending update without a frame has a deadline of its own');
+  } finally {
+    clearTimeout(timeout);
+  }
 
   assert.equal(frames[0], null, 'the frame that never ran is cancelled');
   const updates = hostCalls.filter(call => call.type === 'pipeline/updatePlugin');

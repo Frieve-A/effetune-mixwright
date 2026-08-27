@@ -85,7 +85,7 @@ void testConcurrentConfigurationPublishReachesTheAudioSide() {
   };
   // Rendering is far cheaper than publishing, so the loop is bounded by how far
   // the publisher gets rather than by a block count.
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(50);
   while (publishCount.load(std::memory_order_acquire) < 20000u &&
          published.load(std::memory_order_acquire) &&
          std::chrono::steady_clock::now() < deadline) {

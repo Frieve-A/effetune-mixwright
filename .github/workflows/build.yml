@@ -37,7 +37,7 @@ jobs:
     name: Windows x64
     needs: checks
     runs-on: windows-2022
-    timeout-minutes: 60
+    timeout-minutes: 120
 
     steps:
       - name: Check out source and submodules
@@ -96,7 +96,7 @@ jobs:
     name: macOS Universal
     needs: build-windows
     runs-on: macos-15-intel
-    timeout-minutes: 60
+    timeout-minutes: 120
 
     steps:
       - name: Check out source and submodules

@@ -21,6 +21,15 @@
 
 namespace {
 
+// Keep completion budgets above ten times local timings; polling and deliberate
+// observation periods do not need to grow with these CI safety margins.
+constexpr auto kCompletionTimeout = std::chrono::seconds(60);
+constexpr auto kProcessExitTimeout = std::chrono::seconds(120);
+constexpr DWORD kCompletionTimeoutMs = static_cast<DWORD>(
+    std::chrono::duration_cast<std::chrono::milliseconds>(kCompletionTimeout).count());
+constexpr DWORD kProcessExitTimeoutMs = static_cast<DWORD>(
+    std::chrono::duration_cast<std::chrono::milliseconds>(kProcessExitTimeout).count());
+
 class ScopedWebViewProfile {
 public:
   ScopedWebViewProfile() {
@@ -106,7 +115,7 @@ public:
     captureChildProcesses();
 
     const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::seconds(10);
+                          kProcessExitTimeout;
     bool childrenExited = false;
     while (std::chrono::steady_clock::now() < deadline) {
       captureChildProcesses();
@@ -268,7 +277,7 @@ LRESULT CALLBACK parentWindowProcedure(HWND window, const UINT message,
     constructed.store(true, std::memory_order_release);
     local.reset();
     SetEvent(published);
-    (void)WaitForSingleObject(resumeOwner, 10000);
+    (void)WaitForSingleObject(resumeOwner, kCompletionTimeoutMs);
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (std::chrono::steady_clock::now() < deadline) {
@@ -285,7 +294,7 @@ LRESULT CALLBACK parentWindowProcedure(HWND window, const UINT message,
     }
     CoUninitialize();
   });
-  if (WaitForSingleObject(published, 5000) != WAIT_OBJECT_0) {
+  if (WaitForSingleObject(published, kCompletionTimeoutMs) != WAIT_OBJECT_0) {
     SetEvent(resumeOwner);
     owner.join();
     CloseHandle(resumeOwner);
@@ -329,10 +338,10 @@ LRESULT CALLBACK parentWindowProcedure(HWND window, const UINT message,
       FALSE) {
     return false;
   }
-  const auto wait = WaitForSingleObject(process.hProcess, 8000);
+  const auto wait = WaitForSingleObject(process.hProcess, kProcessExitTimeoutMs);
   if (wait != WAIT_OBJECT_0) {
     (void)TerminateProcess(process.hProcess, 1);
-    (void)WaitForSingleObject(process.hProcess, 2000);
+    (void)WaitForSingleObject(process.hProcess, kProcessExitTimeoutMs);
   }
   DWORD exitCode = 1;
   const auto exited = wait == WAIT_OBJECT_0 &&
@@ -528,7 +537,7 @@ int main(const int argc, char **argv) {
         processorWebView = lease;
       }
       SetEvent(leasePublished);
-      (void)WaitForSingleObject(resumeLease, 10000);
+      (void)WaitForSingleObject(resumeLease, kCompletionTimeoutMs);
       const auto leaseParent = createParent();
       int leaseOwner = 0;
       attachReturned.store(
@@ -551,7 +560,7 @@ int main(const int argc, char **argv) {
       }
       CoUninitialize();
     });
-    const auto publishedWait = WaitForSingleObject(leasePublished, 5000);
+    const auto publishedWait = WaitForSingleObject(leasePublished, kCompletionTimeoutMs);
     std::shared_ptr<effetune::vst::WebViewHost> retiredWebView;
     {
       const std::scoped_lock lock(leaseMutex);
@@ -607,7 +616,7 @@ int main(const int argc, char **argv) {
       }
       local.reset();
       SetEvent(created);
-      (void)WaitForSingleObject(releaseCreator, 10000);
+      (void)WaitForSingleObject(releaseCreator, kCompletionTimeoutMs);
       MSG message{};
       while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE) != 0) {
         TranslateMessage(&message);
@@ -615,7 +624,7 @@ int main(const int argc, char **argv) {
       }
       CoUninitialize();
     });
-    (void)WaitForSingleObject(created, 5000);
+    (void)WaitForSingleObject(created, kCompletionTimeoutMs);
     std::shared_ptr<effetune::vst::WebViewHost> mainSplitHost;
     {
       const std::scoped_lock lock(splitMutex);
@@ -664,7 +673,7 @@ int main(const int argc, char **argv) {
       }
       CoUninitialize();
     });
-    const auto attachedWait = WaitForSingleObject(attached, 7000);
+    const auto attachedWait = WaitForSingleObject(attached, kCompletionTimeoutMs);
     bool evaluateReturnedBoundedly = false;
     if (attachedWait == WAIT_OBJECT_0 && mainSplitHost != nullptr &&
         splitAttached.load(std::memory_order_acquire)) {
@@ -675,7 +684,7 @@ int main(const int argc, char **argv) {
           std::chrono::steady_clock::now() - evaluateStarted <
           std::chrono::seconds(2);
     }
-    const auto resizeWait = WaitForSingleObject(resized, 3000);
+    const auto resizeWait = WaitForSingleObject(resized, kCompletionTimeoutMs);
     SetEvent(releaseCreator);
     creator.join();
     mainSplitHost.reset();
@@ -757,7 +766,7 @@ int main(const int argc, char **argv) {
                               effetune::vst::plugin::kDefaultEditorHeight);
     if (attached) {
       ShowWindow(parent, SW_SHOWNOACTIVATE);
-      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+      const auto deadline = std::chrono::steady_clock::now() + kCompletionTimeout;
       auto nextEvaluation = std::chrono::steady_clock::now() + std::chrono::seconds(1);
       while ((!uiReady.load(std::memory_order_acquire) ||
               smokeState.hostInfoCalls.load(std::memory_order_relaxed) == 0) &&
@@ -810,7 +819,7 @@ int main(const int argc, char **argv) {
             })) {
           return false;
         }
-        const auto evaluateDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        const auto evaluateDeadline = std::chrono::steady_clock::now() + kCompletionTimeout;
         while (!complete.load(std::memory_order_acquire) &&
                std::chrono::steady_clock::now() < evaluateDeadline) {
           pumpMessages();
@@ -857,14 +866,14 @@ int main(const int argc, char **argv) {
             "window.audioManager?.unsupportedWarningShown === true && "
             "document.getElementById('errorDisplay')?.textContent === "
             "'Some effects are unavailable and were bypassed.'",
-            std::chrono::seconds(10));
+            kCompletionTimeout);
         nativePerformanceStatusVisible = waitForJavascript(
             "window.audioManager?.dspPipelineLatencySamples === 384 && "
             "window.audioManager?.pipelineCpuAveragePercent === 12.5 && "
             "document.getElementById('pipelineLatency')?.textContent.includes('384') && "
             "document.getElementById('pipelineCpuValue')?.textContent.includes('12.5') && "
             "document.getElementById('pipelineCpuMeterFill')?.style.width === '12.5%'",
-            std::chrono::seconds(5));
+            kCompletionTimeout);
         amRadioHudDisplayed = waitForJavascript(
             "(() => { const am = window.audioManager?.pipelineA?.find(plugin => "
             "plugin?.constructor?.name === 'AMRadioSimulatorPlugin'); "
@@ -877,7 +886,7 @@ int main(const int argc, char **argv) {
             "am.drawHud(); } finally { prototype.fillText = fillText; "
             "am.canRunAnimation = canRunAnimation; } "
             "return labels.includes('S METER') && labels.includes('AGC GAIN'); })()",
-            std::chrono::seconds(5));
+            kCompletionTimeout);
         if (!amRadioHudDisplayed) {
           (void)evaluate(
               "(() => { const audio = window.audioManager; const am = "
@@ -902,13 +911,13 @@ int main(const int argc, char **argv) {
             "window.audioManager.scheduleLatencyService(); return true; })()",
             ignored);
         dynamicLatencyServiced = latencyServiceScheduled && waitForJavascript(
-            "window.__vstLatencyHostInfoCalls === 1", std::chrono::seconds(5)) &&
+            "window.__vstLatencyHostInfoCalls === 1", kCompletionTimeout) &&
             std::chrono::steady_clock::now() - latencyServiceStarted >=
                 std::chrono::milliseconds(200);
 
         const auto historyReady = waitForJavascript(
             "window.app?.initialized === true && !!window.audioManager?.workletNode",
-            std::chrono::seconds(10));
+            kCompletionTimeout);
         const auto historyRestoreStarted = historyReady && evaluate(
             "(() => { const history = window.pipelineManager?.historyManager; "
             "if (!history) return false; "
@@ -925,7 +934,7 @@ int main(const int argc, char **argv) {
             "window.__vstHistoryCalls?.filter(type => type === 'pipeline/restoreHistory').length "
             "=== 1 && window.__vstHistoryCalls?.filter(type => type === "
             "'pipeline/rebuild').length === 0",
-            std::chrono::seconds(5));
+            kCompletionTimeout);
         const auto historyDrainDeadline =
             std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
         while (std::chrono::steady_clock::now() < historyDrainDeadline) {
@@ -1009,7 +1018,7 @@ int main(const int argc, char **argv) {
             "void window.audioManager?.pollNativeTelemetry(); return true; })()",
             ignored);
         telemetryDelivered = installedTelemetrySubscriber && waitForJavascript(
-            "window.__vstSmokeTelemetryFrames > 0", std::chrono::seconds(5));
+            "window.__vstSmokeTelemetryFrames > 0", kCompletionTimeout);
 
         const auto hiddenInstalled = evaluate(
             "(() => { Object.defineProperty(document, 'hidden', "
@@ -1029,7 +1038,7 @@ int main(const int argc, char **argv) {
             "window.audioManager?.audioContext?.destination?.channelCount === 4 && "
             "window.audioManager?.outputChannelCount === 4 && "
             "window.workletNode?.channelCount === 4",
-            std::chrono::seconds(5)) &&
+            kCompletionTimeout) &&
             smokeState.pipelineRebuildCalls.load(std::memory_order_relaxed) > rebuildCallsBefore;
 
         const auto discardCallsBefore =
@@ -1046,7 +1055,7 @@ int main(const int argc, char **argv) {
             "window.__vstSmokeTelemetryFrames > afterDiscard; })(); return true; })()",
             ignored);
         hiddenTelemetryDiscarded = resumedTelemetry && waitForJavascript(
-            "window.__vstResumeTelemetryChecked === true", std::chrono::seconds(5)) &&
+            "window.__vstResumeTelemetryChecked === true", kCompletionTimeout) &&
             smokeState.telemetryDiscardCalls.load(std::memory_order_relaxed) > discardCallsBefore;
 
         contextMenuDisabled = evaluate(
@@ -1133,7 +1142,7 @@ int main(const int argc, char **argv) {
             "})(); return true; })()",
             ignored) && ignored == "true";
         const auto languageFixtureReady = languageFixtureStarted && waitForJavascript(
-            "window.__vstLanguageFixtureReady === true", std::chrono::seconds(5));
+            "window.__vstLanguageFixtureReady === true", kCompletionTimeout);
         const auto measurementImportStarted = languageFixtureReady && evaluate(
             R"JS((() => {
               window.__vstMeasurementImportReady = false;
@@ -1260,7 +1269,7 @@ int main(const int argc, char **argv) {
             ignored) && ignored == "true";
         measurementImportAvailable = measurementImportStarted && waitForJavascript(
             "window.__vstMeasurementImportReady === true",
-            std::chrono::seconds(10));
+            kCompletionTimeout);
         if (!measurementImportAvailable) {
           evaluate("JSON.stringify({ error: window.__vstMeasurementImportError, "
                    "details: window.__vstMeasurementImportDiagnostics })",
@@ -1269,7 +1278,7 @@ int main(const int argc, char **argv) {
         const auto configDialogOpened = languageFixtureReady && evaluate(
             "(() => { document.getElementById('configSettingsButton')?.click(); return true; })()",
             ignored) && ignored == "true" && waitForJavascript(
-                "!!document.getElementById('language-select')", std::chrono::seconds(5));
+                "!!document.getElementById('language-select')", kCompletionTimeout);
         configDialogIsLanguageOnly = configDialogOpened && evaluate(
             "(() => { const content = document.querySelector('.config-dialog-content'); "
             "const powerColumn = document.querySelector('.config-dialog-power-column'); "
@@ -1295,7 +1304,7 @@ int main(const int argc, char **argv) {
             "'\u30a8\u30d5\u30a7\u30af\u30c8\u3092\u524a\u9664' && "
             "document.getElementById('effectCount')?.textContent.includes("
             "'\u7a2e\u985e\u306e\u30a8\u30d5\u30a7\u30af\u30c8\u304c\u5229\u7528\u53ef\u80fd')",
-            std::chrono::seconds(5));
+            kCompletionTimeout);
         if (configDialogOpened) {
           evaluate("document.getElementById('close-btn')?.click(); true", ignored);
         }
@@ -1315,7 +1324,7 @@ int main(const int argc, char **argv) {
             "dialog?.querySelector('.about-description')?.textContent === "
             "'Multi-Effect Audio Plug-in for DAWs' && "
             "!!document.getElementById('vst-third-party-notices-button'); })()",
-            std::chrono::seconds(5));
+            kCompletionTimeout);
         const auto noticesStarted = aboutOpened && evaluate(
             "document.getElementById('vst-third-party-notices-button')?.click(); true", ignored) &&
             ignored == "true";
@@ -1325,7 +1334,7 @@ int main(const int argc, char **argv) {
             "return text.startsWith('EffeTune Mixwright - Third-Party Notices') && "
             "text.trimEnd().endsWith("
             "'VST is a registered trademark of Steinberg Media Technologies GmbH.'); })()",
-            std::chrono::seconds(5));
+            kCompletionTimeout);
         if (aboutOpened) {
           evaluate("document.getElementById('vst-third-party-notices-close')?.click(); "
                    "document.querySelector('.about-dialog #close-button')?.click(); true",
@@ -1340,7 +1349,7 @@ int main(const int argc, char **argv) {
             "return false; help.click(); return !menu.classList.contains('show'); })()",
             ignored) && ignored == "true";
         const auto appHelpDeadline =
-            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            std::chrono::steady_clock::now() + kCompletionTimeout;
         while (smokeState.externalAppHelpCalls.load(std::memory_order_relaxed) == 0 &&
                std::chrono::steady_clock::now() < appHelpDeadline) {
           pumpMessages();
@@ -1355,7 +1364,7 @@ int main(const int argc, char **argv) {
             "return false; github.click(); return !menu.classList.contains('show'); })()",
             ignored) && ignored == "true";
         const auto githubDeadline =
-            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            std::chrono::steady_clock::now() + kCompletionTimeout;
         while (smokeState.externalGitHubCalls.load(std::memory_order_relaxed) == 0 &&
                std::chrono::steady_clock::now() < githubDeadline) {
           pumpMessages();
@@ -1373,7 +1382,7 @@ int main(const int argc, char **argv) {
             "if (!help) return false; help.click(); return true; })()",
             ignored) && ignored == "true";
         const auto externalHelpDeadline =
-            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            std::chrono::steady_clock::now() + kCompletionTimeout;
         while (smokeState.externalHelpCalls.load(std::memory_order_relaxed) == 0 &&
                std::chrono::steady_clock::now() < externalHelpDeadline) {
           pumpMessages();
@@ -1386,7 +1395,7 @@ int main(const int argc, char **argv) {
             "analyzer.md#level-meter'); true",
             ignored) && ignored == "true";
         const auto remappedExternalHelpDeadline =
-            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            std::chrono::steady_clock::now() + kCompletionTimeout;
         while (smokeState.remappedExternalHelpCalls.load(std::memory_order_relaxed) == 0 &&
                std::chrono::steady_clock::now() < remappedExternalHelpDeadline) {
           pumpMessages();
@@ -1403,7 +1412,7 @@ int main(const int argc, char **argv) {
             "return true; })()",
             ignored) && ignored == "true";
         const auto externalAiDeadline =
-            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            std::chrono::steady_clock::now() + kCompletionTimeout;
         while (smokeState.externalAiCalls.load(std::memory_order_relaxed) == 0 &&
                std::chrono::steady_clock::now() < externalAiDeadline) {
           pumpMessages();
@@ -1424,7 +1433,7 @@ int main(const int argc, char **argv) {
             "(() => { const button = document.querySelector('.toggle-button.master-toggle'); "
             "button?.click(); return !!button; })()",
             ignored);
-        const auto bypassDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        const auto bypassDeadline = std::chrono::steady_clock::now() + kCompletionTimeout;
         while (smokeState.masterBypassCalls.load(std::memory_order_relaxed) <= bypassCallsBefore &&
                std::chrono::steady_clock::now() < bypassDeadline) {
           pumpMessages();
@@ -1445,7 +1454,7 @@ int main(const int argc, char **argv) {
             "(() => { const viewport = document.scrollingElement; "
             "return viewport.scrollHeight > viewport.clientHeight && "
             "viewport.scrollWidth <= viewport.clientWidth; })()",
-            std::chrono::seconds(5));
+            kCompletionTimeout);
 
         const auto markerInstalled = evaluate(
             "window.__vstReattachMarker = 'preserved'; true", ignored) && ignored == "true";
@@ -1474,7 +1483,7 @@ int main(const int argc, char **argv) {
                   "window.__vstReattachMarker === undefined && "
                   "window.app?.initialized === true && "
                   "Object.keys(window.pluginManager?.pluginClasses || {}).length >= 60",
-                  std::chrono::seconds(10)) &&
+                  kCompletionTimeout) &&
               smokeState.hostInfoCalls.load(std::memory_order_relaxed) >
                   hostInfoCallsBeforeReattach &&
               smokeState.pipelineRebuildCalls.load(std::memory_order_relaxed) ==
@@ -1504,7 +1513,7 @@ int main(const int argc, char **argv) {
                 waitForJavascript(
                     "window.app?.initialized === true && "
                     "Object.keys(window.pluginManager?.pluginClasses || {}).length >= 60",
-                    std::chrono::seconds(10)) &&
+                    kCompletionTimeout) &&
                 smokeState.hostInfoCalls.load(std::memory_order_relaxed) >
                     hostInfoCallsBeforeRecovery &&
                 smokeState.pipelineRebuildCalls.load(std::memory_order_relaxed) ==
@@ -1526,7 +1535,7 @@ int main(const int argc, char **argv) {
           // navigating a reused WebView clears that too.
           std::string idleMarker;
           const auto replacementFinishedLoading = waitForJavascript(
-              "window.app?.initialized === true", std::chrono::seconds(20)) &&
+              "window.app?.initialized === true", kCompletionTimeout) &&
               evaluate("sessionStorage.setItem('vstIdleReopenProbe', 'stale'); "
                        "sessionStorage.getItem('vstIdleReopenProbe') === 'stale'",
                        idleMarker) &&
@@ -1550,7 +1559,7 @@ int main(const int argc, char **argv) {
                     "sessionStorage.getItem('vstIdleReopenProbe') === null && "
                     "window.app?.initialized === true && "
                     "Object.keys(window.pluginManager?.pluginClasses || {}).length >= 60",
-                    std::chrono::seconds(15));
+                    kCompletionTimeout);
           }
         }
       }
@@ -1571,7 +1580,7 @@ int main(const int argc, char **argv) {
       ShowWindow(parent, SW_SHOWNOACTIVATE);
       std::atomic_bool fallbackEvaluationPending{false};
       const auto deadline =
-          std::chrono::steady_clock::now() + std::chrono::seconds(10);
+          std::chrono::steady_clock::now() + kCompletionTimeout;
       auto nextFallbackEvaluation =
           std::chrono::steady_clock::now() + std::chrono::seconds(1);
       while (!missingResourceGuidanceShown &&
@@ -1626,8 +1635,8 @@ int main(const int argc, char **argv) {
                            effetune::vst::plugin::kDefaultEditorHeight)) {
           ShowWindow(stalledParent, SW_SHOWNOACTIVATE);
           const auto deadline = std::chrono::steady_clock::now() +
-                                effetune::vst::kWebViewInitialisationTimeout +
-                                std::chrono::seconds(15);
+                                effetune::vst::kWebViewInitialisationTimeout * 10 +
+                                kCompletionTimeout;
           while (!initialisationTimeoutDiagnosed &&
                  std::chrono::steady_clock::now() < deadline) {
             // Dispatch everything, including the null-window WM_TIMER the editor

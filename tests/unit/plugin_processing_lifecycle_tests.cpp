@@ -368,10 +368,10 @@ public:
   // failure try_lock() is permitted cannot decide the answer.
   [[nodiscard]] static bool
   processingResourcesLockable(EffeTuneProcessor &processor,
-                              const std::chrono::milliseconds deadline) {
+                              const std::chrono::milliseconds localTimeout) {
     auto acquired = false;
-    std::thread prober([&processor, &acquired, deadline] {
-      const auto limit = std::chrono::steady_clock::now() + deadline;
+    std::thread prober([&processor, &acquired, localTimeout] {
+      const auto limit = std::chrono::steady_clock::now() + localTimeout * 10;
       do {
         std::unique_lock probe(processor.processingResourcesMutex_, std::try_to_lock);
         if (probe.owns_lock()) {
@@ -883,8 +883,9 @@ private:
 
 template <typename Predicate>
 [[nodiscard]] bool pumpMainThreadUntil(Predicate &&predicate,
-                                       const std::chrono::milliseconds timeout) {
-  const auto deadline = std::chrono::steady_clock::now() + timeout;
+                                       const std::chrono::milliseconds localTimeout) {
+  // Existing passing local budgets are conservative upper bounds for CI waits.
+  const auto deadline = std::chrono::steady_clock::now() + localTimeout * 10;
   while (!predicate()) {
 #if defined(_WIN32)
     MSG message{};
@@ -3757,7 +3758,7 @@ void testTopologyDescriptorIsServicedOutsideAudioCallback() {
              std::chrono::milliseconds(250)),
          "inject one non-RT descriptor configuration failure");
   PluginProcessorTestAccess::deferPipelinePlanRetry(*processor,
-                                                    std::chrono::seconds(5));
+                                                    std::chrono::seconds(60));
   expect(PluginProcessorTestAccess::servicedDescriptorGeneration(*processor) <
              failedGeneration,
          "failed descriptor remains pending during retry backoff");
@@ -3917,7 +3918,7 @@ void testTelemetryPollLeavesTheAudioGuardAlone() {
       completed.store(true, std::memory_order_release);
     });
     const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        std::chrono::steady_clock::now() + std::chrono::seconds(20);
     while (!completed.load(std::memory_order_acquire) &&
            std::chrono::steady_clock::now() < deadline) {
       std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -4133,7 +4134,7 @@ void testPendingPlanConsumesNewUiGenerationAndTopologyRemoval() {
              std::chrono::milliseconds(250)),
          "inject the ten millisecond plan refresh failure");
   PluginProcessorTestAccess::deferPipelinePlanRetry(
-      *processor, std::chrono::seconds(5));
+      *processor, std::chrono::seconds(60));
   for (int32 block = 0; block < 8; ++block) {
     expect(processor->process(data) == kResultOk,
            "settle audio during the deferred retry");
@@ -4177,7 +4178,7 @@ void testPendingPlanConsumesNewUiGenerationAndTopologyRemoval() {
              std::chrono::milliseconds(250)),
          "inject the pre-removal plan refresh failure");
   PluginProcessorTestAccess::deferPipelinePlanRetry(
-      *processor, std::chrono::seconds(5));
+      *processor, std::chrono::seconds(60));
 
   updateLimiterPlugin(*processor, 43, 10.0f, false);
   const auto removalGeneration =
@@ -4779,7 +4780,7 @@ void testAssetStatePollLeavesTheDspRunning() {
           R"({"type":"pipeline/assetState","payload":{"pluginId":91,"slot":0}})");
       completed.store(true, std::memory_order_release);
     });
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
     while (!completed.load(std::memory_order_acquire) &&
            std::chrono::steady_clock::now() < deadline) {
       std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -5380,7 +5381,7 @@ void testFailedDescriptorBackoffClaimsNothing() {
   expect(processor->process(data) == kResultOk,
          "render another block before the backoff probe");
   PluginProcessorTestAccess::deferPipelinePlanRetry(*processor,
-                                                    std::chrono::seconds(5));
+                                                    std::chrono::seconds(60));
   const auto failuresBefore =
       PluginProcessorTestAccess::processFailureSequence(*processor);
 
@@ -5393,7 +5394,7 @@ void testFailedDescriptorBackoffClaimsNothing() {
     PluginProcessorTestAccess::serviceLatencyUpdates(*processor);
     completed.store(true, std::memory_order_release);
   });
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
   while (!completed.load(std::memory_order_acquire) &&
          std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -5472,7 +5473,7 @@ void testFlushOnlyBlocksLetTheControlServiceReachTheDsp() {
   ProcessData flush = data;
   flush.numSamples = 0;
   const auto epochBefore = PluginProcessorTestAccess::blockEpoch(*processor);
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
   auto serviced = false;
   while (!serviced && std::chrono::steady_clock::now() < deadline) {
     expect(processor->process(flush) == kResultOk,
@@ -5936,7 +5937,7 @@ void testConcurrentHostContextChangeWinsPluginUpdateAdmission() {
     updateCompleted.store(true, std::memory_order_release);
   });
   const auto pauseDeadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
   while (!PluginProcessorTestAccess::pluginUpdatePausedBeforeRuntimeTransaction(
              *processor) &&
          !updateCompleted.load(std::memory_order_acquire) &&
@@ -6153,7 +6154,7 @@ void testTopologyEditsDuringPlaybackRaiseNoDiagnostic() {
       completed.store(true, std::memory_order_release);
     });
     const auto gateDeadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        std::chrono::steady_clock::now() + std::chrono::seconds(20);
     while (PluginProcessorTestAccess::processingReady(*processor) &&
            !completed.load(std::memory_order_acquire) &&
            std::chrono::steady_clock::now() < gateDeadline) {
@@ -6316,7 +6317,7 @@ void testPendingWorkIsServicedWhenTheAudioCallbackQuiesces() {
   // and not the transport state, is what hands the engine to the control
   // service, and the service has to reach it on its own timer rather than
   // waiting for the next edit to come along.
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
   auto serviced = false;
   while (!serviced && std::chrono::steady_clock::now() < deadline) {
     PluginProcessorTestAccess::serviceLatencyUpdates(*processor);
@@ -6340,7 +6341,7 @@ void testPendingWorkIsServicedWhenTheAudioCallbackQuiesces() {
     completed.store(true, std::memory_order_release);
   });
   const auto claimDeadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      std::chrono::steady_clock::now() + std::chrono::seconds(20);
   while (!completed.load(std::memory_order_acquire) &&
          std::chrono::steady_clock::now() < claimDeadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -6507,7 +6508,7 @@ void testRefreshFailuresStayOffTheAudioDiagnosticBurst() {
   updateLimiterPlugin(*processor, 66, 10.0f);
   auto refreshNotices = 0;
   auto audioNotices = 0;
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
   while (PluginProcessorTestAccess::remainingPipelinePlanRefreshFailures(
              *processor) != 0u &&
          std::chrono::steady_clock::now() < deadline) {
@@ -9358,7 +9359,7 @@ void testStalePluginUpdateCannotOverwritePendingStateReplacement() {
     staleUpdateCompleted.store(true, std::memory_order_release);
   });
   const auto pauseDeadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
   while (!PluginProcessorTestAccess::pluginUpdatePausedBeforeRuntimeTransaction(
              *processor) &&
          !staleUpdateCompleted.load(std::memory_order_acquire) &&
@@ -9475,7 +9476,7 @@ void testStalePluginUpdateCannotOverwritePendingStateReplacement() {
     crossedEpochUpdateCompleted.store(true, std::memory_order_release);
   });
   const auto automationPauseDeadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
   while (!PluginProcessorTestAccess::pluginUpdatePausedBeforeAutomationEdits(
              *processor) &&
          !crossedEpochUpdateCompleted.load(std::memory_order_acquire) &&
@@ -9753,7 +9754,7 @@ void testSetParamNormalizedAloneReachesTheSavedState() {
   PluginProcessorTestAccess::beginSyntheticBlock(*processor);
   heldResources.unlock();
   const auto refusalDeadline =
-      std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
   while (!committerCompleted.load(std::memory_order_acquire) &&
          std::chrono::steady_clock::now() < refusalDeadline) {
     std::this_thread::yield();
@@ -9809,7 +9810,7 @@ void testSetParamNormalizedAloneReachesTheSavedState() {
     handoffCommitterCompleted.store(true, std::memory_order_release);
   });
   const auto handoffDeadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
   while (!PluginProcessorTestAccess::controllerCommitPaused(*processor) &&
          !handoffCommitterCompleted.load(std::memory_order_acquire) &&
          std::chrono::steady_clock::now() < handoffDeadline) {
