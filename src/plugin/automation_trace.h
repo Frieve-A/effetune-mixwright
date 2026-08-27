@@ -89,6 +89,21 @@ enum class Event : std::uint8_t {
   openReleased,
   // IAutomationState, which is how a host says Read and Write are armed.
   automationState,
+  // Parameter metadata published by the plug-in versus actually read by the host.
+  parameterInfoPublished,
+  getParameterInfo,
+  getParamNormalized,
+  // Bracket restartComponent so synchronous re-queries are visible inside it.
+  restartBegin,
+  restartEnd,
+  // Control-side latency publication, host reads, and topology application.
+  latencyPrepared,
+  latencySynced,
+  getLatencySamples,
+  descriptorQueued,
+  descriptorNode,
+  descriptorApplied,
+  setActive,
 };
 
 // Which thread issued the record. Call ordering across threads is the whole
@@ -244,6 +259,7 @@ struct State {
     }
     std::fprintf(file,
                  "# EffeTune Mixwright automation trace\n"
+                 "# trace-schema=3 latency-and-descriptor-transitions\n"
                  "# build=%s %s version=%s\n",
                  __DATE__, __TIME__, EFFETUNE_PLUGIN_VERSION_STR);
     if (state->filtered) {
@@ -408,6 +424,30 @@ inline void publishTransport(const std::int64_t projectTime,
     return "openReleased";
   case Event::automationState:
     return "automationState";
+  case Event::parameterInfoPublished:
+    return "infoPublished";
+  case Event::getParameterInfo:
+    return "getParameterInfo";
+  case Event::getParamNormalized:
+    return "getParamNormalized";
+  case Event::restartBegin:
+    return "restartBegin";
+  case Event::restartEnd:
+    return "restartEnd";
+  case Event::latencyPrepared:
+    return "latencyPrepared";
+  case Event::latencySynced:
+    return "latencySynced";
+  case Event::getLatencySamples:
+    return "getLatencySamples";
+  case Event::descriptorQueued:
+    return "descriptorQueued";
+  case Event::descriptorNode:
+    return "descriptorNode";
+  case Event::descriptorApplied:
+    return "descriptorApplied";
+  case Event::setActive:
+    return "setActive";
   case Event::none:
     break;
   }
@@ -512,6 +552,51 @@ inline void formatDetail(const Record &record, char *const detail,
     std::snprintf(detail, capacity, "state=0x%08x read=%d write=%d", record.u32,
                   (record.u32 & 0x1u) != 0 ? 1 : 0, (record.u32 & 0x2u) != 0 ? 1 : 0);
     break;
+  case Event::parameterInfoPublished:
+  case Event::getParameterInfo:
+    std::snprintf(detail, capacity,
+                  "index=%lld stepCount=%d flags=0x%08x default=%.9f accepted=%d",
+                  static_cast<long long>(record.i64), record.i32, record.u32,
+                  record.d0, has(kFlagSuccess));
+    break;
+  case Event::getParamNormalized:
+    std::snprintf(detail, capacity, "value=%.9f", record.d0);
+    break;
+  case Event::restartBegin:
+    std::snprintf(detail, capacity, "flags=0x%08x", record.u32);
+    break;
+  case Event::restartEnd:
+    std::snprintf(detail, capacity, "flags=0x%08x result=0x%08x", record.u32,
+                  static_cast<unsigned>(record.i32));
+    break;
+  case Event::latencyPrepared:
+  case Event::latencySynced:
+    std::snprintf(detail, capacity,
+                  "previous=%.0f reported=%.0f pipeline=%u resampler=%lld factor=%d",
+                  record.d0, record.d1, record.u32,
+                  static_cast<long long>(record.i64), record.i32);
+    break;
+  case Event::getLatencySamples:
+    std::snprintf(detail, capacity, "reported=%u", record.u32);
+    break;
+  case Event::descriptorQueued:
+    std::snprintf(detail, capacity, "generation=%lld nodes=%u",
+                  static_cast<long long>(record.i64), record.u32);
+    break;
+  case Event::descriptorNode:
+    std::snprintf(detail, capacity, "generation=%lld pluginId=%u enabled=%d",
+                  static_cast<long long>(record.i64), record.u32, record.i32);
+    break;
+  case Event::descriptorApplied:
+    std::snprintf(detail, capacity,
+                  "generation=%lld previousPipeline=%.0f pipeline=%.0f accepted=%d",
+                  static_cast<long long>(record.i64), record.d0, record.d1,
+                  has(kFlagSuccess));
+    break;
+  case Event::setActive:
+    std::snprintf(detail, capacity, "active=%u result=0x%08x", record.u32,
+                  static_cast<unsigned>(record.i32));
+    break;
   case Event::none:
     detail[0] = '\0';
     break;
@@ -583,6 +668,44 @@ inline void flush() noexcept {
 // ---------------------------------------------------------------------------
 // Typed emitters. Each one is a pure sink over values the caller already has.
 // ---------------------------------------------------------------------------
+
+inline void parameterInfo(const std::uint32_t instance, const Event event,
+                           const std::int32_t index, const std::uint32_t parameterId,
+                           const std::int32_t stepCount, const std::int32_t flags,
+                           const double defaultValue, const bool accepted) noexcept {
+  Record record;
+  record.instance = instance;
+  record.event = static_cast<std::uint8_t>(event);
+  record.parameterId = parameterId;
+  record.i64 = index;
+  record.i32 = stepCount;
+  record.u32 = static_cast<std::uint32_t>(flags);
+  record.d0 = defaultValue;
+  record.flags = accepted ? kFlagSuccess : 0u;
+  emit(record);
+}
+
+inline void getParamNormalized(const std::uint32_t instance,
+                               const std::uint32_t parameterId,
+                               const double value) noexcept {
+  Record record;
+  record.instance = instance;
+  record.event = static_cast<std::uint8_t>(Event::getParamNormalized);
+  record.parameterId = parameterId;
+  record.d0 = value;
+  emit(record);
+}
+
+inline void restart(const std::uint32_t instance, const Event event,
+                     const std::int32_t flags, const std::int32_t result = 0) noexcept {
+  Record record;
+  record.instance = instance;
+  record.event = static_cast<std::uint8_t>(event);
+  record.parameterId = kAllParameters;
+  record.u32 = static_cast<std::uint32_t>(flags);
+  record.i32 = result;
+  emit(record);
+}
 
 inline void setParamNormalized(const std::uint32_t instance,
                                const std::uint32_t parameterId, const double value,
@@ -771,6 +894,72 @@ inline void openReleased(const std::uint32_t instance, const std::uint32_t param
   record.u32 = coalesced;
   record.i32 = result;
   record.flags = static_cast<std::uint16_t>(blockBoundary ? kFlagBlockBoundary : 0u);
+  emit(record);
+}
+
+inline void latency(const std::uint32_t instance, const Event event,
+                     const std::uint32_t previous, const std::uint32_t reported,
+                     const std::uint32_t pipeline, const std::uint32_t resampler,
+                     const std::uint32_t factor) noexcept {
+  Record record;
+  record.instance = instance;
+  record.event = static_cast<std::uint8_t>(event);
+  record.parameterId = kAllParameters;
+  record.d0 = previous;
+  record.d1 = reported;
+  record.u32 = pipeline;
+  record.i64 = resampler;
+  record.i32 = static_cast<std::int32_t>(factor);
+  emit(record);
+}
+
+inline void latencyRead(const std::uint32_t instance,
+                         const std::uint32_t reported) noexcept {
+  Record record;
+  record.instance = instance;
+  record.event = static_cast<std::uint8_t>(Event::getLatencySamples);
+  record.parameterId = kAllParameters;
+  record.u32 = reported;
+  emit(record);
+}
+
+inline void descriptor(const std::uint32_t instance, const Event event,
+                        const std::uint64_t generation, const std::uint32_t value,
+                        const bool enabled = false) noexcept {
+  Record record;
+  record.instance = instance;
+  record.event = static_cast<std::uint8_t>(event);
+  record.parameterId = kAllParameters;
+  record.i64 = static_cast<std::int64_t>(generation);
+  record.u32 = value;
+  record.i32 = enabled ? 1 : 0;
+  emit(record);
+}
+
+inline void descriptorApplied(const std::uint32_t instance,
+                               const std::uint64_t generation,
+                               const std::uint32_t previousPipeline,
+                               const std::uint32_t pipeline,
+                               const bool accepted) noexcept {
+  Record record;
+  record.instance = instance;
+  record.event = static_cast<std::uint8_t>(Event::descriptorApplied);
+  record.parameterId = kAllParameters;
+  record.i64 = static_cast<std::int64_t>(generation);
+  record.d0 = previousPipeline;
+  record.d1 = pipeline;
+  record.flags = static_cast<std::uint16_t>(accepted ? kFlagSuccess : 0u);
+  emit(record);
+}
+
+inline void active(const std::uint32_t instance, const bool state,
+                    const std::int32_t result) noexcept {
+  Record record;
+  record.instance = instance;
+  record.event = static_cast<std::uint8_t>(Event::setActive);
+  record.parameterId = kAllParameters;
+  record.u32 = state ? 1u : 0u;
+  record.i32 = result;
   emit(record);
 }
 

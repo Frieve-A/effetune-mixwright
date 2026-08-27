@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -14,6 +15,7 @@ inline constexpr std::size_t kPipelineDescriptorNodeBytes = 12;
 inline constexpr std::size_t kMaxPipelineNodes = 128;
 inline constexpr std::size_t kMaxPluginInstances = 96;
 inline constexpr std::uint8_t kMaxBus = 4;
+inline constexpr std::size_t kMaxExecutionSampleRates = 16;
 
 enum class OversamplingPhase { linear, minimum };
 enum class FilterQuality { low, medium, high, ultra };
@@ -45,6 +47,33 @@ struct PluginState {
   std::string extraJson = "{}";
 };
 
+enum class ExecutionChannelMode : std::uint8_t {
+  all = 1u << 0u,
+  single = 1u << 1u,
+  mono = 1u << 2u,
+  stereoPair = 1u << 3u
+};
+
+enum class ExecutionContextSupport {
+  supported,
+  unsupportedSampleRate,
+  unsupportedChannelMode
+};
+
+// Transient metadata copied from the upstream executionCapabilities contract.
+// It is deliberately absent from PluginStateDocument: admission depends on the
+// current engine context and must never become serialized project state.
+struct RuntimeExecutionCapabilities {
+  std::array<double, kMaxExecutionSampleRates> supportedSampleRates{};
+  std::uint8_t supportedSampleRateCount = 0;
+  std::uint8_t supportedChannelModes = 0;
+  bool constrainsSampleRate = false;
+  bool constrainsChannelMode = false;
+
+  [[nodiscard]] bool operator==(
+      const RuntimeExecutionCapabilities &) const noexcept = default;
+};
+
 struct PipelineState {
   std::vector<PluginState> plugins;
 };
@@ -71,7 +100,7 @@ struct AutomationState {
 
 struct PluginStateDocument {
   std::uint32_t formatVersion = 1;
-  std::string appVersion = "0.4.0";
+  std::string appVersion = "0.6.0";
   PipelineState pipelineA;
   PipelineState pipelineB;
   bool pipelineBInitialized = false;
@@ -87,6 +116,14 @@ using InstanceResolver = std::function<std::uint32_t(std::uint32_t logicalId)>;
 
 [[nodiscard]] bool isSectionPlugin(const PluginState &plugin) noexcept;
 [[nodiscard]] std::int8_t encodeChannelSpec(const std::optional<std::string> &channel);
+[[nodiscard]] ExecutionContextSupport executionContextSupport(
+    const RuntimeExecutionCapabilities &capabilities,
+    const std::optional<std::string> &channel, double sampleRate,
+    std::uint32_t outputChannelCount) noexcept;
+[[nodiscard]] bool supportsExecutionContext(
+    const RuntimeExecutionCapabilities &capabilities,
+    const std::optional<std::string> &channel, double sampleRate,
+    std::uint32_t outputChannelCount) noexcept;
 [[nodiscard]] std::vector<std::uint8_t>
 encodePipelineDescriptor(const PipelineState &pipeline, const InstanceResolver &resolveInstance,
                          bool omitInactive = true);

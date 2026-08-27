@@ -6,6 +6,9 @@ import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
 
 import * as irContract from '../../external/effetune/js/ir-library/ir-plugin-contract.js';
+import {
+  getPluginExecutionCapabilities
+} from '../../external/effetune/js/audio/plugin-execution-capabilities.js';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const source = await readFile(path.join(projectRoot, 'ui-shim', 'vst-audio-manager.js'), 'utf8');
@@ -19,11 +22,20 @@ const classStart = source.indexOf('const noop =');
 const classEnd = source.indexOf('\nfunction fakeNode', classStart);
 const rebuildStart = source.indexOf('  async rebuildPipeline()');
 const rebuildEnd = source.indexOf('\n  serializePipeline(', rebuildStart);
+const topologyCommitStart = source.indexOf('  commitPowerTopologyMutation(');
+const topologyCommitEnd = source.indexOf('\n  registerPipelineProcessors()', topologyCommitStart);
+const masterBypassStart = source.indexOf('  setMasterBypass(');
+const masterBypassEnd = source.indexOf('\n  applyNativeBypass(', masterBypassStart);
 
 assert.notEqual(classStart, -1, 'NativePort class is missing');
 assert.notEqual(classEnd, -1, 'NativePort class boundary is missing');
 assert.notEqual(rebuildStart, -1, 'AudioManager.rebuildPipeline is missing');
 assert.notEqual(rebuildEnd, -1, 'AudioManager.rebuildPipeline boundary is missing');
+assert.notEqual(topologyCommitStart, -1, 'AudioManager.commitPowerTopologyMutation is missing');
+assert.notEqual(topologyCommitEnd, -1,
+  'AudioManager.commitPowerTopologyMutation boundary is missing');
+assert.notEqual(masterBypassStart, -1, 'AudioManager.setMasterBypass is missing');
+assert.notEqual(masterBypassEnd, -1, 'AudioManager.setMasterBypass boundary is missing');
 
 function catalogExports() {
   const transformed = generatedCatalogSource
@@ -86,6 +98,7 @@ function createNativePort() {
     DataView,
     document: createEventTarget(),
     Float32Array,
+    getPluginExecutionCapabilities,
     performance,
     queueMicrotask,
     setTimeout,
@@ -106,7 +119,7 @@ function createNativePort() {
   const catalog = catalogExports();
   Object.assign(context, catalog);
   vm.runInNewContext(`${source.slice(classStart, classEnd)}\n` +
-    'this.NativePort = NativePort;', context);
+    'this.NativePort = NativePort; this.normalizePlugin = normalizePlugin;', context);
   const owner = {
     preserveReadyNativePipelineDuringStartup: true,
     currentPipeline: 'A',
@@ -116,6 +129,7 @@ function createNativePort() {
       return this.currentPipeline === 'B' ? this.pipelineB : this.pipelineA;
     },
     applyHostAutomationDeltas() {},
+    applyNativeExecutionStates() {},
     synchronizeNativeAssetMembership() {},
     scheduleLatencyService() {}
   };
@@ -124,6 +138,109 @@ function createNativePort() {
   context.window.workletNode = node;
   return { context, hostCalls, node, port };
 }
+
+test('native payload carries upstream execution capabilities without persisting context', () => {
+  const { context } = createNativePort();
+  class ConstrainedPlugin {
+    static executionCapabilities = Object.freeze({
+      requiresWasm: true,
+      supportedSampleRates: Object.freeze([48000]),
+      supportedChannelModes: Object.freeze(['mono', 'stereo-pair'])
+    });
+  }
+  const logical = Object.assign(new ConstrainedPlugin(), {
+    id: 91,
+    name: 'Constrained',
+    channel: 'A'
+  });
+  const payload = {
+    id: 91,
+    type: 'ConstrainedPlugin',
+    parameters: { amount: 0.75 },
+    wasmParams: new Float32Array([0.75]),
+    wasmParamsHash: 123
+  };
+  const owner = { getCurrentPipeline: () => [logical] };
+  const normalized = context.normalizePlugin(payload, owner);
+  assert.deepEqual(Array.from(normalized.executionCapabilities.supportedSampleRates), [48000]);
+  assert.deepEqual(Array.from(normalized.executionCapabilities.supportedChannelModes),
+    ['mono', 'stereo-pair']);
+  assert.equal(Object.hasOwn(normalized, 'executionSupported'), false,
+    'contextual admission remains native and transient');
+  assert.deepEqual({ ...normalized.parameters }, { amount: 0.75 });
+  assert.deepEqual(Array.from(normalized.wasmParams), [0.75],
+    'admission never destroys the logical or packed state');
+
+  class RoomEqPlugin {}
+  const compatibilityLogical = Object.assign(new RoomEqPlugin(), { id: 92, channel: null });
+  owner.getCurrentPipeline = () => [compatibilityLogical];
+  const compatibilityPayload = context.normalizePlugin({
+    id: 92,
+    type: 'RoomEqPlugin',
+    parameters: {},
+    wasmParams: new Float32Array(),
+    wasmParamsHash: 456
+  }, owner);
+  assert.deepEqual(Array.from(compatibilityPayload.executionCapabilities.supportedSampleRates),
+    [44100, 48000, 88200, 96000, 176400, 192000],
+    'legacy declarations remain sourced from the upstream compatibility table');
+});
+
+test('native pipeline images resolve parameters at the current output width', () => {
+  const { context, port } = createNativePort();
+  const serializeStart = source.indexOf('  serializePipeline(');
+  const serializeEnd = source.indexOf('\n  synchronizeHistoryState()', serializeStart);
+  assert.notEqual(serializeStart, -1, 'AudioManager.serializePipeline is missing');
+  assert.notEqual(serializeEnd, -1, 'AudioManager.serializePipeline boundary is missing');
+  vm.runInNewContext(
+    `this.Manager = class {${source.slice(serializeStart, serializeEnd)}\n};`, context);
+
+  const optionsSeen = [];
+  const plugin = {
+    id: 93,
+    type: 'RoomEqPlugin',
+    name: 'Room EQ',
+    enabled: true,
+    getParameters(options) {
+      optionsSeen.push({ ...options });
+      return { outputChannels: options.outputChannelCount };
+    }
+  };
+  const manager = new context.Manager();
+  const nativeNode = {};
+  Object.assign(manager, {
+    audioContext: { sampleRate: 96000, destination: { channelCount: 1 } },
+    nativeNode,
+    workletNode: nativeNode,
+    pipelineA: [plugin],
+    pipelineB: []
+  });
+  port.owner = manager;
+
+  for (const outputChannelCount of [1, 4, 8]) {
+    manager.audioContext.destination.channelCount = outputChannelCount;
+    const [serialized] = manager.serializePipeline(manager.pipelineA);
+    const queued = port.serializeQueuedPlugin('A', plugin.id);
+    assert.equal(serialized.parameters.outputChannels, outputChannelCount);
+    assert.equal(queued.parameters.outputChannels, outputChannelCount);
+    assert.equal(manager.outputChannelCount, outputChannelCount,
+      'the adapter exposes the same width that parameter serialization uses');
+    assert.equal(nativeNode.channelCount, outputChannelCount,
+      'the worklet compatibility surface exposes the current host width');
+  }
+  assert.deepEqual(optionsSeen.map(options => ({
+    sampleRate: options.sampleRate,
+    outputChannelCount: options.outputChannelCount,
+    commitSampleRate: options.commitSampleRate
+  })), [
+    { sampleRate: 96000, outputChannelCount: 1, commitSampleRate: true },
+    { sampleRate: 96000, outputChannelCount: 1, commitSampleRate: true },
+    { sampleRate: 96000, outputChannelCount: 4, commitSampleRate: true },
+    { sampleRate: 96000, outputChannelCount: 4, commitSampleRate: true },
+    { sampleRate: 96000, outputChannelCount: 8, commitSampleRate: true },
+    { sampleRate: 96000, outputChannelCount: 8, commitSampleRate: true }
+  ]);
+});
 
 // A bridge that never answers the request a gesture travelled in. Nothing is
 // waiting on that answer any more -- the value is the plug-in's own from the
@@ -141,6 +258,344 @@ function automationEditPayloads(hostCalls) {
   return hostCalls.flatMap(call => call.type === 'pipeline/updatePlugin'
     ? (call.payload.automationEdits || []) : []);
 }
+
+test('native performance status drives the upstream latency and CPU events', () => {
+  const methodStart = source.indexOf('  applyNativePerformanceStatus(info, dispatch = true)');
+  const methodEnd = source.indexOf('\n  async rebuildPipeline()', methodStart);
+  assert.notEqual(methodStart, -1, 'native performance status adapter is missing');
+  assert.notEqual(methodEnd, -1, 'native performance status adapter boundary is missing');
+  const context = {};
+  vm.runInNewContext(`this.Manager = class {${source.slice(methodStart, methodEnd)}\n};`, context);
+  const events = [];
+  const manager = new context.Manager();
+  Object.assign(manager, {
+    audioContext: { sampleRate: 48000 },
+    lastDispatchedNativeLatencySamples: null,
+    lastDispatchedNativeLatencyCompensated: null,
+    lastDispatchedPipelineCpuAveragePercent: null,
+    dispatchEvent(type, payload) { events.push({ type, payload }); }
+  });
+
+  manager.applyNativePerformanceStatus({
+    latencySamples: 384,
+    processingLatencySamples: 8320,
+    latencyCompensated: false,
+    pipelineCpuAverage: 12.5
+  }, false);
+  assert.equal(manager.dspPipelineLatencySamples, 8320,
+    'the display follows the current DSP image while host PDC is deferred');
+  assert.equal(manager.dspPipelineLatencyCompensated, false);
+  assert.equal(manager.pipelineCpuAveragePercent, 12.5);
+  assert.deepEqual(events, [], 'startup status is retained until UI listeners exist');
+
+  manager.applyNativePerformanceStatus({
+    latencySamples: 384,
+    processingLatencySamples: 8320,
+    latencyCompensated: false,
+    pipelineCpuAverage: 12.5
+  });
+  assert.equal(events.length, 2);
+  assert.equal(events[0].type, 'dspLatency');
+  assert.deepEqual({ ...events[0].payload }, {
+    type: 'dspLatency', samples: 8320, sampleRate: 48000, compensated: false
+  });
+  assert.equal(events[1].type, 'pipelineCpuUsage');
+  assert.deepEqual({ ...events[1].payload }, { average: 12.5 });
+
+  manager.applyNativePerformanceStatus({
+    latencySamples: 384,
+    processingLatencySamples: 8320,
+    latencyCompensated: false,
+    pipelineCpuAverage: 12.5
+  });
+  assert.equal(events.length, 2, 'unchanged telemetry does not redraw the status line');
+
+  manager.applyNativePerformanceStatus({ latencySamples: 384, pipelineCpuAverage: 12.5 });
+  assert.equal(manager.dspPipelineLatencySamples, 384,
+    'older native responses still fall back to their reported latency');
+  assert.equal(manager.dspPipelineLatencyCompensated, true);
+  assert.equal(events.length, 3);
+});
+
+test('native execution states use the upstream validated worklet route', () => {
+  const methodStart = source.indexOf('  applyNativeExecutionStates(states)');
+  const methodEnd = source.indexOf('\n  async rebuildPipeline()', methodStart);
+  assert.notEqual(methodStart, -1, 'native execution-state adapter is missing');
+  assert.notEqual(methodEnd, -1, 'native execution-state adapter boundary is missing');
+  const context = {};
+  vm.runInNewContext(`this.Manager = class {${source.slice(methodStart, methodEnd)}\n};`, context);
+  const messages = [];
+  const manager = new context.Manager();
+  const nativeNode = {};
+  Object.assign(manager, {
+    nativeNode,
+    nativeExecutionStateGeneration: 3,
+    _resetDspExecutionStateSnapshot() { messages.push({ reset: true }); },
+    handleWorkletMessage(event, node) { messages.push({ data: event.data, node }); }
+  });
+
+  manager.applyNativeExecutionStates([
+    { pluginId: 17, pluginType: 'AMRadioSimulatorPlugin', state: 'active' },
+    {
+      pluginId: 18,
+      pluginType: 'SWRadioSimulatorPlugin',
+      state: 'bypassed',
+      reason: 'unsupportedSampleRate'
+    },
+    { pluginId: 'invalid', pluginType: 'TubeSimulatorPlugin', state: 'active' }
+  ]);
+
+  assert.deepEqual(messages.map(message => message.reset === true ? { reset: true } : ({
+    data: { ...message.data },
+    nativeNode: message.node === nativeNode
+  })), [
+    { reset: true },
+    {
+      data: {
+        type: 'dspExecutionState',
+        pluginId: 17,
+        pluginType: 'AMRadioSimulatorPlugin',
+        state: 'active',
+        generation: 4
+      },
+      nativeNode: true
+    },
+    {
+      data: {
+        type: 'dspExecutionState',
+        pluginId: 18,
+        pluginType: 'SWRadioSimulatorPlugin',
+        state: 'bypassed',
+        generation: 4,
+        reason: 'unsupportedSampleRate'
+      },
+      nativeNode: true
+    }
+  ]);
+});
+
+test('startup rebuilds a pending state replacement but preserves an ordinary ready DSP',
+  async () => {
+    const initStart = source.indexOf('  async initAudio()');
+    const initEnd = source.indexOf('\n  async initializeAudioWorklet()', initStart);
+    assert.notEqual(initStart, -1, 'AudioManager.initAudio is missing');
+    assert.notEqual(initEnd, -1, 'AudioManager.initAudio boundary is missing');
+
+    const runStartup = async stateReplacementPending => {
+      const calls = [];
+      const appliedExecutionStates = [];
+      const preparedPipelines = [];
+      const executionStates = [{
+        pluginId: 17,
+        pluginType: 'AMRadioSimulatorPlugin',
+        state: 'active'
+      }];
+      const context = {
+        getPluginParameterOptions: () => ({}),
+        noop() {},
+        fakeAudioContext: (sampleRate, channels) => ({ sampleRate, channels }),
+        fakeNode: port => ({ port }),
+        window: {
+          app: { initialized: false },
+          __effetuneHostCall: async (type, payload) => {
+            calls.push({ type, payload });
+            return {
+              ok: true,
+              dspReady: true,
+              stateReplacementPending,
+              engineSampleRate: 48000,
+              channels: 2,
+              contextGeneration: 7,
+              masterBypass: false,
+              executionStates
+            };
+          }
+        }
+      };
+      vm.runInNewContext(
+        `this.Manager = class {${source.slice(initStart, initEnd)}\n` +
+          `${source.slice(rebuildStart, rebuildEnd)}\n};`, context);
+      const plugin = {
+        id: 17,
+        name: 'Offset',
+        enabled: true,
+        getParameters: () => ({ of: -0.5 }),
+        getWorkletPluginData(parameters) {
+          return { id: this.id, type: 'DCOffsetPlugin', enabled: true, parameters };
+        }
+      };
+      const manager = new context.Manager();
+      Object.assign(manager, {
+        contextManager: {},
+        ioManager: {},
+        nativeNode: {},
+        currentPipeline: 'A',
+        pipelineA: [plugin],
+        getCurrentPipeline() { return this.pipelineA; },
+        pipelineProcessor: {
+          setPipeline(pipeline) { preparedPipelines.push([...pipeline]); },
+          setMasterBypass() {}
+        },
+        nativePort: {
+          postMessage(message) { calls.push({ type: message.type, payload: message }); }
+        },
+        applyNativePerformanceStatus() {},
+        applyNativeBypass() {},
+        applyNativeExecutionStates(states) { appliedExecutionStates.push(states); },
+        applyHostAutomationDeltas() {},
+        applyHostDiagnostics() {},
+        updateExposedProperties() {},
+        seedRestoredAutomationBaseline() {},
+        synchronizeNativeAssetMembership() {},
+        dispatchEvent() {}
+      });
+
+      assert.equal(await manager.initAudio(), '');
+      await manager.rebuildPipeline();
+      return { calls, appliedExecutionStates, executionStates, preparedPipelines };
+    };
+
+    const pendingStartup = await runStartup(true);
+    const pendingCalls = pendingStartup.calls;
+    assert.deepEqual(pendingCalls.map(call => call.type),
+      ['host/getInfo', 'updatePlugins'],
+      'a ready retained DSP with pending restored state receives one startup rebuild');
+    assert.deepEqual({ ...pendingCalls[0].payload }, { startup: true },
+      'the pending decision comes from the page startup handshake');
+
+    assert.deepEqual(pendingStartup.appliedExecutionStates, [],
+      'a replacement rebuild waits for the new native image to report its own states');
+    assert.deepEqual(pendingStartup.preparedPipelines.map(pipeline => pipeline.map(p => p.id)),
+      [[17]], 'the validator prepares the replacement logical pipeline before native rebuild');
+
+    const ordinaryStartup = await runStartup(false);
+    const ordinaryCalls = ordinaryStartup.calls;
+    assert.deepEqual(ordinaryCalls.map(call => call.type), ['host/getInfo'],
+      'an ordinary ready editor recreation preserves native DSP without rebuilding');
+    assert.deepEqual(ordinaryStartup.appliedExecutionStates,
+      [ordinaryStartup.executionStates],
+      'the preserved native image republishes its execution states after JS restoration');
+    assert.deepEqual(ordinaryStartup.preparedPipelines.map(pipeline => pipeline.map(p => p.id)),
+      [[17]], 'preserved startup prepares the restored logical image before state validation');
+  });
+
+test('audio graph rebuild waits for native success and propagates native failure', async () => {
+  const { context, port } = createNativePort();
+  vm.runInNewContext(
+    `this.rebuildPipeline = ({${source.slice(rebuildStart, rebuildEnd)}}).rebuildPipeline;`,
+    context
+  );
+  context.window.app.initialized = true;
+  const events = [];
+  const plugin = {
+    id: 17,
+    name: 'Offset',
+    enabled: true,
+    getParameters: () => ({ of: 0.25 }),
+    getWorkletPluginData(parameters) {
+      return { id: this.id, type: 'DCOffsetPlugin', enabled: true, parameters };
+    }
+  };
+  const manager = {
+    currentPipeline: 'A',
+    pipelineA: [plugin],
+    pipelineB: [],
+    audioContext: { sampleRate: 48000, destination: { channelCount: 2 } },
+    nativePort: port,
+    getCurrentPipeline() { return this.pipelineA; },
+    dispatchEvent(type) { events.push(type); },
+    applyHostAutomationDeltas() {},
+    synchronizeNativeAssetMembership() {},
+    scheduleLatencyService() {}
+  };
+  port.owner = manager;
+
+  let resolveRebuild;
+  context.window.__effetuneHostCall = () => new Promise(resolve => {
+    resolveRebuild = resolve;
+  });
+  const pending = context.rebuildPipeline.call(manager);
+  await new Promise(resolve => queueMicrotask(resolve));
+  assert.deepEqual(events, [], 'the graph event is not published while native rebuild is pending');
+  resolveRebuild({ ok: true });
+  assert.equal(await pending, '');
+  assert.deepEqual(events, ['audioGraphRebuilt'],
+    'the graph event is published only after native rebuild succeeds');
+
+  context.console = { ...console, error() {} };
+  context.window.__effetuneHostCall = async () => {
+    throw new Error('native rebuild rejected');
+  };
+  assert.equal(await context.rebuildPipeline.call(manager),
+    'Audio Error: native rebuild rejected');
+  assert.deepEqual(events, ['audioGraphRebuilt'],
+    'a failed native rebuild returns an error without publishing a success event');
+
+  await assert.doesNotReject(() => port.postMessage({
+    type: 'updatePlugins', plugins: [plugin]
+  }));
+});
+
+test('refused normal topology mutations restore the native authority', async () => {
+  const { context, port } = createNativePort();
+  vm.runInNewContext(
+    `this.commitPowerTopologyMutation = ({${source.slice(
+      topologyCommitStart, topologyCommitEnd)}}).commitPowerTopologyMutation;`,
+    context
+  );
+  const errors = [];
+  let reloads = 0;
+  context.window.uiManager = { setError(message) { errors.push(message); } };
+  context.window.location = { reload() { reloads++; } };
+  context.window.__effetuneHostCall = async () => {
+    throw new Error('native topology rejected');
+  };
+  const manager = { nativePort: port };
+
+  const committed = await context.commitPowerTopologyMutation.call(
+    manager,
+    { type: 'updatePlugins', plugins: [] },
+    { reason: 'pipeline-full-update' }
+  );
+  await new Promise(resolve => setTimeout(resolve, 0));
+
+  assert.equal(committed, false, 'the refused mutation is not reported as committed');
+  assert.equal(reloads, 1, 'the editor reloads the unchanged native authority once');
+  assert.deepEqual(errors,
+    ['The pipeline change could not be applied. The previous pipeline was restored.']);
+
+  const plugin = {
+    id: 17,
+    type: 'DCOffsetPlugin',
+    name: 'Offset',
+    enabled: true,
+    parameters: { of: 0.25 }
+  };
+  port.owner.pipelineA = [plugin];
+  const updated = await context.commitPowerTopologyMutation.call(
+    manager,
+    { type: 'updatePlugin', plugin },
+    { reason: 'pipeline-plugin-update' }
+  );
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(updated, false, 'a refused single plug-in mutation is not reported as committed');
+  assert.equal(reloads, 1, 'the one-shot rollback does not schedule a reload loop');
+
+  vm.runInNewContext(
+    `this.setMasterBypass = ({${source.slice(
+      masterBypassStart, masterBypassEnd)}}).setMasterBypass;`,
+    context
+  );
+  const bypassManager = {
+    nativePort: port,
+    masterBypass: false,
+    applyNativeBypass(value) { this.masterBypass = value; },
+    commitPowerTopologyMutation: context.commitPowerTopologyMutation
+  };
+  await context.setMasterBypass.call(bypassManager, true);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(reloads, 2, 'a refused direct bypass edit restores native authority');
+});
 
 async function createRestoredEditorFixture() {
   const fixture = createNativePort();
@@ -354,6 +809,62 @@ test('a pointer drag derives one touch boundary per target instead of one per va
     assert.equal(discrete.endGesture, true,
       'an edit made with no pointer down ends its own touch');
   });
+
+// An effect power button changes the plug-in from its click handler. DOM click
+// is dispatched after pointerup, so a gesture layer that closes synchronously
+// on pointerup turns every button press into a zero-duration edit: beginEdit,
+// performEdit and endEdit all reach the host together after the hand is already
+// reported as gone. Sliders do not expose the defect because their input events
+// arrive while the pointer is still down.
+test('an effect toggle keeps its host touch open from pointerdown through click', async () => {
+  const { context, hostCalls, port } = createNativePort();
+  const plugin = {
+    id: 17,
+    type: 'DCOffsetPlugin',
+    enabled: true,
+    parameters: { of: 0 }
+  };
+  port.owner.pipelineA = [plugin];
+  port.owner.pipelineB = [];
+  port.owner.hostAutomationApplyDepth = 0;
+  port.owner.applyHostAutomationDelta = () => {};
+  port.rememberAdoptedPlugin('A', plugin);
+
+  const item = { dataset: { pluginId: '17' } };
+  const toggle = {
+    classList: { contains: name => name === 'toggle-button' },
+    closest: selector => selector === '.toggle-button' ? toggle :
+      (selector === '.pipeline-item' ? item : null)
+  };
+
+  context.window.dispatch('pointerdown', {
+    target: toggle, pointerId: 1, isPrimary: true, buttons: 1
+  });
+  assert.deepEqual(hostCalls.map(call => call.type), ['automation/beginGesture'],
+    'pointerdown opens the already-bound node-enable touch before activation');
+
+  // This is the browser ordering used by the upstream onclick handler: the
+  // release event completes first, then click changes enabled and publishes the
+  // plug-in image before the next task runs.
+  context.window.dispatch('pointerup', {
+    target: toggle, pointerId: 1, isPrimary: true, buttons: 0
+  });
+  plugin.enabled = false;
+  void port.postMessage({ type: 'updatePlugin', plugin });
+  await new Promise(resolve => setTimeout(resolve, 0));
+
+  assert.deepEqual(hostCalls.map(call => call.type), [
+    'automation/beginGesture',
+    'pipeline/updatePlugin',
+    'automation/endGesture'
+  ], 'the value travels inside the touch and the release follows it');
+  const [edit] = automationEditPayloads(hostCalls);
+  assert.equal(edit.parameterKey, '__enabled');
+  assert.equal(edit.normalized, 0);
+  assert.equal(edit.beginGesture, true);
+  assert.equal(edit.endGesture, false,
+    'the click value does not close the touch in its own transaction');
+});
 
 // A release the WebView never sees is the case that leaves the host believing
 // the user's hand is still on the control, so every other way a pointer can
@@ -2394,12 +2905,23 @@ test('a sample rate change reseeds the baseline for rate-derived targets', async
     delayMs: 10,
     gn: 0,
     _sampleRate: 96000,
+    _outputChannelCount: 2,
     getParameters(options = {}) {
       const sampleRate = Number.isFinite(options.sampleRate) && options.sampleRate > 0
         ? options.sampleRate
         : this._sampleRate;
-      if (options.commitSampleRate) this._sampleRate = sampleRate;
-      return { dy: Math.round(this.delayMs * sampleRate / 1000), gn: this.gn };
+      const outputChannelCount = Number.isInteger(options.outputChannelCount)
+        ? options.outputChannelCount
+        : this._outputChannelCount;
+      if (options.commitSampleRate) {
+        this._sampleRate = sampleRate;
+        this._outputChannelCount = outputChannelCount;
+      }
+      return {
+        dy: Math.round(this.delayMs * sampleRate / 1000),
+        gn: this.gn,
+        outputChannelCount
+      };
     },
     getWorkletPluginData(parameters) {
       return { id: this.id, type: this.type, enabled: this.enabled, parameters };
@@ -2433,12 +2955,17 @@ test('a sample rate change reseeds the baseline for rate-derived targets', async
       context.unpackDSPAutomationValue(descriptor, 960)),
     'the first publish seeds the delay resolved at the original engine rate');
 
-  // The host switches the engine to 48 kHz, which halves the derived sample count.
+  // The host switches the engine to 48 kHz and eight channels. The derived sample
+  // count is halved and the channel-aware design is committed at the new width.
   await manager.synchronizeNativeContext({
-    engineSampleRate: 48000, channels: 2, contextGeneration: 2
+    engineSampleRate: 48000, channels: 8, contextGeneration: 2
   });
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(plugin._sampleRate, 48000, 'the rebuild committed the new engine rate');
+  assert.equal(plugin._outputChannelCount, 8,
+    'the rebuild committed the new engine output width');
+  assert.equal(manager.outputChannelCount, 8,
+    'the adapter exposes a host channel change to newly constructed plug-ins');
 
   const rebuilds = hostCalls.filter(call => call.type === 'pipeline/rebuild');
   assert.equal(rebuilds.length, 2, 'the rate change republishes the pipeline');

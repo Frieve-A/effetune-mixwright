@@ -5,25 +5,30 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <fstream>
 #include <iterator>
-#include <map>
 #include <mutex>
+#include <new>
 #include <string>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 #if defined(_WIN32)
 #include <Windows.h>
 #elif defined(__APPLE__)
 #include <CoreGraphics/CoreGraphics.h>
+#include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
+#include <pthread.h>
 #endif
 
 namespace effetune::vst {
+
 namespace {
 
 #if defined(_WIN32)
@@ -178,40 +183,8 @@ p{margin:0;color:#d0d0d0}
   return singleThreaded;
 }
 
-// A timer with a null window posts WM_TIMER straight to the calling thread's
-// queue, so the watchdog needs no window class of the plug-in's own - nothing
-// that could leave a window procedure behind in an unloaded binary - and it
-// always runs on the thread that owns the editor windows. The shared service
-// timer cannot promise that: it belongs to whichever thread first initialised
-// the plug-in, which is not necessarily the thread the host opens editors on.
 constexpr UINT kWatchdogIntervalMilliseconds = 500;
-
-using WatchdogKey = std::pair<DWORD, UINT_PTR>;
-
-[[nodiscard]] std::mutex &watchdogMutex() {
-  static std::mutex mutex;
-  return mutex;
-}
-
-[[nodiscard]] std::map<WatchdogKey, WebViewHost *> &watchdogRegistry() {
-  static std::map<WatchdogKey, WebViewHost *> registry;
-  return registry;
-}
-
-void CALLBACK watchdogTimerProc(HWND, UINT, const UINT_PTR timerId, DWORD) {
-  WebViewHost *host = nullptr;
-  {
-    const std::scoped_lock lock(watchdogMutex());
-    auto &registry = watchdogRegistry();
-    if (const auto entry = registry.find({GetCurrentThreadId(), timerId});
-        entry != registry.end()) {
-      host = entry->second;
-    }
-  }
-  if (host != nullptr) {
-    host->serviceInitialisation();
-  }
-}
+constexpr UINT kDispatcherMessage = WM_APP + 0x45f;
 
 [[nodiscard]] HFONT createDiagnosticFont() {
   NONCLIENTMETRICSW metrics{};
@@ -277,118 +250,9 @@ std::string WebViewHost::diagnosticText(const WebViewStatus status) {
   return message;
 }
 
-WebViewHost::WebViewHost(MessageHandler handler, std::filesystem::path resourceRoot,
-                         const bool createImmediately)
-    : handler_(std::move(handler)),
-      resourceRoot_(resourceRoot.empty() ? locateResourceRoot() : std::move(resourceRoot)),
-      resourceBundleAvailable_(hasRequiredResources(resourceRoot_)) {
-  if (createImmediately) {
-    createWebView();
-  }
-}
+namespace {
 
-WebViewHost::~WebViewHost() {
-  endInitialisationWatch();
-  destroyDiagnosticView();
-  webView_.reset();
-}
-
-void WebViewHost::createWebView() {
-  // Start from a clean verdict so a failure recorded on an earlier thread or an
-  // earlier attempt cannot be reported as the reason for this one.
-  status_ = WebViewStatus::initialising;
-#if defined(_WIN32)
-  if (!callerIsInSingleThreadedApartment()) {
-    // Constructing the WebView anyway would leave a window that never paints and
-    // no way to explain why, so stop here and let the diagnostic view speak.
-    status_ = WebViewStatus::unsupportedApartment;
-    return;
-  }
-#endif
-  choc::ui::WebView::Options options;
-#if !defined(NDEBUG)
-  options.enableDebugMode = true;
-#endif
-  options.transparentBackground = true;
-  // CHOC's default origin is shared by every CHOC WebView in the DAW's
-  // WebView2 profile. Use a product-specific origin so another plug-in's
-  // persisted site data or service worker cannot intercept this UI.
-  options.customSchemeURI = std::string(kWebViewHomeUri);
-  options.fetchResource = [this](const std::string &path)
-      -> std::optional<choc::ui::WebView::Options::Resource> {
-    const auto resource = fetchResource(path);
-    if (!resource.has_value()) {
-      return std::nullopt;
-    }
-    return choc::ui::WebView::Options::Resource(resource->bytes, resource->mimeType);
-  };
-  options.webviewIsReady = [this](choc::ui::WebView &view) { configure(view); };
-  webView_ = std::make_unique<choc::ui::WebView>(options);
-}
-
-void WebViewHost::replaceWebView() noexcept {
-  webView_.reset();
-  try {
-    createWebView();
-  } catch (const std::exception &) {
-    webView_.reset();
-  }
-}
-
-bool WebViewHost::webViewIsUsable() const noexcept {
-  if (webView_ == nullptr || !webView_->loadedOK() ||
-      webView_->getViewHandle() == nullptr) {
-    return false;
-  }
-#if defined(_WIN32)
-  return IsWindow(static_cast<HWND>(webView_->getViewHandle())) != FALSE;
-#else
-  return true;
-#endif
-}
-
-bool WebViewHost::ensureWebView() {
-  if (webViewIsUsable()) {
-    return true;
-  }
-
-#if defined(_WIN32)
-  // CHOC derives its window class name from GetTickCount(), whose resolution is
-  // about 16 ms, so two WebViews built inside the same tick collide: the second
-  // RegisterClassExW fails and takes the whole construction with it. That happens
-  // whenever a project loads several instances at once. Retrying after the tick
-  // counter has moved on turns the collision into a brief delay instead of a
-  // dead editor.
-  constexpr int maximumAttempts = 3;
-  for (int attempt = 0; attempt < maximumAttempts; ++attempt) {
-    if (attempt != 0) {
-      const auto tick = GetTickCount64();
-      while (GetTickCount64() == tick) {
-        Sleep(1);
-      }
-    }
-    replaceWebView();
-    if (webViewIsUsable()) {
-      return true;
-    }
-    if (status_ == WebViewStatus::unsupportedApartment) {
-      // Permanent for the lifetime of this thread; retrying only wastes time.
-      return false;
-    }
-  }
-  status_ = WebViewStatus::runtimeUnavailable;
-  return false;
-#else
-  replaceWebView();
-  if (webViewIsUsable()) {
-    return true;
-  }
-  status_ = WebViewStatus::runtimeUnavailable;
-  return false;
-#endif
-}
-
-std::filesystem::path WebViewHost::locateResourceRoot() {
+[[nodiscard]] std::filesystem::path locateResourceRoot() {
 #if defined(_WIN32)
   static int moduleAnchor = 0;
   HMODULE module = nullptr;
@@ -406,7 +270,7 @@ std::filesystem::path WebViewHost::locateResourceRoot() {
   }
 #elif defined(__APPLE__)
   Dl_info info{};
-  if (dladdr(reinterpret_cast<const void *>(&WebViewHost::locateResourceRoot), &info) != 0 &&
+  if (dladdr(reinterpret_cast<const void *>(&locateResourceRoot), &info) != 0 &&
       info.dli_fname != nullptr) {
     return std::filesystem::path(info.dli_fname).parent_path().parent_path() / "Resources" /
            "webview";
@@ -415,414 +279,1457 @@ std::filesystem::path WebViewHost::locateResourceRoot() {
   return std::filesystem::current_path() / "webview-assets";
 }
 
-std::optional<WebViewHost::ResourceData> WebViewHost::fetchResource(std::string path) const {
-  const auto suffix = path.find_first_of("?#");
-  if (suffix != std::string::npos) {
-    path.resize(suffix);
-  }
-  while (!path.empty() && path.front() == '/') {
-    path.erase(path.begin());
-  }
-  if (path.empty()) {
-    path = "effetune.html";
-  }
-  if (path.find('\\') != std::string::npos || path.find(':') != std::string::npos) {
-    return std::nullopt;
-  }
-  const std::filesystem::path relative(path);
-  if (containsTraversal(relative)) {
-    return std::nullopt;
-  }
-  if (!resourceBundleAvailable_) {
-    if (path == "effetune.html") {
-      return ResourceData{"text/html; charset=utf-8", missingResourcePage()};
+struct WebViewResourceData {
+  std::string mimeType;
+  std::string bytes;
+};
+
+} // namespace
+
+struct WebViewGeneration;
+
+struct WebViewHostState : public std::enable_shared_from_this<WebViewHostState> {
+  WebViewHostState(WebViewHost::MessageHandler messageHandler,
+                   std::filesystem::path root)
+      : handler(std::move(messageHandler)),
+        resourceRoot(root.empty() ? locateResourceRoot() : std::move(root)),
+        resourceBundleAvailable(hasRequiredResources(resourceRoot)) {}
+
+  [[nodiscard]] std::optional<WebViewResourceData>
+  fetchResource(std::string path) const {
+    const auto suffix = path.find_first_of("?#");
+    if (suffix != std::string::npos) {
+      path.resize(suffix);
     }
-    return std::nullopt;
+    while (!path.empty() && path.front() == '/') {
+      path.erase(path.begin());
+    }
+    if (path.empty()) {
+      path = "effetune.html";
+    }
+    if (path.find('\\') != std::string::npos ||
+        path.find(':') != std::string::npos) {
+      return std::nullopt;
+    }
+    const std::filesystem::path relative(path);
+    if (containsTraversal(relative)) {
+      return std::nullopt;
+    }
+    if (!resourceBundleAvailable) {
+      if (path == "effetune.html") {
+        return WebViewResourceData{"text/html; charset=utf-8",
+                                   missingResourcePage()};
+      }
+      return std::nullopt;
+    }
+    const auto candidate = resourceRoot / relative;
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(candidate, error)) {
+      return std::nullopt;
+    }
+    std::ifstream input(candidate, std::ios::binary);
+    if (!input) {
+      return std::nullopt;
+    }
+    WebViewResourceData resource;
+    resource.mimeType = mimeTypeFor(candidate);
+    resource.bytes.assign(std::istreambuf_iterator<char>(input),
+                          std::istreambuf_iterator<char>());
+    return resource;
   }
-  const auto candidate = resourceRoot_ / relative;
-  std::error_code error;
-  if (!std::filesystem::is_regular_file(candidate, error)) {
-    return std::nullopt;
+
+  void initialise(bool createImmediately);
+  void shutdown() noexcept;
+  [[nodiscard]] bool attach(void *owner, void *parent, std::int32_t width,
+                            std::int32_t height);
+  void resize(void *owner, std::int32_t width, std::int32_t height) noexcept;
+  void detach(void *owner) noexcept;
+  void serviceInitialisation() noexcept;
+  [[nodiscard]] bool evaluate(std::string script,
+                              WebViewHost::EvaluationHandler completion);
+  void publishStatus(const WebViewGeneration *source,
+                     WebViewStatus newStatus) noexcept;
+  void publishLoaded(const WebViewGeneration *source, bool isLoaded) noexcept;
+
+  WebViewHost::MessageHandler handler;
+  const std::filesystem::path resourceRoot;
+  const bool resourceBundleAvailable;
+  std::atomic<WebViewStatus> status{WebViewStatus::initialising};
+  std::atomic_bool loaded{false};
+  std::atomic_bool stopping{false};
+  std::mutex generationMutex;
+  std::shared_ptr<WebViewGeneration> generation;
+};
+
+namespace {
+
+void configureWebView(choc::ui::WebView &view,
+                      const std::weak_ptr<WebViewHostState> &weakState,
+                      const std::weak_ptr<WebViewGeneration> &weakGeneration);
+
+#if defined(_WIN32)
+
+constexpr DWORD kDispatcherWaitMilliseconds = 1000;
+constexpr WPARAM kDispatcherInvoke = 0;
+constexpr WPARAM kDispatcherRelease = 1;
+constexpr wchar_t kDispatcherIdentityProperty[] =
+    L"EffeTune.WebView.DispatcherIdentity";
+
+LRESULT CALLBACK dispatcherWindowProc(HWND window, UINT message, WPARAM wParam,
+                                      LPARAM lParam);
+
+[[nodiscard]] std::uintptr_t nextDispatcherIdentity() noexcept {
+  static std::atomic_uintptr_t next{1};
+  auto identity = next.fetch_add(1, std::memory_order_relaxed);
+  if (identity == 0) {
+    identity = next.fetch_add(1, std::memory_order_relaxed);
   }
-  std::ifstream input(candidate, std::ios::binary);
-  if (!input) {
-    return std::nullopt;
-  }
-  ResourceData resource;
-  resource.mimeType = mimeTypeFor(candidate);
-  resource.bytes.assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
-  return resource;
+  return identity;
 }
 
-void WebViewHost::configure(choc::ui::WebView &view) {
-  view.bind("vst_hostMessage", [this](const choc::value::ValueView &arguments) {
-    if (!handler_ || !arguments.isArray() || arguments.size() == 0) {
+[[nodiscard]] HMODULE retainDispatcherModule() noexcept {
+  HMODULE module = nullptr;
+  return GetModuleHandleExW(
+             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+             reinterpret_cast<LPCWSTR>(&dispatcherWindowProc), &module) != FALSE
+             ? module
+             : nullptr;
+}
+
+struct WebViewOperation {
+  std::function<bool(WebViewGeneration &)> callback;
+  std::atomic_bool cancelled{false};
+  std::atomic_bool result{false};
+};
+
+#elif defined(__APPLE__)
+
+constexpr std::int64_t kMainThreadWaitNanoseconds = 1000000000;
+
+struct MainThreadRequest {
+  std::function<void(const std::shared_ptr<MainThreadRequest> &)> callback;
+  std::atomic_bool cancelled{false};
+};
+
+void runMainThreadRequest(void *context) {
+  std::unique_ptr<std::shared_ptr<MainThreadRequest>> holder(
+      static_cast<std::shared_ptr<MainThreadRequest> *>(context));
+  const auto request = **holder;
+  if (!request->cancelled.load(std::memory_order_acquire)) {
+    request->callback(request);
+  }
+  request->callback = {};
+}
+
+[[nodiscard]] void *retainCurrentModule() noexcept {
+  Dl_info info{};
+  if (dladdr(reinterpret_cast<const void *>(&runMainThreadRequest), &info) == 0 ||
+      info.dli_fname == nullptr) {
+    return nullptr;
+  }
+  auto *module = dlopen(info.dli_fname, RTLD_LAZY | RTLD_NOLOAD);
+  return module != nullptr ? module : dlopen(info.dli_fname, RTLD_LAZY);
+}
+
+struct MainThreadObjectRelease {
+  id object = nullptr;
+  void *module = nullptr;
+};
+
+void releaseMainThreadObject(void *context) {
+  std::unique_ptr<MainThreadObjectRelease> release(
+      static_cast<MainThreadObjectRelease *>(context));
+  using Release = void (*)(id, SEL);
+  reinterpret_cast<Release>(objc_msgSend)(release->object,
+                                          sel_registerName("release"));
+  // The callback is running from this image, so its last module reference
+  // cannot safely be dropped until after it returns. This path is only the
+  // exception fallback; keeping the pin is safer than self-unloading here.
+  (void)release->module;
+}
+
+class MainThreadObjectLease {
+public:
+  explicit MainThreadObjectLease(id object) noexcept {
+    if (object != nullptr) {
+      using Retain = id (*)(id, SEL);
+      object_ = reinterpret_cast<Retain>(objc_msgSend)(
+          object, sel_registerName("retain"));
+    }
+  }
+
+  ~MainThreadObjectLease() {
+    if (object_ == nullptr) {
+      return;
+    }
+    if (pthread_main_np() != 0) {
+      using Release = void (*)(id, SEL);
+      reinterpret_cast<Release>(objc_msgSend)(object_,
+                                              sel_registerName("release"));
+      return;
+    }
+    auto *module = retainCurrentModule();
+    if (module == nullptr) {
+      return;
+    }
+    auto *release = new (std::nothrow) MainThreadObjectRelease{object_, module};
+    if (release == nullptr) {
+      return;
+    }
+    dispatch_async_f(dispatch_get_main_queue(), release,
+                     releaseMainThreadObject);
+  }
+
+  MainThreadObjectLease(const MainThreadObjectLease &) = delete;
+  MainThreadObjectLease &operator=(const MainThreadObjectLease &) = delete;
+
+  [[nodiscard]] id get() const noexcept { return object_; }
+
+private:
+  id object_ = nullptr;
+};
+
+[[nodiscard]] bool runCancellableOnMainThreadBounded(
+    std::function<void(const std::shared_ptr<MainThreadRequest> &)> callback,
+    const bool cancelOnTimeout = true) {
+  try {
+    const auto request = std::make_shared<MainThreadRequest>();
+    request->callback = std::move(callback);
+    if (pthread_main_np() != 0) {
+      request->callback(request);
+      return true;
+    }
+    auto *module = retainCurrentModule();
+    auto group = dispatch_group_create();
+    dispatch_group_async_f(
+        group, dispatch_get_main_queue(),
+        new std::shared_ptr<MainThreadRequest>(request), runMainThreadRequest);
+    const auto completed =
+        dispatch_group_wait(group, dispatch_time(DISPATCH_TIME_NOW,
+                                                 kMainThreadWaitNanoseconds)) == 0;
+#if !OS_OBJECT_USE_OBJC
+    dispatch_release(group);
+#endif
+    if (completed) {
+      if (module != nullptr) {
+        dlclose(module);
+      }
+    } else {
+      if (cancelOnTimeout) {
+        request->cancelled.store(true, std::memory_order_release);
+      }
+      // The pending block contains code and state from this image. Retaining the
+      // image is the only safe fallback when the host's main loop is unavailable.
+      (void)module;
+    }
+    return completed;
+  } catch (const std::exception &) {
+    return false;
+  }
+}
+
+[[nodiscard]] bool runOnMainThreadBounded(std::function<void()> callback,
+                                          const bool cancelOnTimeout = true) {
+  return runCancellableOnMainThreadBounded(
+      [callback = std::move(callback)](
+          const std::shared_ptr<MainThreadRequest> &) { callback(); },
+      cancelOnTimeout);
+}
+
+#endif
+
+} // namespace
+
+struct WebViewGeneration : public std::enable_shared_from_this<WebViewGeneration> {
+  explicit WebViewGeneration(std::weak_ptr<WebViewHostState> state)
+      : hostState(std::move(state)) {}
+
+  ~WebViewGeneration() {
+#if defined(_WIN32)
+    if (!released.load(std::memory_order_acquire) &&
+        ownerThread != GetCurrentThreadId()) {
+      // The dispatcher/window owns another shared reference in every normal
+      // cross-thread path. If that window vanished unexpectedly, abandoning the
+      // affine objects is safer than running CHOC/COM destruction here.
+      (void)webView.release();
+      diagnosticView = nullptr;
+      diagnosticFont = nullptr;
+      return;
+    }
+#elif defined(__APPLE__)
+    if (webView != nullptr && pthread_main_np() == 0) {
+      // A timed-out main-queue request retains the generation. This branch is
+      // only for an unavailable queue during process teardown.
+      (void)webView.release();
+      return;
+    }
+    if (!released.load(std::memory_order_acquire)) {
+      releaseOnOwner();
+    }
+#endif
+    webView.reset();
+  }
+
+  [[nodiscard]] static std::shared_ptr<WebViewGeneration>
+  create(const std::shared_ptr<WebViewHostState> &state) {
+    auto result = std::shared_ptr<WebViewGeneration>(
+        new WebViewGeneration(std::weak_ptr<WebViewHostState>(state)));
+#if defined(_WIN32)
+    result->ownerThread = GetCurrentThreadId();
+    result->identity = nextDispatcherIdentity();
+    if (!result->createDispatcher()) {
+      result->setStatus(WebViewStatus::runtimeUnavailable);
+      return result;
+    }
+#endif
+    result->createWebViewOnOwner();
+    return result;
+  }
+
+  [[nodiscard]] bool ownsCurrentThread() const noexcept {
+#if defined(_WIN32)
+    return ownerThread == GetCurrentThreadId();
+#elif defined(__APPLE__)
+    return pthread_main_np() != 0;
+#else
+    return true;
+#endif
+  }
+
+  void setStatus(const WebViewStatus newStatus) noexcept {
+    currentStatus.store(newStatus, std::memory_order_release);
+    if (const auto state = hostState.lock()) {
+      state->publishStatus(this, newStatus);
+    }
+  }
+
+  void setLoaded(const bool isLoaded) noexcept {
+    if (const auto state = hostState.lock()) {
+      state->publishLoaded(this, isLoaded);
+    }
+  }
+
+  [[nodiscard]] bool usableOnOwner() const noexcept {
+    if (webView == nullptr || !webView->loadedOK() ||
+        webView->getViewHandle() == nullptr) {
+      return false;
+    }
+#if defined(_WIN32)
+    return IsWindow(static_cast<HWND>(webView->getViewHandle())) != FALSE;
+#else
+    return true;
+#endif
+  }
+
+  void createWebViewOnOwner() noexcept {
+    if (!ownsCurrentThread() || retiring.load(std::memory_order_acquire)) {
+      return;
+    }
+    webView.reset();
+    setLoaded(false);
+    setStatus(WebViewStatus::initialising);
+#if defined(_WIN32)
+    if (!callerIsInSingleThreadedApartment()) {
+      setStatus(WebViewStatus::unsupportedApartment);
+      return;
+    }
+#endif
+    try {
+      choc::ui::WebView::Options options;
+#if !defined(NDEBUG)
+      options.enableDebugMode = true;
+#endif
+      options.transparentBackground = true;
+      options.customSchemeURI = std::string(kWebViewHomeUri);
+      const auto weakState = hostState;
+      const auto weakGeneration = weak_from_this();
+      options.fetchResource =
+          [weakState, weakGeneration](const std::string &path)
+          -> std::optional<choc::ui::WebView::Options::Resource> {
+        const auto state = weakState.lock();
+        const auto generation = weakGeneration.lock();
+        if (state == nullptr || state->stopping.load(std::memory_order_acquire)) {
+          return std::nullopt;
+        }
+        if (generation == nullptr ||
+            generation->retiring.load(std::memory_order_acquire)) {
+          return std::nullopt;
+        }
+        const auto resource = state->fetchResource(path);
+        if (!resource.has_value()) {
+          return std::nullopt;
+        }
+        return choc::ui::WebView::Options::Resource(resource->bytes,
+                                                    resource->mimeType);
+      };
+      options.webviewIsReady =
+          [weakState, weakGeneration](choc::ui::WebView &view) {
+        const auto generation = weakGeneration.lock();
+        if (generation == nullptr ||
+            generation->retiring.load(std::memory_order_acquire)) {
+          return;
+        }
+        configureWebView(view, weakState, weakGeneration);
+        generation->setStatus(WebViewStatus::ready);
+        if (generation->parent != nullptr) {
+          generation->destroyDiagnosticViewOnOwner();
+          generation->presentNativeViewOnOwner();
+          generation->endInitialisationWatchOnOwner();
+        }
+      };
+      webView = std::make_unique<choc::ui::WebView>(options);
+      setLoaded(webView != nullptr && webView->loadedOK());
+    } catch (const std::exception &) {
+      webView.reset();
+      setLoaded(false);
+      setStatus(WebViewStatus::runtimeUnavailable);
+    }
+  }
+
+  void replaceWebViewOnOwner() noexcept {
+    createWebViewOnOwner();
+  }
+
+  [[nodiscard]] bool ensureWebViewOnOwner() noexcept {
+    if (usableOnOwner()) {
+      return true;
+    }
+#if defined(_WIN32)
+    constexpr int maximumAttempts = 3;
+    for (int attempt = 0; attempt < maximumAttempts; ++attempt) {
+      if (attempt != 0) {
+        const auto tick = GetTickCount64();
+        while (GetTickCount64() == tick) {
+          Sleep(1);
+        }
+      }
+      replaceWebViewOnOwner();
+      if (usableOnOwner()) {
+        return true;
+      }
+      if (currentStatus.load(std::memory_order_acquire) ==
+          WebViewStatus::unsupportedApartment) {
+        return false;
+      }
+    }
+#else
+    replaceWebViewOnOwner();
+    if (usableOnOwner()) {
+      return true;
+    }
+#endif
+    setStatus(WebViewStatus::runtimeUnavailable);
+    return false;
+  }
+
+  [[nodiscard]] bool attachOnOwner(void *newOwner, void *newParent,
+                                   const std::int32_t width,
+                                   const std::int32_t height,
+                                   const std::atomic_bool *cancelled = nullptr) {
+    if (!ownsCurrentThread() || newOwner == nullptr || newParent == nullptr ||
+        retiring.load(std::memory_order_acquire) ||
+        (cancelled != nullptr &&
+         cancelled->load(std::memory_order_acquire))) {
+      return false;
+    }
+#if defined(_WIN32)
+    auto *parentWindow = static_cast<HWND>(newParent);
+    if (IsWindow(parentWindow) == FALSE) {
+      return false;
+    }
+#endif
+    endInitialisationWatchOnOwner();
+    owner = nullptr;
+    parent = nullptr;
+    lastWidth = std::max(1, width);
+    lastHeight = std::max(1, height);
+    destroyDiagnosticViewOnOwner();
+
+    if (webView != nullptr && webView->isReady()) {
+      replaceWebViewOnOwner();
+    }
+    if (!ensureWebViewOnOwner()) {
+      owner = newOwner;
+      parent = newParent;
+      if (showDiagnosticViewOnOwner()) {
+        return true;
+      }
+      owner = nullptr;
+      parent = nullptr;
+      return false;
+    }
+    auto *view = webView->getViewHandle();
+    if (view == nullptr) {
+      return false;
+    }
+    if (retiring.load(std::memory_order_acquire) ||
+        (cancelled != nullptr &&
+         cancelled->load(std::memory_order_acquire))) {
+      return false;
+    }
+#if defined(_WIN32)
+    auto *child = static_cast<HWND>(view);
+    SetLastError(ERROR_SUCCESS);
+    const auto style = GetWindowLongPtrW(child, GWL_STYLE);
+    if (style == 0 && GetLastError() != ERROR_SUCCESS) {
+      return false;
+    }
+    SetLastError(ERROR_SUCCESS);
+    if (SetWindowLongPtrW(child, GWL_STYLE,
+                          (style | WS_CHILD | WS_CLIPSIBLINGS) & ~WS_POPUP) == 0 &&
+        GetLastError() != ERROR_SUCCESS) {
+      return false;
+    }
+    SetLastError(ERROR_SUCCESS);
+    const auto previousParent = SetParent(child, parentWindow);
+    if (previousParent == nullptr && GetLastError() != ERROR_SUCCESS) {
+      replaceWebViewOnOwner();
+      return false;
+    }
+    if (SetWindowPos(child, nullptr, 0, 0, lastWidth, lastHeight,
+                     SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOZORDER |
+                         SWP_SHOWWINDOW) == FALSE) {
+      replaceWebViewOnOwner();
+      return false;
+    }
+#elif defined(__APPLE__)
+    using AddSubview = void (*)(id, SEL, id);
+    reinterpret_cast<AddSubview>(objc_msgSend)(static_cast<id>(newParent),
+                                               sel_registerName("addSubview:"),
+                                               static_cast<id>(view));
+#else
+    return false;
+#endif
+    owner = newOwner;
+    parent = newParent;
+    resizeOnOwner(newOwner, width, height);
+    beginInitialisationWatchOnOwner();
+    return true;
+  }
+
+  void resizeOnOwner(void *requestedOwner, const std::int32_t width,
+                     const std::int32_t height) noexcept {
+    if (!ownsCurrentThread() || requestedOwner == nullptr ||
+        requestedOwner != owner || retiring.load(std::memory_order_acquire)) {
+      return;
+    }
+    lastWidth = std::max(1, width);
+    lastHeight = std::max(1, height);
+#if defined(_WIN32)
+    if (diagnosticView != nullptr) {
+      SetWindowPos(diagnosticView, nullptr, 0, 0, lastWidth, lastHeight,
+                   SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOZORDER);
+    }
+#endif
+    if (webView == nullptr || webView->getViewHandle() == nullptr) {
+      return;
+    }
+#if defined(_WIN32)
+    auto *child = static_cast<HWND>(webView->getViewHandle());
+    if (IsWindow(child) != FALSE) {
+      SetWindowPos(child, nullptr, 0, 0, lastWidth, lastHeight,
+                   SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOZORDER);
+    }
+#elif defined(__APPLE__)
+    using SetFrame = void (*)(id, SEL, CGRect);
+    reinterpret_cast<SetFrame>(objc_msgSend)(
+        static_cast<id>(webView->getViewHandle()), sel_registerName("setFrame:"),
+        CGRectMake(0, 0, lastWidth, lastHeight));
+#endif
+  }
+
+  void detachOnOwner(void *requestedOwner) noexcept {
+    if (!ownsCurrentThread() || requestedOwner == nullptr ||
+        requestedOwner != owner || retiring.load(std::memory_order_acquire)) {
+      return;
+    }
+#if defined(__APPLE__)
+    if (webView != nullptr && webView->getViewHandle() != nullptr &&
+        parent != nullptr) {
+      using RemoveFromSuperview = void (*)(id, SEL);
+      reinterpret_cast<RemoveFromSuperview>(objc_msgSend)(
+          static_cast<id>(webView->getViewHandle()),
+          sel_registerName("removeFromSuperview"));
+    }
+#endif
+    endInitialisationWatchOnOwner();
+    destroyDiagnosticViewOnOwner();
+    owner = nullptr;
+    parent = nullptr;
+    setStatus(WebViewStatus::initialising);
+    replaceWebViewOnOwner();
+  }
+
+  [[nodiscard]] bool evaluateOnOwner(
+      std::string script, WebViewHost::EvaluationHandler completion) {
+    if (!ownsCurrentThread() || webView == nullptr || !webView->isReady() ||
+        retiring.load(std::memory_order_acquire)) {
+      return false;
+    }
+    const auto weakGeneration = weak_from_this();
+    return webView->evaluateJavascript(
+        script, [weakGeneration, completion = std::move(completion)](
+                    const std::string &error,
+                    const choc::value::ValueView &result) {
+          const auto generation = weakGeneration.lock();
+          if (generation == nullptr ||
+              generation->retiring.load(std::memory_order_acquire) ||
+              !completion) {
+            return;
+          }
+          completion(error, choc::json::toString(result));
+        });
+  }
+
+  void beginInitialisationWatchOnOwner() noexcept {
+    attachedAt = std::chrono::steady_clock::now();
+    if (webView != nullptr && webView->isReady()) {
+      setStatus(WebViewStatus::ready);
+      presentNativeViewOnOwner();
+      return;
+    }
+    setStatus(WebViewStatus::initialising);
+#if defined(_WIN32)
+    if (const auto window = dispatcherWindow.load(std::memory_order_acquire);
+        window != nullptr) {
+      (void)SetTimer(window, identity,
+                     kWatchdogIntervalMilliseconds, nullptr);
+    }
+#endif
+  }
+
+  void endInitialisationWatchOnOwner() noexcept {
+#if defined(_WIN32)
+    if (const auto window = dispatcherWindow.load(std::memory_order_acquire);
+        window != nullptr) {
+      (void)KillTimer(window, identity);
+    }
+#endif
+  }
+
+  void serviceInitialisationOnOwner() noexcept {
+    if (!ownsCurrentThread() || parent == nullptr ||
+        retiring.load(std::memory_order_acquire)) {
+      return;
+    }
+    if (usableOnOwner() && webView->isReady()) {
+      if (currentStatus.load(std::memory_order_acquire) != WebViewStatus::ready) {
+        setStatus(WebViewStatus::ready);
+        destroyDiagnosticViewOnOwner();
+        presentNativeViewOnOwner();
+      }
+      endInitialisationWatchOnOwner();
+      return;
+    }
+    bool statusTransitioned = false;
+    if (currentStatus.load(std::memory_order_acquire) ==
+            WebViewStatus::initialising &&
+        std::chrono::steady_clock::now() - attachedAt >=
+            kWebViewInitialisationTimeout) {
+      setStatus(WebViewStatus::initialisationTimedOut);
+      statusTransitioned = true;
+    }
+    if (statusTransitioned || !diagnosticVisible) {
+      (void)showDiagnosticViewOnOwner();
+    }
+  }
+
+  void presentNativeViewOnOwner() noexcept {
+#if defined(_WIN32)
+    if (webView == nullptr || parent == nullptr) {
+      return;
+    }
+    auto *child = static_cast<HWND>(webView->getViewHandle());
+    if (child == nullptr || IsWindow(child) == FALSE) {
+      return;
+    }
+    SetWindowPos(child, nullptr, 0, 0, lastWidth, lastHeight,
+                 SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOZORDER |
+                     SWP_SHOWWINDOW);
+    SendMessageW(child, WM_SHOWWINDOW, TRUE, 0);
+    SendMessageW(child, WM_SIZE, SIZE_RESTORED,
+                 MAKELPARAM(static_cast<WORD>(lastWidth),
+                            static_cast<WORD>(lastHeight)));
+#endif
+  }
+
+  [[nodiscard]] bool showDiagnosticViewOnOwner() noexcept {
+#if defined(_WIN32)
+    if (parent == nullptr || !ownsCurrentThread()) {
+      return false;
+    }
+    auto *parentWindow = static_cast<HWND>(parent);
+    if (IsWindow(parentWindow) == FALSE) {
+      return false;
+    }
+    const auto text = widen(WebViewHost::diagnosticText(
+        currentStatus.load(std::memory_order_acquire)));
+    if (diagnosticView != nullptr) {
+      SetWindowTextW(diagnosticView, text.c_str());
+      SetWindowPos(diagnosticView, HWND_TOP, 0, 0, lastWidth, lastHeight,
+                   SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+      diagnosticVisible = true;
+      return true;
+    }
+    diagnosticView = CreateWindowExW(
+        0, L"EDIT", text.c_str(),
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY |
+            ES_AUTOVSCROLL,
+        0, 0, lastWidth, lastHeight, parentWindow, nullptr, nullptr, nullptr);
+    if (diagnosticView == nullptr) {
+      return false;
+    }
+    if (diagnosticFont == nullptr) {
+      diagnosticFont = createDiagnosticFont();
+    }
+    if (diagnosticFont != nullptr) {
+      SendMessageW(diagnosticView, WM_SETFONT,
+                   reinterpret_cast<WPARAM>(diagnosticFont), TRUE);
+    }
+    SendMessageW(diagnosticView, EM_SETMARGINS,
+                 EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(16, 16));
+    diagnosticVisible = true;
+    return true;
+#else
+    return false;
+#endif
+  }
+
+  void destroyDiagnosticViewOnOwner() noexcept {
+    diagnosticVisible = false;
+#if defined(_WIN32)
+    if (!ownsCurrentThread()) {
+      return;
+    }
+    if (diagnosticView != nullptr) {
+      const auto view = std::exchange(diagnosticView, nullptr);
+      if (IsWindow(view) != FALSE) {
+        DestroyWindow(view);
+      }
+    }
+    if (diagnosticFont != nullptr) {
+      DeleteObject(diagnosticFont);
+      diagnosticFont = nullptr;
+    }
+#endif
+  }
+
+#if defined(_WIN32)
+  [[nodiscard]] bool createDispatcher() {
+    const auto window =
+        CreateWindowExW(0, L"STATIC", L"", 0, 0, 0, 0, 0, HWND_MESSAGE,
+                        nullptr, nullptr, nullptr);
+    if (window == nullptr) {
+      return false;
+    }
+    dispatcherWindow.store(window, std::memory_order_release);
+    auto *holder = new std::shared_ptr<WebViewGeneration>(shared_from_this());
+    SetLastError(ERROR_SUCCESS);
+    if (SetWindowLongPtrW(window, GWLP_USERDATA,
+                          reinterpret_cast<LONG_PTR>(holder)) == 0 &&
+        GetLastError() != ERROR_SUCCESS) {
+      delete holder;
+      DestroyWindow(window);
+      dispatcherWindow.store(nullptr, std::memory_order_release);
+      return false;
+    }
+    if (SetPropW(window, kDispatcherIdentityProperty,
+                 reinterpret_cast<HANDLE>(identity)) == FALSE) {
+      SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+      delete holder;
+      DestroyWindow(window);
+      dispatcherWindow.store(nullptr, std::memory_order_release);
+      return false;
+    }
+    SetLastError(ERROR_SUCCESS);
+    const auto original = SetWindowLongPtrW(
+        window, GWLP_WNDPROC,
+        reinterpret_cast<LONG_PTR>(dispatcherWindowProc));
+    if (original == 0 && GetLastError() != ERROR_SUCCESS) {
+      RemovePropW(window, kDispatcherIdentityProperty);
+      SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+      delete holder;
+      DestroyWindow(window);
+      dispatcherWindow.store(nullptr, std::memory_order_release);
+      return false;
+    }
+    originalWindowProc = reinterpret_cast<WNDPROC>(original);
+    return true;
+  }
+
+  [[nodiscard]] bool isDispatcherWindow() const noexcept {
+    const auto window = dispatcherWindow.load(std::memory_order_acquire);
+    if (window == nullptr || IsWindow(window) == FALSE) {
+      return false;
+    }
+    DWORD process = 0;
+    const auto thread = GetWindowThreadProcessId(window, &process);
+    if (thread != ownerThread || process != GetCurrentProcessId() ||
+        reinterpret_cast<WNDPROC>(GetWindowLongPtrW(window, GWLP_WNDPROC)) !=
+            dispatcherWindowProc ||
+        reinterpret_cast<std::uintptr_t>(
+            GetPropW(window, kDispatcherIdentityProperty)) != identity) {
+      return false;
+    }
+    return true;
+  }
+
+  [[nodiscard]] bool sendBounded(const WPARAM command,
+                                 const bool releaseCommand) noexcept {
+    auto module = retainDispatcherModule();
+    if (!isDispatcherWindow()) {
+      if (releaseCommand) {
+        (void)module;
+      } else if (module != nullptr) {
+        FreeLibrary(module);
+      }
+      return false;
+    }
+    DWORD_PTR result = 0;
+    SetLastError(ERROR_SUCCESS);
+    const auto sent = SendMessageTimeoutW(
+        dispatcherWindow.load(std::memory_order_acquire), kDispatcherMessage,
+        command,
+        static_cast<LPARAM>(identity), SMTO_ABORTIFHUNG | SMTO_BLOCK,
+        kDispatcherWaitMilliseconds, &result);
+    const auto timedOut = sent == 0 && GetLastError() == ERROR_TIMEOUT;
+    if (timedOut || (releaseCommand && (sent == 0 || result == 0))) {
+      // The message may already be executing, or may run when the STA resumes.
+      // Keep this image loaded so its WNDPROC and CHOC callbacks remain valid.
+      (void)module;
+      if (releaseCommand) {
+        const auto window = dispatcherWindow.load(std::memory_order_acquire);
+        if (window != nullptr) {
+          (void)PostMessageW(window, kDispatcherMessage, kDispatcherRelease,
+                             static_cast<LPARAM>(identity));
+        }
+      }
+    } else if (module != nullptr) {
+      FreeLibrary(module);
+    }
+    return sent != 0 && result != 0;
+  }
+
+  [[nodiscard]] bool invoke(
+      std::function<bool(WebViewGeneration &)> callback) {
+    if (retiring.load(std::memory_order_acquire)) {
+      return false;
+    }
+    if (ownsCurrentThread()) {
+      return callback(*this);
+    }
+    const auto operation = std::make_shared<WebViewOperation>();
+    operation->callback = std::move(callback);
+    {
+      const std::scoped_lock lock(operationMutex);
+      if (retiring.load(std::memory_order_acquire)) {
+        return false;
+      }
+      operations.push_back(operation);
+    }
+    if (!sendBounded(kDispatcherInvoke, false)) {
+      operation->cancelled.store(true, std::memory_order_release);
+      return false;
+    }
+    return operation->result.load(std::memory_order_acquire);
+  }
+
+  void drainOperationsOnOwner() noexcept {
+    std::vector<std::shared_ptr<WebViewOperation>> pending;
+    {
+      const std::scoped_lock lock(operationMutex);
+      pending.swap(operations);
+    }
+    for (const auto &operation : pending) {
+      if (!operation->cancelled.load(std::memory_order_acquire) &&
+          !retiring.load(std::memory_order_acquire)) {
+        operation->result.store(operation->callback(*this),
+                                std::memory_order_release);
+      }
+    }
+  }
+
+  void closeDispatcherOnOwner() noexcept {
+    if (!ownsCurrentThread()) {
+      return;
+    }
+    const auto window =
+        dispatcherWindow.exchange(nullptr, std::memory_order_acq_rel);
+    if (window == nullptr) {
+      return;
+    }
+    auto *holder = reinterpret_cast<std::shared_ptr<WebViewGeneration> *>(
+        GetWindowLongPtrW(window, GWLP_USERDATA));
+    SetWindowLongPtrW(window, GWLP_WNDPROC,
+                      reinterpret_cast<LONG_PTR>(originalWindowProc));
+    SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+    RemovePropW(window, kDispatcherIdentityProperty);
+    DestroyWindow(window);
+    delete holder;
+  }
+#endif
+
+  void releaseOnOwner(const bool closeDispatcher = true) noexcept {
+    if (!ownsCurrentThread() ||
+        released.exchange(true, std::memory_order_acq_rel)) {
+      return;
+    }
+    retiring.store(true, std::memory_order_release);
+    endInitialisationWatchOnOwner();
+    destroyDiagnosticViewOnOwner();
+#if defined(__APPLE__)
+    if (webView != nullptr && webView->getViewHandle() != nullptr &&
+        parent != nullptr) {
+      using RemoveFromSuperview = void (*)(id, SEL);
+      reinterpret_cast<RemoveFromSuperview>(objc_msgSend)(
+          static_cast<id>(webView->getViewHandle()),
+          sel_registerName("removeFromSuperview"));
+    }
+#endif
+    owner = nullptr;
+    parent = nullptr;
+    webView.reset();
+    setLoaded(false);
+#if defined(_WIN32)
+    if (closeDispatcher) {
+      closeDispatcherOnOwner();
+    }
+#else
+    (void)closeDispatcher;
+#endif
+  }
+
+  void retire() noexcept {
+    if (retiring.exchange(true, std::memory_order_acq_rel)) {
+      return;
+    }
+#if defined(_WIN32)
+    {
+      const std::scoped_lock lock(operationMutex);
+      for (const auto &operation : operations) {
+        operation->cancelled.store(true, std::memory_order_release);
+      }
+    }
+    if (ownsCurrentThread()) {
+      releaseOnOwner();
+    } else {
+      (void)sendBounded(kDispatcherRelease, true);
+    }
+#elif defined(__APPLE__)
+    if (ownsCurrentThread()) {
+      releaseOnOwner();
+    } else {
+      try {
+        const auto self = shared_from_this();
+        if (!runOnMainThreadBounded([self] { self->releaseOnOwner(); }, false)) {
+          (void)retainCurrentModule();
+        }
+      } catch (const std::exception &) {
+        (void)retainCurrentModule();
+      }
+    }
+#else
+    releaseOnOwner();
+#endif
+  }
+
+  std::weak_ptr<WebViewHostState> hostState;
+  std::unique_ptr<choc::ui::WebView> webView;
+  std::atomic<WebViewStatus> currentStatus{WebViewStatus::initialising};
+  std::atomic_bool retiring{false};
+  std::atomic_bool released{false};
+  void *owner = nullptr;
+  void *parent = nullptr;
+  std::int32_t lastWidth = 1;
+  std::int32_t lastHeight = 1;
+  std::chrono::steady_clock::time_point attachedAt{};
+  bool diagnosticVisible = false;
+#if defined(_WIN32)
+  std::atomic<HWND> dispatcherWindow{nullptr};
+  WNDPROC originalWindowProc = nullptr;
+  DWORD ownerThread = 0;
+  std::uintptr_t identity = 0;
+  HWND diagnosticView = nullptr;
+  HFONT diagnosticFont = nullptr;
+  std::mutex operationMutex;
+  std::vector<std::shared_ptr<WebViewOperation>> operations;
+#endif
+};
+
+namespace {
+
+void configureWebView(choc::ui::WebView &view,
+                      const std::weak_ptr<WebViewHostState> &weakState,
+                      const std::weak_ptr<WebViewGeneration> &weakGeneration) {
+  view.bind("vst_hostMessage", [weakState, weakGeneration](
+                                   const choc::value::ValueView &arguments) {
+    const auto state = weakState.lock();
+    const auto generation = weakGeneration.lock();
+    if (state == nullptr || state->stopping.load(std::memory_order_acquire) ||
+        generation == nullptr ||
+        generation->retiring.load(std::memory_order_acquire) ||
+        !state->handler || !arguments.isArray() || arguments.size() == 0) {
       return choc::json::create("ok", false, "error", "Invalid bridge call");
     }
     const auto request = arguments[0].getWithDefault<std::string>({});
     try {
-      return choc::json::parse(handler_(request));
+      return choc::json::parse(state->handler(request));
     } catch (const choc::json::ParseError &) {
-      return choc::json::create("ok", false, "error", "Invalid native bridge response");
+      return choc::json::create("ok", false, "error",
+                                "Invalid native bridge response");
     }
   });
   (void)view.addInitScript(
       "window.__EFFETUNE_VST__=true;window.pipelineStateLoaded=true;"
       "document.documentElement.classList.add('effetune-vst-host');");
   (void)view.navigate(std::string(kWebViewHomeUri) + "effetune.html");
-  // The controller only exists from here on, so everything the editor told the
-  // native window before this point was dropped and has to be replayed. This
-  // callback arrives on the thread that created the WebView, which is not
-  // necessarily the thread that owns the editor windows - when it is not, the
-  // replay is left to the watchdog, which always runs on the right one.
-  if (parent_ != nullptr && callerOwnsEditorWindows()) {
-    status_ = WebViewStatus::ready;
-    destroyDiagnosticView();
-    presentNativeView();
-    endInitialisationWatch();
+}
+
+#if defined(_WIN32)
+LRESULT CALLBACK dispatcherWindowProc(HWND window, const UINT message,
+                                      const WPARAM wParam,
+                                      const LPARAM lParam) {
+  auto *holder = reinterpret_cast<std::shared_ptr<WebViewGeneration> *>(
+      GetWindowLongPtrW(window, GWLP_USERDATA));
+  if (holder == nullptr || *holder == nullptr) {
+    return DefWindowProcW(window, message, wParam, lParam);
+  }
+  const auto generation = *holder;
+  if (generation->dispatcherWindow.load(std::memory_order_acquire) != window ||
+      generation->ownerThread != GetCurrentThreadId() ||
+      reinterpret_cast<WNDPROC>(GetWindowLongPtrW(window, GWLP_WNDPROC)) !=
+          dispatcherWindowProc) {
+    return DefWindowProcW(window, message, wParam, lParam);
+  }
+  if (message == WM_TIMER && wParam == generation->identity) {
+    generation->serviceInitialisationOnOwner();
+    return 0;
+  }
+  if (message == kDispatcherMessage) {
+    if (static_cast<std::uintptr_t>(lParam) != generation->identity) {
+      return 0;
+    }
+    if (wParam == kDispatcherInvoke) {
+      generation->drainOperationsOnOwner();
+      return 1;
+    }
+    if (wParam == kDispatcherRelease) {
+      generation->releaseOnOwner();
+      return 1;
+    }
+    return 0;
+  }
+  if (message == WM_NCDESTROY) {
+    const auto original = generation->originalWindowProc;
+    generation->releaseOnOwner(false);
+    generation->dispatcherWindow.store(nullptr, std::memory_order_release);
+    SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+    RemovePropW(window, kDispatcherIdentityProperty);
+    const auto result = CallWindowProcW(original, window, message, wParam, lParam);
+    delete holder;
+    return result;
+  }
+  return CallWindowProcW(generation->originalWindowProc, window, message, wParam,
+                         lParam);
+}
+#endif
+
+} // namespace
+
+void WebViewHostState::publishStatus(const WebViewGeneration *source,
+                                     const WebViewStatus newStatus) noexcept {
+  const std::scoped_lock lock(generationMutex);
+  if (generation.get() == source) {
+    status.store(newStatus, std::memory_order_release);
   }
 }
 
-void WebViewHost::presentNativeView() noexcept {
-#if defined(_WIN32)
-  if (webView_ == nullptr || parent_ == nullptr) {
+void WebViewHostState::publishLoaded(const WebViewGeneration *source,
+                                     const bool isLoaded) noexcept {
+  const std::scoped_lock lock(generationMutex);
+  if (generation.get() == source) {
+    loaded.store(isLoaded, std::memory_order_release);
+  }
+}
+
+void WebViewHostState::initialise(const bool createImmediately) {
+  if (!createImmediately) {
     return;
   }
-  auto *child = static_cast<HWND>(webView_->getViewHandle());
-  if (child == nullptr || IsWindow(child) == FALSE) {
-    return;
-  }
-  // Deliberately the same geometry call attach() makes, z-order included: the
-  // diagnostic view is always destroyed before this runs, so there is nothing to
-  // rise above, and hosts that put their own siblings in the container must keep
-  // the stacking they chose.
-  SetWindowPos(child, nullptr, 0, 0, lastWidth_, lastHeight_,
-               SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOZORDER | SWP_SHOWWINDOW);
-  // CHOC forwards bounds and visibility to the WebView2 controller only from
-  // WM_SIZE and WM_SHOWWINDOW, and drops both while the controller is still
-  // being created. Neither message is re-sent for a window that is already
-  // visible at the right size, so send them explicitly rather than leaving the
-  // controller zero-sized or invisible in hosts that size and show the container
-  // before WebView2 is up.
-  //
-  // A WebView built during initialize() belongs to whichever thread ran it, which
-  // need not be this one, and a plain SendMessage to another thread's window
-  // blocks for as long as that thread takes. Bound the wait so replaying these
-  // two messages can never stall the editor thread.
-  constexpr UINT sendFlags = SMTO_NORMAL | SMTO_ABORTIFHUNG;
-  constexpr UINT sendTimeoutMilliseconds = 1000;
-  SendMessageTimeoutW(child, WM_SHOWWINDOW, TRUE, 0, sendFlags,
-                      sendTimeoutMilliseconds, nullptr);
-  SendMessageTimeoutW(child, WM_SIZE, SIZE_RESTORED,
-                      MAKELPARAM(static_cast<WORD>(lastWidth_),
-                                 static_cast<WORD>(lastHeight_)),
-                      sendFlags, sendTimeoutMilliseconds, nullptr);
+#if defined(__APPLE__)
+  const auto self = shared_from_this();
+  (void)runOnMainThreadBounded([self] {
+    if (self->stopping.load(std::memory_order_acquire)) {
+      return;
+    }
+    auto created = WebViewGeneration::create(self);
+    const std::scoped_lock lock(self->generationMutex);
+    self->generation = std::move(created);
+    self->status.store(self->generation->currentStatus.load(
+                           std::memory_order_acquire),
+                       std::memory_order_release);
+    self->loaded.store(self->generation->webView != nullptr &&
+                           self->generation->webView->loadedOK(),
+                       std::memory_order_release);
+  });
+#else
+  auto created = WebViewGeneration::create(shared_from_this());
+  const std::scoped_lock lock(generationMutex);
+  generation = std::move(created);
+  status.store(generation->currentStatus.load(std::memory_order_acquire),
+               std::memory_order_release);
+  loaded.store(generation->webView != nullptr && generation->webView->loadedOK(),
+               std::memory_order_release);
 #endif
+}
+
+void WebViewHostState::shutdown() noexcept {
+  if (stopping.exchange(true, std::memory_order_acq_rel)) {
+    return;
+  }
+  std::shared_ptr<WebViewGeneration> retired;
+  {
+    const std::scoped_lock lock(generationMutex);
+    retired = std::move(generation);
+    loaded.store(false, std::memory_order_release);
+  }
+  if (retired != nullptr) {
+    retired->retire();
+  }
+}
+
+bool WebViewHostState::attach(void *owner, void *parent,
+                              const std::int32_t width,
+                              const std::int32_t height) {
+  if (stopping.load(std::memory_order_acquire)) {
+    return false;
+  }
+#if defined(_WIN32)
+  std::shared_ptr<WebViewGeneration> current;
+  std::shared_ptr<WebViewGeneration> retired;
+  {
+    const std::scoped_lock lock(generationMutex);
+    current = generation;
+    if (current == nullptr || !current->ownsCurrentThread()) {
+      retired = std::move(generation);
+      current.reset();
+    }
+  }
+  if (retired != nullptr) {
+    retired->retire();
+  }
+  if (current == nullptr) {
+    auto created = WebViewGeneration::create(shared_from_this());
+    {
+      const std::scoped_lock lock(generationMutex);
+      if (generation == nullptr) {
+        generation = created;
+        current = created;
+      } else {
+        current = generation;
+      }
+    }
+    if (current != created) {
+      created->retire();
+    }
+  }
+  if (!current->ownsCurrentThread()) {
+    return false;
+  }
+  if (stopping.load(std::memory_order_acquire)) {
+    current->retire();
+    return false;
+  }
+  status.store(current->currentStatus.load(std::memory_order_acquire),
+               std::memory_order_release);
+  loaded.store(current->webView != nullptr && current->webView->loadedOK(),
+               std::memory_order_release);
+  return current->attachOnOwner(owner, parent, width, height);
+#elif defined(__APPLE__)
+  struct Result {
+    std::atomic_bool attached{false};
+  };
+  const auto result = std::make_shared<Result>();
+  const auto self = shared_from_this();
+  auto parentLease =
+      std::make_shared<MainThreadObjectLease>(static_cast<id>(parent));
+  if (parentLease->get() == nullptr ||
+      !runCancellableOnMainThreadBounded(
+          [self, result, owner, width, height,
+           parentLease = std::move(parentLease)](
+              const std::shared_ptr<MainThreadRequest> &request) {
+            const auto cancelled = [&] {
+              return request->cancelled.load(std::memory_order_acquire) ||
+                     self->stopping.load(std::memory_order_acquire);
+            };
+            if (cancelled()) {
+              return;
+            }
+            std::shared_ptr<WebViewGeneration> current;
+            std::shared_ptr<WebViewGeneration> created;
+            bool publishedCreated = false;
+            {
+              const std::scoped_lock lock(self->generationMutex);
+              current = self->generation;
+            }
+            if (current == nullptr) {
+              created = WebViewGeneration::create(self);
+              if (cancelled()) {
+                created->retire();
+                return;
+              }
+              bool cancelledBeforePublish = false;
+              {
+                const std::scoped_lock lock(self->generationMutex);
+                if (cancelled()) {
+                  cancelledBeforePublish = true;
+                } else if (self->generation == nullptr) {
+                  self->generation = created;
+                  current = created;
+                  publishedCreated = true;
+                } else {
+                  current = self->generation;
+                }
+              }
+              if (cancelledBeforePublish) {
+                created->retire();
+                return;
+              }
+              if (current != created) {
+                created->retire();
+              }
+            }
+            if (cancelled()) {
+              if (publishedCreated) {
+                const std::scoped_lock lock(self->generationMutex);
+                if (self->generation == current) {
+                  self->generation.reset();
+                }
+              }
+              if (publishedCreated) {
+                current->retire();
+              }
+              return;
+            }
+            const auto attached = current->attachOnOwner(
+                owner, parentLease->get(), width, height, &request->cancelled);
+            if (!attached) {
+              return;
+            }
+            if (cancelled()) {
+              current->detachOnOwner(owner);
+              if (publishedCreated) {
+                {
+                  const std::scoped_lock lock(self->generationMutex);
+                  if (self->generation == current) {
+                    self->generation.reset();
+                  }
+                }
+                current->retire();
+              }
+              return;
+            }
+            result->attached.store(true, std::memory_order_release);
+          })) {
+    return false;
+  }
+  return result->attached.load(std::memory_order_acquire);
+#else
+  (void)owner;
+  (void)parent;
+  (void)width;
+  (void)height;
+  return false;
+#endif
+}
+
+void WebViewHostState::resize(void *owner, const std::int32_t width,
+                              const std::int32_t height) noexcept {
+  try {
+  if (stopping.load(std::memory_order_acquire)) {
+    return;
+  }
+  std::shared_ptr<WebViewGeneration> current;
+  {
+    const std::scoped_lock lock(generationMutex);
+    current = generation;
+  }
+  if (current == nullptr) {
+    return;
+  }
+#if defined(_WIN32)
+  (void)current->invoke([owner, width, height](WebViewGeneration &target) {
+    target.resizeOnOwner(owner, width, height);
+    return true;
+  });
+#elif defined(__APPLE__)
+  (void)runOnMainThreadBounded([current, owner, width, height] {
+    current->resizeOnOwner(owner, width, height);
+  });
+#endif
+  } catch (const std::exception &) {
+  }
+}
+
+void WebViewHostState::detach(void *owner) noexcept {
+  try {
+  if (stopping.load(std::memory_order_acquire)) {
+    return;
+  }
+  std::shared_ptr<WebViewGeneration> current;
+  {
+    const std::scoped_lock lock(generationMutex);
+    current = generation;
+  }
+  if (current == nullptr) {
+    return;
+  }
+#if defined(_WIN32)
+  (void)current->invoke([owner](WebViewGeneration &target) {
+    target.detachOnOwner(owner);
+    return true;
+  });
+#elif defined(__APPLE__)
+  (void)runOnMainThreadBounded(
+      [current, owner] { current->detachOnOwner(owner); });
+#endif
+  } catch (const std::exception &) {
+  }
+}
+
+void WebViewHostState::serviceInitialisation() noexcept {
+  try {
+  if (stopping.load(std::memory_order_acquire)) {
+    return;
+  }
+  std::shared_ptr<WebViewGeneration> current;
+  {
+    const std::scoped_lock lock(generationMutex);
+    current = generation;
+  }
+  if (current == nullptr) {
+    return;
+  }
+#if defined(_WIN32)
+  (void)current->invoke([](WebViewGeneration &target) {
+    target.serviceInitialisationOnOwner();
+    return true;
+  });
+#elif defined(__APPLE__)
+  (void)runOnMainThreadBounded(
+      [current] { current->serviceInitialisationOnOwner(); });
+#endif
+  } catch (const std::exception &) {
+  }
+}
+
+bool WebViewHostState::evaluate(
+    std::string script, WebViewHost::EvaluationHandler completion) {
+  std::shared_ptr<WebViewGeneration> current;
+  {
+    const std::scoped_lock lock(generationMutex);
+    current = generation;
+  }
+  if (current == nullptr || stopping.load(std::memory_order_acquire)) {
+    return false;
+  }
+  const auto completionAllowed = std::make_shared<std::atomic_bool>(true);
+  WebViewHost::EvaluationHandler guardedCompletion;
+  if (completion) {
+    guardedCompletion =
+        [completionAllowed, completion = std::move(completion)](
+            std::string error, std::string result) mutable {
+          if (completionAllowed->load(std::memory_order_acquire)) {
+            completion(std::move(error), std::move(result));
+          }
+        };
+  }
+#if defined(_WIN32)
+  const auto started = current->invoke(
+      [script = std::move(script), completion = std::move(guardedCompletion)](
+          WebViewGeneration &target) mutable {
+        return target.evaluateOnOwner(std::move(script), std::move(completion));
+      });
+  if (!started) {
+    completionAllowed->store(false, std::memory_order_release);
+  }
+  return started;
+#elif defined(__APPLE__)
+  struct Result {
+    bool started = false;
+  };
+  const auto result = std::make_shared<Result>();
+  if (!runOnMainThreadBounded(
+          [current, result, script = std::move(script),
+           completion = std::move(guardedCompletion)]() mutable {
+            result->started = current->evaluateOnOwner(
+                std::move(script), std::move(completion));
+          })) {
+    completionAllowed->store(false, std::memory_order_release);
+    return false;
+  }
+  if (!result->started) {
+    completionAllowed->store(false, std::memory_order_release);
+  }
+  return result->started;
+#else
+  return false;
+#endif
+}
+
+WebViewHost::WebViewHost(MessageHandler handler,
+                         std::filesystem::path resourceRoot,
+                         const bool createImmediately)
+    : state_(std::make_shared<WebViewHostState>(std::move(handler),
+                                               std::move(resourceRoot))) {
+  state_->initialise(createImmediately);
+}
+
+WebViewHost::~WebViewHost() { shutdown(); }
+
+void WebViewHost::shutdown() noexcept {
+  if (state_ != nullptr) {
+    state_->shutdown();
+  }
 }
 
 bool WebViewHost::attach(void *owner, void *parent, const std::int32_t width,
                          const std::int32_t height) {
-  if (owner == nullptr || parent == nullptr) {
-    return false;
-  }
-#if defined(_WIN32)
-  auto *parentWindow = static_cast<HWND>(parent);
-  if (IsWindow(parentWindow) == FALSE) {
-    return false;
-  }
-#endif
-
-  endInitialisationWatch();
-  owner_ = nullptr;
-  parent_ = nullptr;
-  lastWidth_ = std::max(1, width);
-  lastHeight_ = std::max(1, height);
-  destroyDiagnosticView();
-
-  // The WebView2 controller must come into existence while the CHOC window is
-  // already parented to the host window it will be shown in, or some hosts leave
-  // the reopened editor blank. A ready WebView's controller was created under the
-  // previous parent - and may also have hosted state work while the editor was
-  // closed - so it is replaced rather than reparented. One whose construction is
-  // still pending has no controller yet, so its controller will still land after
-  // the SetParent below; replacing that one would only race two WebView2
-  // environment creations for the same profile.
-  if (webView_ != nullptr && webView_->isReady()) {
-    replaceWebView();
-  }
-  if (!ensureWebView()) {
-    owner_ = owner;
-    parent_ = parent;
-    if (showDiagnosticView()) {
-      return true;
-    }
-    owner_ = nullptr;
-    parent_ = nullptr;
-    return false;
-  }
-  auto *view = webView_->getViewHandle();
-  if (view == nullptr) {
-    return false;
-  }
-#if defined(_WIN32)
-  auto *child = static_cast<HWND>(view);
-
-  SetLastError(ERROR_SUCCESS);
-  const auto style = GetWindowLongPtrW(child, GWL_STYLE);
-  if (style == 0 && GetLastError() != ERROR_SUCCESS) {
-    return false;
-  }
-  SetLastError(ERROR_SUCCESS);
-  if (SetWindowLongPtrW(child, GWL_STYLE,
-                        (style | WS_CHILD | WS_CLIPSIBLINGS) & ~WS_POPUP) == 0 &&
-      GetLastError() != ERROR_SUCCESS) {
-    return false;
-  }
-
-  SetLastError(ERROR_SUCCESS);
-  const auto previousParent = SetParent(child, parentWindow);
-  if (previousParent == nullptr && GetLastError() != ERROR_SUCCESS) {
-    replaceWebView();
-    return false;
-  }
-  if (SetWindowPos(child, nullptr, 0, 0, lastWidth_, lastHeight_,
-                   SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOZORDER |
-                       SWP_SHOWWINDOW) == FALSE) {
-    replaceWebView();
-    return false;
-  }
-  owner_ = owner;
-  parent_ = parent;
-  beginInitialisationWatch();
-  return true;
-#elif defined(__APPLE__)
-  using AddSubview = void (*)(id, SEL, id);
-  reinterpret_cast<AddSubview>(objc_msgSend)(static_cast<id>(parent),
-                                             sel_registerName("addSubview:"),
-                                             static_cast<id>(view));
-  owner_ = owner;
-  parent_ = parent;
-  resize(owner, width, height);
-  beginInitialisationWatch();
-  return true;
-#else
-  (void)width;
-  (void)height;
-  return false;
-#endif
-}
-
-void WebViewHost::beginInitialisationWatch() noexcept {
-  attachedAt_ = std::chrono::steady_clock::now();
-#if defined(_WIN32)
-  attachedThread_ = GetCurrentThreadId();
-#endif
-  if (webView_ != nullptr && webView_->isReady()) {
-    status_ = WebViewStatus::ready;
-    presentNativeView();
-    return;
-  }
-  status_ = WebViewStatus::initialising;
-#if defined(_WIN32)
-  if (watchdogTimer_ == 0) {
-    if (const auto timerId = SetTimer(nullptr, 0, kWatchdogIntervalMilliseconds,
-                                      watchdogTimerProc);
-        timerId != 0) {
-      watchdogTimer_ = static_cast<std::uintptr_t>(timerId);
-      const std::scoped_lock lock(watchdogMutex());
-      watchdogRegistry()[{attachedThread_, timerId}] = this;
-    }
-  }
-#endif
-}
-
-void WebViewHost::endInitialisationWatch() noexcept {
-#if defined(_WIN32)
-  if (watchdogTimer_ == 0) {
-    return;
-  }
-  const auto timerId = static_cast<UINT_PTR>(watchdogTimer_);
-  watchdogTimer_ = 0;
-  {
-    const std::scoped_lock lock(watchdogMutex());
-    watchdogRegistry().erase({attachedThread_, timerId});
-  }
-  // KillTimer only works from the thread that owns the timer. Off-thread the
-  // registry entry above is already gone, so a stray tick resolves to no host
-  // and does nothing.
-  if (attachedThread_ == GetCurrentThreadId()) {
-    KillTimer(nullptr, timerId);
-  }
-#endif
-}
-
-bool WebViewHost::callerOwnsEditorWindows() const noexcept {
-#if defined(_WIN32)
-  return attachedThread_ == GetCurrentThreadId();
-#else
-  return true;
-#endif
-}
-
-void WebViewHost::serviceInitialisation() noexcept {
-  if (parent_ == nullptr || !callerOwnsEditorWindows()) {
-    // Everything below manipulates windows, which have thread affinity, so any
-    // other thread has to leave the work to the editor's own watchdog timer.
-    return;
-  }
-  if (webViewIsUsable() && webView_->isReady()) {
-    if (status_ != WebViewStatus::ready) {
-      // A slow-but-working WebView2 takes the window back from the diagnostics.
-      status_ = WebViewStatus::ready;
-      destroyDiagnosticView();
-      presentNativeView();
-    }
-    endInitialisationWatch();
-    return;
-  }
-  if (status_ == WebViewStatus::initialising) {
-    if (std::chrono::steady_clock::now() - attachedAt_ < kWebViewInitialisationTimeout) {
-      return;
-    }
-    status_ = WebViewStatus::initialisationTimedOut;
-  }
-  if (!diagnosticVisible_) {
-    // The pending WebView is deliberately left running underneath: if it does
-    // finish, the branch above hands the window straight back to it.
-    (void)showDiagnosticView();
-  }
-}
-
-bool WebViewHost::showDiagnosticView() noexcept {
-#if defined(_WIN32)
-  if (parent_ == nullptr) {
-    return false;
-  }
-  auto *parentWindow = static_cast<HWND>(parent_);
-  if (IsWindow(parentWindow) == FALSE) {
-    return false;
-  }
-  const auto text = widen(diagnosticText(status_));
-  if (diagnosticView_ != nullptr) {
-    auto *existing = static_cast<HWND>(diagnosticView_);
-    SetWindowTextW(existing, text.c_str());
-    SetWindowPos(existing, HWND_TOP, 0, 0, lastWidth_, lastHeight_,
-                 SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
-    diagnosticVisible_ = true;
-    return true;
-  }
-  // A read-only multi-line EDIT control needs no window class of the plug-in's
-  // own, so no window procedure can outlive an unloaded binary, and the user can
-  // select the text and paste it straight into a bug report.
-  auto *created = CreateWindowExW(
-      0, L"EDIT", text.c_str(),
-      WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY |
-          ES_AUTOVSCROLL,
-      0, 0, lastWidth_, lastHeight_, parentWindow, nullptr, nullptr, nullptr);
-  if (created == nullptr) {
-    return false;
-  }
-  if (diagnosticFont_ == nullptr) {
-    diagnosticFont_ = createDiagnosticFont();
-  }
-  if (diagnosticFont_ != nullptr) {
-    SendMessageW(created, WM_SETFONT, reinterpret_cast<WPARAM>(diagnosticFont_), TRUE);
-  }
-  SendMessageW(created, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
-               MAKELPARAM(16, 16));
-  diagnosticView_ = created;
-  diagnosticVisible_ = true;
-  return true;
-#else
-  return false;
-#endif
-}
-
-void WebViewHost::destroyDiagnosticView() noexcept {
-  diagnosticVisible_ = false;
-#if defined(_WIN32)
-  if (diagnosticView_ != nullptr) {
-    auto *view = static_cast<HWND>(diagnosticView_);
-    diagnosticView_ = nullptr;
-    if (IsWindow(view) != FALSE) {
-      DestroyWindow(view);
-    }
-  }
-  if (diagnosticFont_ != nullptr) {
-    DeleteObject(static_cast<HGDIOBJ>(diagnosticFont_));
-    diagnosticFont_ = nullptr;
-  }
-#endif
+  return state_ != nullptr && state_->attach(owner, parent, width, height);
 }
 
 void WebViewHost::resize(void *owner, const std::int32_t width,
                          const std::int32_t height) noexcept {
-  if (owner == nullptr || owner != owner_) {
-    return;
+  if (state_ != nullptr) {
+    state_->resize(owner, width, height);
   }
-  lastWidth_ = std::max(1, width);
-  lastHeight_ = std::max(1, height);
-#if defined(_WIN32)
-  if (diagnosticView_ != nullptr) {
-    SetWindowPos(static_cast<HWND>(diagnosticView_), nullptr, 0, 0, lastWidth_,
-                 lastHeight_, SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOZORDER);
-  }
-#endif
-  if (webView_ == nullptr || webView_->getViewHandle() == nullptr) {
-    return;
-  }
-#if defined(_WIN32)
-  auto *child = static_cast<HWND>(webView_->getViewHandle());
-  if (IsWindow(child) != FALSE) {
-    SetWindowPos(child, nullptr, 0, 0, lastWidth_, lastHeight_,
-                 SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOZORDER);
-  }
-#elif defined(__APPLE__)
-  using SetFrame = void (*)(id, SEL, CGRect);
-  reinterpret_cast<SetFrame>(objc_msgSend)(static_cast<id>(webView_->getViewHandle()),
-                                           sel_registerName("setFrame:"),
-                                           CGRectMake(0, 0, std::max(1, width),
-                                                      std::max(1, height)));
-#else
-  (void)width;
-  (void)height;
-#endif
 }
 
 void WebViewHost::detach(void *owner) noexcept {
-  if (owner == nullptr || owner != owner_) {
-    return;
+  if (state_ != nullptr) {
+    state_->detach(owner);
   }
-  if (webView_ != nullptr && webView_->getViewHandle() != nullptr && parent_ != nullptr) {
-#if defined(__APPLE__)
-    using RemoveFromSuperview = void (*)(id, SEL);
-    reinterpret_cast<RemoveFromSuperview>(objc_msgSend)(
-        static_cast<id>(webView_->getViewHandle()), sel_registerName("removeFromSuperview"));
-#endif
-  }
-  endInitialisationWatch();
-  destroyDiagnosticView();
-  owner_ = nullptr;
-  parent_ = nullptr;
-  status_ = WebViewStatus::initialising;
-  replaceWebView();
 }
 
 bool WebViewHost::loaded() const noexcept {
-  return webView_ != nullptr && webView_->loadedOK();
+  return state_ != nullptr && state_->loaded.load(std::memory_order_acquire);
 }
 
 bool WebViewHost::evaluate(std::string script, EvaluationHandler handler) {
-  if (webView_ == nullptr || !webView_->isReady()) {
-    return false;
+  return state_ != nullptr &&
+         state_->evaluate(std::move(script), std::move(handler));
+}
+
+WebViewStatus WebViewHost::status() const noexcept {
+  return state_ != nullptr
+             ? state_->status.load(std::memory_order_acquire)
+             : WebViewStatus::runtimeUnavailable;
+}
+
+void WebViewHost::serviceInitialisation() noexcept {
+  if (state_ != nullptr) {
+    state_->serviceInitialisation();
   }
-  return webView_->evaluateJavascript(
-      script, [handler = std::move(handler)](const std::string &error,
-                                             const choc::value::ValueView &result) {
-        if (handler) {
-          handler(error, choc::json::toString(result));
-        }
-      });
 }
 
 } // namespace effetune::vst

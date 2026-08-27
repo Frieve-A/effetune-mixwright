@@ -143,6 +143,65 @@ void setError(std::string *destination, std::string value) {
   return choc::json::toString(logical);
 }
 
+[[nodiscard]] bool decodeExecutionCapabilities(
+    const ValueView value, RuntimeExecutionCapabilities &destination,
+    std::string *error) {
+  if (value.isVoid()) {
+    return true;
+  }
+  if (!value.isObject()) {
+    setError(error, "DSP execution capabilities must be an object");
+    return false;
+  }
+
+  const auto sampleRates = value["supportedSampleRates"];
+  if (!sampleRates.isVoid()) {
+    if (!sampleRates.isArray() || sampleRates.size() > kMaxExecutionSampleRates) {
+      setError(error, "DSP supported sample rates exceed the bridge limit");
+      return false;
+    }
+    destination.constrainsSampleRate = true;
+    destination.supportedSampleRateCount =
+        static_cast<std::uint8_t>(sampleRates.size());
+    for (std::uint32_t index = 0; index < sampleRates.size(); ++index) {
+      const auto sampleRate = sampleRates[index].getWithDefault<double>(0.0);
+      if (!std::isfinite(sampleRate) || sampleRate <= 0.0) {
+        setError(error, "DSP supported sample rate is invalid");
+        return false;
+      }
+      destination.supportedSampleRates[index] = sampleRate;
+    }
+  }
+
+  const auto channelModes = value["supportedChannelModes"];
+  if (!channelModes.isVoid()) {
+    constexpr std::uint32_t kExecutionChannelModeCount = 4;
+    if (!channelModes.isArray() || channelModes.size() > kExecutionChannelModeCount) {
+      setError(error, "DSP supported channel modes exceed the bridge limit");
+      return false;
+    }
+    destination.constrainsChannelMode = true;
+    for (std::uint32_t index = 0; index < channelModes.size(); ++index) {
+      const auto mode = channelModes[index].getWithDefault<std::string>({});
+      auto modeBit = std::uint8_t{};
+      if (mode == "all") {
+        modeBit = static_cast<std::uint8_t>(ExecutionChannelMode::all);
+      } else if (mode == "single") {
+        modeBit = static_cast<std::uint8_t>(ExecutionChannelMode::single);
+      } else if (mode == "mono") {
+        modeBit = static_cast<std::uint8_t>(ExecutionChannelMode::mono);
+      } else if (mode == "stereo-pair") {
+        modeBit = static_cast<std::uint8_t>(ExecutionChannelMode::stereoPair);
+      } else {
+        setError(error, "DSP supported channel mode is invalid");
+        return false;
+      }
+      destination.supportedChannelModes |= modeBit;
+    }
+  }
+  return true;
+}
+
 [[nodiscard]] bool decodePlugin(const ValueView item, RoutedPlugin &destination,
                                 std::string *error) {
   if (!item.isObject()) {
@@ -170,8 +229,14 @@ void setError(std::string *destination, std::string value) {
   static const std::unordered_set<std::string_view> knownPluginFields{
       "id",                           "name",          "enabled",
       "parameters",  "inputBus",       "outputBus",     "channel", "unknown",
-      "wasmParams",  "wasmParamsHash", "wasmParamBytes"};
+      "wasmParams",  "wasmParamsHash", "wasmParamBytes", "executionCapabilities"};
   destination.logical.extraJson = unknownMembersJson(item, knownPluginFields);
+
+  if (!decodeExecutionCapabilities(item["executionCapabilities"],
+                                   destination.runtime.executionCapabilities,
+                                   error)) {
+    return false;
+  }
 
   const auto packed = item["wasmParams"];
   const auto hash = item["wasmParamsHash"].getWithDefault<std::int64_t>(0);
@@ -209,7 +274,8 @@ void setError(std::string *destination, std::string value) {
 }
 
 [[nodiscard]] bool decodePlugins(const ValueView array, std::vector<RoutedPlugin> &plugins,
-                                 std::string *error) {
+                                 std::string *error,
+                                 std::unordered_set<std::uint32_t> *messagePluginIds = nullptr) {
   if (!array.isArray() || array.size() > kMaxPipelineNodes) {
     setError(error, "Pipeline payload is missing or exceeds the node limit");
     return false;
@@ -222,11 +288,13 @@ void setError(std::string *destination, std::string value) {
     if (!decodePlugin(array[index], plugin, error)) {
       return false;
     }
-    const auto duplicate = std::find_if(
+    const auto duplicateInPipeline = std::find_if(
         plugins.begin(), plugins.end(), [&plugin](const RoutedPlugin &existing) {
           return existing.logical.id == plugin.logical.id;
-        });
-    if (duplicate != plugins.end()) {
+        }) != plugins.end();
+    if (duplicateInPipeline ||
+        (messagePluginIds != nullptr &&
+         !messagePluginIds->insert(plugin.logical.id).second)) {
       setError(error, "Pipeline plugin IDs must be unique");
       return false;
     }
@@ -377,12 +445,15 @@ bool MessageRouter::decode(const std::string_view json, RoutedUiMessage &message
       decoded.action = UiAction::restoreHistory;
       decoded.pipeline =
           payload["currentPipeline"].getWithDefault<std::string>("A") == "B" ? 'B' : 'A';
-      if (!decodePlugins(payload["pipelineA"], decoded.pipelineA, error)) {
+      std::unordered_set<std::uint32_t> pluginIds;
+      if (!decodePlugins(payload["pipelineA"], decoded.pipelineA, error,
+                         &pluginIds)) {
         return false;
       }
       decoded.pipelineBInitialized = payload["pipelineBInitialized"].getWithDefault<bool>(false);
       if (decoded.pipelineBInitialized &&
-          !decodePlugins(payload["pipelineB"], decoded.pipelineB, error)) {
+          !decodePlugins(payload["pipelineB"], decoded.pipelineB, error,
+                         &pluginIds)) {
         return false;
       }
       if (!decodeAutomationEdits(payload["automationEdits"], decoded.automationEdits,
@@ -414,6 +485,14 @@ bool MessageRouter::decode(const std::string_view json, RoutedUiMessage &message
       decoded.normalizedValue = edit.normalized;
       decoded.pluginType = std::move(edit.pluginType);
       decoded.parameterKey = std::move(edit.parameterKey);
+    } else if (type == "automation/beginGesture") {
+      // A click-activated control can name its target at mouse-down even though
+      // its value does not change until the later click event.
+      decoded.action = UiAction::beginAutomationGesture;
+      if (!decodeAutomationTargets(payload["targets"], decoded.automationEdits,
+                                   error)) {
+        return false;
+      }
     } else if (type == "automation/endGesture") {
       // The release of a pointer gesture, which names only the targets it
       // moved. There is no value here on purpose: the values already travelled

@@ -209,7 +209,7 @@ std::optional<std::string> normalizeChannel(std::string channel) {
 std::string shortParametersToJson(const ValueView object) {
   static const std::unordered_set<std::string_view> metadata{
       "id", "nm", "en", "ib", "ob", "ch", "name", "enabled", "inputBus",
-      "outputBus", "channel", "unknown"};
+      "outputBus", "channel", "unknown", "executionCapabilities"};
   auto parameters = choc::value::createObject({});
   for (std::uint32_t index = 0; index < object.size(); ++index) {
     const auto member = object.getObjectMemberAt(index);
@@ -220,8 +220,17 @@ std::string shortParametersToJson(const ValueView object) {
   return choc::json::toString(parameters);
 }
 
-bool decodePipeline(const ValueView array, PipelineState &pipeline, std::uint32_t &nextId) {
+bool decodePipeline(const ValueView array, PipelineState &pipeline,
+                    std::uint32_t &nextId,
+                    std::unordered_set<std::uint32_t> &pluginIds,
+                    std::string *error) {
   if (!array.isArray()) {
+    return false;
+  }
+  if (array.size() > kMaxPipelineNodes) {
+    if (error != nullptr) {
+      *error = "State pipeline exceeds the node limit";
+    }
     return false;
   }
   pipeline.plugins.clear();
@@ -250,6 +259,12 @@ bool decodePipeline(const ValueView array, PipelineState &pipeline, std::uint32_
     if (plugin.name.empty()) {
       continue;
     }
+    if (!pluginIds.insert(plugin.id).second) {
+      if (error != nullptr) {
+        *error = "State pipeline plugin IDs must be unique";
+      }
+      return false;
+    }
     plugin.enabled = shortForm ? item["en"].getWithDefault<bool>(true)
                                : item["enabled"].getWithDefault<bool>(true);
     plugin.inputBus = readBus(item, "inputBus", "ib");
@@ -262,7 +277,8 @@ bool decodePipeline(const ValueView array, PipelineState &pipeline, std::uint32_
     plugin.unknown = item["unknown"].getWithDefault<bool>(false);
     static const std::unordered_set<std::string_view> knownPluginFields{
         "id", "nm", "en", "ib", "ob", "ch", "name", "enabled",
-        "parameters", "inputBus", "outputBus", "channel", "unknown"};
+        "parameters", "inputBus", "outputBus", "channel", "unknown",
+        "executionCapabilities"};
     plugin.extraJson = unknownMembersJson(item, knownPluginFields);
     const auto parameters = item["parameters"];
     plugin.parametersJson = parameters.isObject() ? choc::json::toString(parameters)
@@ -384,9 +400,10 @@ bool StateCodec::decode(const std::string_view json, PluginStateDocument &state,
     const auto root = choc::json::parse(json);
     PluginStateDocument decoded;
     std::uint32_t nextId = 1;
+    std::unordered_set<std::uint32_t> pluginIds;
 
     if (root.isArray()) {
-      if (!decodePipeline(root, decoded.pipelineA, nextId)) {
+      if (!decodePipeline(root, decoded.pipelineA, nextId, pluginIds, error)) {
         return false;
       }
     } else if (root.isObject()) {
@@ -420,15 +437,27 @@ bool StateCodec::decode(const std::string_view json, PluginStateDocument &state,
       }
 
       if (root["pipelineA"].isArray()) {
-        (void)decodePipeline(root["pipelineA"], decoded.pipelineA, nextId);
+        if (!decodePipeline(root["pipelineA"], decoded.pipelineA, nextId, pluginIds,
+                            error)) {
+          return false;
+        }
         if (root["pipelineB"].isArray()) {
-          (void)decodePipeline(root["pipelineB"], decoded.pipelineB, nextId);
+          if (!decodePipeline(root["pipelineB"], decoded.pipelineB, nextId, pluginIds,
+                              error)) {
+            return false;
+          }
           decoded.pipelineBInitialized = true;
         }
       } else if (root["pipeline"].isArray()) {
-        (void)decodePipeline(root["pipeline"], decoded.pipelineA, nextId);
+        if (!decodePipeline(root["pipeline"], decoded.pipelineA, nextId, pluginIds,
+                            error)) {
+          return false;
+        }
       } else if (root["plugins"].isArray()) {
-        (void)decodePipeline(root["plugins"], decoded.pipelineA, nextId);
+        if (!decodePipeline(root["plugins"], decoded.pipelineA, nextId, pluginIds,
+                            error)) {
+          return false;
+        }
       } else {
         if (error != nullptr) {
           *error = "State contains no recognized pipeline";

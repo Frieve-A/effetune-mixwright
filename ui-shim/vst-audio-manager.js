@@ -7,6 +7,7 @@ import {
   packDSPAutomationValue,
   unpackDSPAutomationValue
 } from './js/audio/dsp-params.generated.js';
+import { getPluginExecutionCapabilities } from './js/audio/plugin-execution-capabilities.js';
 
 window.dspParamPackers = DSP_PARAM_PACKERS;
 
@@ -33,6 +34,9 @@ function encodeBase64(bytes) {
 
 function normalizePlugin(plugin, owner) {
   const logical = owner?.getCurrentPipeline?.().find(candidate => candidate.id === plugin.id);
+  const channel = plugin.channel !== undefined ? plugin.channel : (logical?.channel ?? null);
+  const executionCapabilities = getPluginExecutionCapabilities(logical) ||
+    getPluginExecutionCapabilities(plugin);
   const normalized = {
     id: plugin.id,
     type: plugin.type,
@@ -41,8 +45,9 @@ function normalizePlugin(plugin, owner) {
     parameters: plugin.parameters || {},
     inputBus: plugin.inputBus ?? 0,
     outputBus: plugin.outputBus ?? 0,
-    channel: plugin.channel ?? null
+    channel
   };
+  if (executionCapabilities) normalized.executionCapabilities = executionCapabilities;
   if (plugin.wasmParams instanceof Float32Array) {
     normalized.wasmParams = Array.from(plugin.wasmParams);
     normalized.wasmParamsHash = plugin.wasmParamsHash >>> 0;
@@ -118,6 +123,30 @@ function automationTargets(plugin) {
   return targets;
 }
 
+function getAudioOutputChannelCount(owner) {
+  const value = owner?.contextManager?.audioContext?.destination?.channelCount ??
+    owner?.audioContext?.destination?.channelCount;
+  return Number.isInteger(value) && value >= 1 && value <= 8 ? value : 2;
+}
+
+function exposeAudioOutputChannelCount(owner) {
+  const outputChannelCount = getAudioOutputChannelCount(owner);
+  owner.outputChannelCount = outputChannelCount;
+  if (owner.nativeNode) owner.nativeNode.channelCount = outputChannelCount;
+  if (owner.workletNode) owner.workletNode.channelCount = outputChannelCount;
+  return outputChannelCount;
+}
+
+function getPluginParameterOptions(owner, commitSampleRate = false) {
+  const options = {
+    sampleRate: owner?.contextManager?.audioContext?.sampleRate ??
+      owner?.audioContext?.sampleRate ?? 44100,
+    outputChannelCount: exposeAudioOutputChannelCount(owner)
+  };
+  if (commitSampleRate) options.commitSampleRate = true;
+  return options;
+}
+
 class NativePort {
   constructor(owner) {
     this.owner = owner;
@@ -151,8 +180,10 @@ class NativePort {
     // which phase each is registered in is part of that -- see below.
     this.pointerGestureOpen = false;
     // Every automation identity the open pointer gesture has moved, against the
-    // target the close has to name.
+    // target the close has to name. A click-activated effect toggle claims its
+    // target at pointerdown, before its value changes after pointerup.
     this.pointerGestureTargets = new Map();
+    this.pointerGestureCloseTimer = null;
     // Which pointers are down right now, rather than whether any is. A second
     // mouse button pressed and released mid-drag, or a second finger lifting,
     // reports a pointerup of its own while the user is still holding the
@@ -171,6 +202,14 @@ class NativePort {
     // close itself -- it is never trusted to drain on its own.
     this.livePointerIds = new Set();
     this.beginPointerGesture = event => {
+      // A pointerup defers its close through the following click. If another
+      // press somehow arrives first, finish the old interaction instead of
+      // merging two physical gestures into one host touch.
+      if (this.pointerGestureCloseTimer !== null) {
+        clearTimeout(this.pointerGestureCloseTimer);
+        this.pointerGestureCloseTimer = null;
+        this.closePointerGesture();
+      }
       // A primary press starts an interaction, so anything still in the set is
       // the residue of an earlier one whose release was never delivered. A
       // secondary pointer -- a second finger, isPrimary false -- joins the
@@ -178,6 +217,22 @@ class NativePort {
       if (event?.isPrimary !== false) this.livePointerIds.clear();
       this.livePointerIds.add(event?.pointerId ?? 'mouse');
       this.pointerGestureOpen = true;
+
+      // The upstream effect power button applies its value in onclick, which
+      // runs after pointerup. Open an already-bound node-enable parameter now,
+      // while the hand is actually on the button, so the host sees the same
+      // mouse-down/value/mouse-up touch shape it sees for a slider.
+      const target = this.effectToggleAutomationTarget(event);
+      if (target) {
+        const identity = automationDeltaIdentity(target);
+        if (!this.pointerGestureTargets.has(identity)) {
+          this.pointerGestureTargets.set(identity, target);
+          void window.__effetuneHostCall('automation/beginGesture', {
+            targets: [target]
+          }).catch(error =>
+            console.error('[EffeTune Mixwright] automation gesture begin failed', error));
+        }
+      }
     };
     this.endPointerGesture = event => {
       // A mouse reports every one of its buttons under a single pointer id, so
@@ -186,7 +241,20 @@ class NativePort {
       // so a pointer that keeps one is not up at all and stays in the set.
       if (event?.type === 'pointerup' && (event.buttons ?? 0) !== 0) return;
       this.livePointerIds.delete(event?.pointerId ?? 'mouse');
-      if (this.livePointerIds.size === 0) this.closePointerGesture();
+      if (this.livePointerIds.size !== 0) return;
+      if (event?.type !== 'pointerup') {
+        this.closePointerGesture();
+        return;
+      }
+      // DOM activation is pointerdown -> pointerup -> click. Closing here used
+      // to make a toggle's later onclick value a complete zero-duration edit.
+      // The next task is the first point at which that click is guaranteed to
+      // have run; sliders merely keep their existing release semantics with a
+      // sub-frame delay.
+      this.pointerGestureCloseTimer = setTimeout(() => {
+        this.pointerGestureCloseTimer = null;
+        if (this.livePointerIds.size === 0) this.closePointerGesture();
+      }, 0);
     };
     // A window that loses focus can see no pointer event at all, so this closes
     // whatever is still held rather than one pointer of it.
@@ -221,6 +289,27 @@ class NativePort {
     }
   }
 
+  effectToggleAutomationTarget(event) {
+    if (event?.button !== undefined && event.button !== 0) return null;
+    const toggle = event?.target?.closest?.('.toggle-button');
+    if (!toggle || toggle.classList?.contains?.('master-toggle')) return null;
+    const item = toggle.closest?.('.pipeline-item');
+    const pluginId = Number(item?.dataset?.pluginId);
+    if (!Number.isInteger(pluginId)) return null;
+    const pipeline = this.owner.currentPipeline === 'B' ? 'B' : 'A';
+    const plugins = pipeline === 'B' ? this.owner.pipelineB : this.owner.pipelineA;
+    const plugin = plugins?.find(candidate => candidate.id === pluginId);
+    const pluginType = plugin?.type || plugin?.constructor?.name;
+    if (!plugin || typeof pluginType !== 'string' || pluginType.length === 0) return null;
+    return {
+      pipeline,
+      pluginId,
+      pluginType,
+      parameterKey: NODE_ENABLE_DESCRIPTOR.key,
+      elementIndex: NODE_ENABLE_DESCRIPTOR.element
+    };
+  }
+
   // Stamps one automation edit with where it sits inside the touch the user is
   // performing. An edit made with no pointer down -- a keyboard arrow, a typed
   // value, a programmatic change -- is a complete touch of its own, which is
@@ -252,6 +341,10 @@ class NativePort {
   // the touch before the value the user released on reached the host.
   closePointerGesture() {
     if (!this.pointerGestureOpen) return;
+    if (this.pointerGestureCloseTimer !== null) {
+      clearTimeout(this.pointerGestureCloseTimer);
+      this.pointerGestureCloseTimer = null;
+    }
     this.pointerGestureOpen = false;
     // The touch is over however it ended, so no pointer this one recorded is
     // down any more. Leaving one behind would keep the next touch from ever
@@ -289,10 +382,12 @@ class NativePort {
       return;
     }
     if (reason === 'pipeline-master-bypass' && typeof message.masterBypass === 'boolean') {
-      void window.__effetuneHostCall('pipeline/masterBypass', {
+      return window.__effetuneHostCall('pipeline/masterBypass', {
         value: message.masterBypass
-      }).catch(error => console.error('[EffeTune Mixwright] master bypass update failed', error));
-      return;
+      }).catch(error => {
+        console.error('[EffeTune Mixwright] master bypass update failed', error);
+        return { ok: false, error: error?.message || String(error) };
+      });
     }
     if (message.type === 'updatePlugins') {
       const pipeline = this.owner.currentPipeline;
@@ -310,6 +405,7 @@ class NativePort {
         automationEdits: edits.map(edit => edit.payload)
       }).then(result => {
         this.owner.applyHostAutomationDeltas(result.automationDeltas);
+        this.owner.applyNativeExecutionStates?.(result.executionStates);
         if (result.skippedUnsupported && !this.owner.unsupportedWarningShown) {
           this.owner.unsupportedWarningShown = true;
           window.uiManager?.setError?.('Some effects are unavailable and were bypassed.', false);
@@ -320,6 +416,8 @@ class NativePort {
       }).catch(error => {
         this.reconcileAutomationEdits(edits);
         console.error('[EffeTune Mixwright] pipeline rebuild failed', error);
+        if (reason === 'audio-manager-rebuild') throw error;
+        return { ok: false, error: error?.message || String(error) };
       });
     } else if (message.type === 'updatePlugin' && message.plugin) {
       if (this.owner.hostAutomationApplyDepth > 0) return;
@@ -405,7 +503,8 @@ class NativePort {
     const plugins = pipeline === 'B' ? this.owner.pipelineB : this.owner.pipelineA;
     const live = plugins?.find(candidate => candidate.id === pluginId);
     if (!live) return null;
-    const parameters = live.getParameters?.() || live.parameters || {};
+    const parameters = live.getParameters?.(getPluginParameterOptions(this.owner, true)) ||
+      live.parameters || {};
     const payload = typeof live.getWorkletPluginData === 'function'
       ? live.getWorkletPluginData(parameters)
       : {
@@ -430,12 +529,18 @@ class NativePort {
       plugin: this.serializeQueuedPlugin(pipeline, plugin.id) || plugin,
       automationEdits: edits.map(edit => edit.payload)
     }).then(result => {
+      this.owner.applyNativeExecutionStates?.(result.executionStates);
       if (result.rebuildAssets) this.owner.synchronizeNativeAssetMembership();
+      if (result.skippedUnsupported && !this.owner.unsupportedWarningShown) {
+        this.owner.unsupportedWarningShown = true;
+        window.uiManager?.setError?.('Some effects are unavailable and were bypassed.', false);
+      }
       return result;
     })
       .catch(error => {
         this.reconcileAutomationEdits(edits);
         console.error('[EffeTune Mixwright] parameter update failed', error);
+        return { ok: false, error: error?.message || String(error) };
       });
   }
 
@@ -732,12 +837,18 @@ export class AudioManager extends BrowserAudioManager {
     this.ioManager.sourceNode = fakeNode({ postMessage: noop });
     this.telemetryTimer = setInterval(() => this.pollNativeTelemetry(), 1000 / 60);
     this.nativeContextGeneration = 0;
+    this.nativeExecutionStateGeneration = 0;
+    this.pendingNativeExecutionStates = null;
     this.preserveReadyNativePipelineDuringStartup = false;
     this.nativeContextSync = null;
     this.telemetryPoll = null;
     this.telemetryWasHidden = document.hidden;
     this.lastHiddenContextPoll = 0;
     this.latencyServiceTimer = null;
+    this.pipelineCpuAveragePercent = 0;
+    this.lastDispatchedNativeLatencySamples = null;
+    this.lastDispatchedNativeLatencyCompensated = null;
+    this.lastDispatchedPipelineCpuAveragePercent = null;
     this.hostAutomationApplyDepth = 0;
     this.hostDiagnosticTimer = null;
     this.shownHostDiagnostic = null;
@@ -765,6 +876,7 @@ export class AudioManager extends BrowserAudioManager {
         return;
       }
       const result = await window.__effetuneHostCall(hidden ? 'host/getInfo' : 'telemetry/read');
+      this.applyNativePerformanceStatus(result);
       this.applyHostAutomationDeltas(result.automationDeltas);
       this.applyHostDiagnostics(result.diagnostics);
       this.applyNativeBypass(result.masterBypass === true);
@@ -801,7 +913,12 @@ export class AudioManager extends BrowserAudioManager {
       const info = await window.__effetuneHostCall('host/getInfo', { startup: true });
       this.contextManager.audioContext = fakeAudioContext(info.engineSampleRate, info.channels);
       this.nativeContextGeneration = info.contextGeneration || 0;
-      this.preserveReadyNativePipelineDuringStartup = info.dspReady === true;
+      this.preserveReadyNativePipelineDuringStartup =
+        info.dspReady === true && info.stateReplacementPending !== true;
+      this.pendingNativeExecutionStates = this.preserveReadyNativePipelineDuringStartup
+        ? info.executionStates
+        : null;
+      this.applyNativePerformanceStatus(info, false);
       this.applyNativeBypass(info.masterBypass === true);
       this.applyHostAutomationDeltas(info.automationDeltas);
       this.applyHostDiagnostics(info.diagnostics);
@@ -827,6 +944,7 @@ export class AudioManager extends BrowserAudioManager {
     this.audioContext = this.contextManager.audioContext;
     this.workletNode = this.nativeNode;
     this.contextManager.workletNode = this.nativeNode;
+    exposeAudioOutputChannelCount(this);
     this.pipeline = this.getCurrentPipeline();
     window.audioManager = this;
     window.workletNode = this.nativeNode;
@@ -835,11 +953,73 @@ export class AudioManager extends BrowserAudioManager {
     this.pipelineProcessor.setMasterBypass(this.masterBypass);
   }
 
+  applyNativePerformanceStatus(info, dispatch = true) {
+    const currentLatency = Number.isInteger(info?.processingLatencySamples) &&
+      info.processingLatencySamples >= 0
+      ? info.processingLatencySamples
+      : info?.latencySamples;
+    const latencySamples = Number.isInteger(currentLatency) && currentLatency >= 0
+      ? currentLatency
+      : 0;
+    const latencyCompensated = info?.latencyCompensated !== false;
+    this.dspPipelineLatencySamples = latencySamples;
+    this.dspPipelineLatencyCompensated = latencyCompensated;
+    if (dispatch &&
+        (this.lastDispatchedNativeLatencySamples !== latencySamples ||
+         this.lastDispatchedNativeLatencyCompensated !== latencyCompensated)) {
+      this.lastDispatchedNativeLatencySamples = latencySamples;
+      this.lastDispatchedNativeLatencyCompensated = latencyCompensated;
+      this.dispatchEvent('dspLatency', {
+        type: 'dspLatency',
+        samples: latencySamples,
+        sampleRate: this.audioContext?.sampleRate,
+        compensated: latencyCompensated
+      });
+    }
+
+    const cpuAverage = Number.isFinite(info?.pipelineCpuAverage) &&
+      info.pipelineCpuAverage >= 0 ? info.pipelineCpuAverage : 0;
+    this.pipelineCpuAveragePercent = cpuAverage;
+    if (dispatch && this.lastDispatchedPipelineCpuAveragePercent !== cpuAverage) {
+      this.lastDispatchedPipelineCpuAveragePercent = cpuAverage;
+      this.dispatchEvent('pipelineCpuUsage', { average: cpuAverage });
+    }
+  }
+
+  applyNativeExecutionStates(states) {
+    if (!Array.isArray(states)) return;
+    this._resetDspExecutionStateSnapshot();
+    const generation = ++this.nativeExecutionStateGeneration;
+    for (const state of states) {
+      if (!Number.isInteger(state?.pluginId) || typeof state?.pluginType !== 'string' ||
+          !['pending', 'active', 'bypassed'].includes(state?.state)) {
+        continue;
+      }
+      const data = {
+        type: 'dspExecutionState',
+        pluginId: state.pluginId,
+        pluginType: state.pluginType,
+        state: state.state,
+        generation
+      };
+      if (state.state === 'bypassed') data.reason = state.reason;
+      this.handleWorkletMessage({ data }, this.nativeNode);
+    }
+  }
+
   async rebuildPipeline() {
     this.pipeline = this.getCurrentPipeline();
     window.pipeline = this.pipeline;
+    // The upstream execution-state validator matches notifications against
+    // both the logical pipeline and PipelineProcessor's prepared image. The
+    // native override owns rebuildPipeline(), so it must keep that second view
+    // synchronized even when startup deliberately preserves the running DSP.
+    this.pipelineProcessor?.setPipeline?.(this.pipeline);
+    this.pipelineProcessor?.setMasterBypass?.(this.masterBypass);
     if (this.preserveReadyNativePipelineDuringStartup && window.app?.initialized !== true) {
       this.seedRestoredAutomationBaseline();
+      this.applyNativeExecutionStates?.(this.pendingNativeExecutionStates);
+      this.pendingNativeExecutionStates = null;
       // setCurrentPipeline installs membership-based asset target resolvers before
       // restored IR preparation settles. Populate that membership even though the
       // native topology itself must remain untouched during editor reconstruction.
@@ -847,28 +1027,32 @@ export class AudioManager extends BrowserAudioManager {
       this.dispatchEvent?.('audioGraphRebuilt', {});
       return '';
     }
-    const sampleRate = this.audioContext?.sampleRate ?? 44100;
+    const parameterOptions = getPluginParameterOptions(this, true);
     const plugins = this.pipeline.map(plugin => {
-      const parameters = plugin.getParameters({ sampleRate, commitSampleRate: true });
+      const parameters = plugin.getParameters(parameterOptions);
       const payload = typeof plugin.getWorkletPluginData === 'function'
         ? plugin.getWorkletPluginData(parameters)
         : { id: plugin.id, type: plugin.constructor.name, enabled: plugin.enabled, parameters };
       payload.name = plugin.name || payload.name || plugin.constructor.name;
       return payload;
     });
-    this.nativePort.postMessage({
-      type: 'updatePlugins',
-      plugins
-    });
+    try {
+      await this.nativePort.postMessage({
+        type: 'updatePlugins',
+        plugins
+      }, 'audio-manager-rebuild');
+    } catch (error) {
+      return `Audio Error: ${error?.message || String(error)}`;
+    }
     this.dispatchEvent?.('audioGraphRebuilt', {});
     return '';
   }
 
   serializePipeline(pipeline) {
-    const sampleRate = this.audioContext?.sampleRate ?? 44100;
+    const parameterOptions = getPluginParameterOptions(this, true);
     const logicalOwner = { getCurrentPipeline: () => pipeline };
     return pipeline.map(plugin => {
-      const parameters = plugin.getParameters({ sampleRate, commitSampleRate: true });
+      const parameters = plugin.getParameters(parameterOptions);
       const payload = typeof plugin.getWorkletPluginData === 'function'
         ? plugin.getWorkletPluginData(parameters)
         : { id: plugin.id, type: plugin.constructor.name, enabled: plugin.enabled, parameters };
@@ -910,6 +1094,13 @@ export class AudioManager extends BrowserAudioManager {
       // reads as changed and claims an automation slot the user never asked for.
       this.seedRestoredAutomationBaseline();
       this.applyHostAutomationDeltas(result.automationDeltas);
+      if (Array.isArray(result.executionStates)) {
+        this.pipeline = this.getCurrentPipeline();
+        window.pipeline = this.pipeline;
+        this.pipelineProcessor?.setPipeline?.(this.pipeline);
+        this.pipelineProcessor?.setMasterBypass?.(this.masterBypass);
+        this.applyNativeExecutionStates?.(result.executionStates);
+      }
       if (result.skippedUnsupported && !this.unsupportedWarningShown) {
         this.unsupportedWarningShown = true;
         window.uiManager?.setError?.('Some effects are unavailable and were bypassed.', false);
@@ -937,8 +1128,20 @@ export class AudioManager extends BrowserAudioManager {
   }
 
   commitPowerTopologyMutation(message, { reason = '' } = {}) {
-    this.nativePort.postMessage(message, reason);
-    return Promise.resolve(true);
+    return Promise.resolve(this.nativePort.postMessage(message, reason)).then(result => {
+      if (result?.ok !== false) return true;
+      if (!this.nativeTopologyRollbackPending) {
+        this.nativeTopologyRollbackPending = true;
+        window.uiManager?.setError?.(
+          'The pipeline change could not be applied. The previous pipeline was restored.',
+          false
+        );
+        const reload = () => window.location?.reload?.();
+        if (typeof setTimeout === 'function') setTimeout(reload, 0);
+        else reload();
+      }
+      return false;
+    });
   }
 
   registerPipelineProcessors() {}
@@ -952,8 +1155,10 @@ export class AudioManager extends BrowserAudioManager {
     const value = bypass === true;
     if (this.masterBypass === value) return Promise.resolve();
     this.applyNativeBypass(value);
-    this.nativePort.postMessage({ type: 'updatePlugins', masterBypass: value },
-      'pipeline-master-bypass');
+    void this.commitPowerTopologyMutation(
+      { type: 'updatePlugins', masterBypass: value },
+      { reason: 'pipeline-master-bypass' }
+    );
     return Promise.resolve();
   }
 
@@ -974,11 +1179,11 @@ export class AudioManager extends BrowserAudioManager {
     // field seeded from the plug-in's own stale rate reads as a user gesture on
     // the very first full update. commitSampleRate is deliberately omitted --
     // reseeding observes the pipeline, it never mutates it.
-    const sampleRate = this.audioContext?.sampleRate ?? 44100;
+    const parameterOptions = getPluginParameterOptions(this);
     const rememberPipeline = (side, plugins) => {
       for (const plugin of plugins || []) {
         const type = plugin.type || plugin.constructor?.name;
-        const parameters = plugin.getParameters?.({ sampleRate }) || plugin.parameters || {};
+        const parameters = plugin.getParameters?.(parameterOptions) || plugin.parameters || {};
         this.nativePort.rememberAdoptedPlugin(side, {
           id: plugin.id, type, enabled: plugin.enabled, parameters
         });
@@ -1203,6 +1408,7 @@ export class AudioManager extends BrowserAudioManager {
         this.audioContext.destination.channelCount = latest.channels;
         this.audioContext.destination.maxChannelCount = latest.channels;
       }
+      exposeAudioOutputChannelCount(this);
       // The rebuild resolves every rate-derived parameter against the new engine
       // rate while keeping the plug-in ids, so a baseline still describing the
       // old rate would read those untouched targets as gestures and force them
@@ -1220,7 +1426,9 @@ export class AudioManager extends BrowserAudioManager {
     clearTimeout(this.latencyServiceTimer);
     this.latencyServiceTimer = setTimeout(() => {
       this.latencyServiceTimer = null;
-      void window.__effetuneHostCall('host/getInfo').catch(() => {});
+      void window.__effetuneHostCall('host/getInfo')
+        .then(info => this.applyNativePerformanceStatus(info))
+        .catch(() => {});
     }, 250);
   }
 }

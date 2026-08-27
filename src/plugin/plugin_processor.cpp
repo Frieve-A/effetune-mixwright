@@ -34,6 +34,7 @@
 #include <new>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 
 namespace effetune::vst::plugin {
@@ -46,6 +47,19 @@ struct EffeTuneProcessor::ControlServiceTimer {
 };
 
 namespace {
+
+void traceRestartComponent(IComponentHandler &handler, const int32 flags,
+                            const std::uint32_t instance) {
+  const auto tracing = trace::enabled();
+  if (tracing) {
+    trace::restart(instance, trace::Event::restartBegin, flags);
+  }
+  const auto result = handler.restartComponent(flags);
+  if (tracing) {
+    trace::restart(instance, trace::Event::restartEnd, flags,
+                    static_cast<std::int32_t>(result));
+  }
+}
 
 [[nodiscard]] bool hasChannelPointers(const AudioBusBuffers &bus) noexcept {
   if (bus.numChannels < 0 || bus.channelBuffers32 == nullptr) {
@@ -247,6 +261,46 @@ displayedAutomationValue(const AutomationTargetDescriptor &target,
   return value;
 }
 
+[[nodiscard]] bool refreshRuntimeExecutionAdmission(
+    const PipelineState &pipeline, std::vector<RuntimePlugin> &runtimes,
+    const double sampleRate, const std::uint32_t channels) noexcept {
+  auto skipped = false;
+  for (auto &runtime : runtimes) {
+    const auto logical = std::find_if(
+        pipeline.plugins.begin(), pipeline.plugins.end(),
+        [&runtime](const PluginState &candidate) {
+          return candidate.id == runtime.logicalId;
+        });
+    runtime.contextuallyBypassed =
+        logical != pipeline.plugins.end() &&
+        !supportsExecutionContext(runtime.executionCapabilities,
+                                  logical->channel, sampleRate, channels);
+    skipped = skipped || runtime.contextuallyBypassed;
+  }
+  return skipped;
+}
+
+[[nodiscard]] bool exceedsNativeStateCapacity(
+    const PipelineState &pipeline,
+    const std::unordered_map<std::string, KernelInfo> &kernels) {
+  std::size_t nativeInstances = 0;
+  for (const auto &plugin : pipeline.plugins) {
+    try {
+      const auto extra = choc::json::parse(plugin.extraJson);
+      const auto type = extra["type"].getWithDefault<std::string>({});
+      if (!type.empty() && kernels.contains(type) &&
+          ++nativeInstances > kMaxPluginInstances) {
+        return true;
+      }
+    } catch (const choc::json::ParseError &) {
+      // StateCodec produced extraJson, so malformed extras are only possible
+      // in an internally constructed legacy document. They carry no reliable
+      // serialized type and therefore cannot claim a native instance here.
+    }
+  }
+  return false;
+}
+
 } // namespace
 
 EffeTuneProcessor::EffeTuneProcessor()
@@ -304,9 +358,11 @@ tresult PLUGIN_API EffeTuneProcessor::initialize(FUnknown *context) {
   // The UI also owns the canonical JS parameter packers. Keep it alive while
   // the editor is closed so project state can rebuild a playable pipeline.
   try {
-    std::scoped_lock editorLock(editorMutex_);
-    webView_ = std::make_unique<WebViewHost>(
+    auto webView = std::make_shared<WebViewHost>(
         [this](const std::string_view message) { return handleUiMessage(message); });
+    std::scoped_lock editorLock(editorMutex_);
+    editorTerminating_ = false;
+    webView_ = std::move(webView);
   } catch (const std::exception &) {
     // A missing WebView runtime must not prevent the audio component loading;
     // attachEditor() retries and the processor continues with its current DSP.
@@ -349,10 +405,16 @@ tresult PLUGIN_API EffeTuneProcessor::terminate() {
   controlServiceTimer_.reset();
   processingReady_.store(false, std::memory_order_seq_cst);
   waitForAudioQuiescence();
+  std::shared_ptr<WebViewHost> retiredWebView;
   {
     std::scoped_lock editorLock(editorMutex_);
-    webView_.reset();
+    editorTerminating_ = true;
+    retiredWebView = std::move(webView_);
   }
+  if (retiredWebView != nullptr) {
+    retiredWebView->shutdown();
+  }
+  retiredWebView.reset();
   std::scoped_lock resources(processingResourcesMutex_);
   engineOutputBuffer_.clear();
   dryTransitionBuffer_.clear();
@@ -398,6 +460,9 @@ tresult PLUGIN_API EffeTuneProcessor::setActive(const TBool state) {
   const auto result = SingleComponentEffect::setActive(state);
   if (state && (result == kResultOk || result == kResultTrue)) {
     componentActive_.store(true, std::memory_order_release);
+  }
+  if (trace::enabled()) {
+    trace::active(traceInstance_, state != 0, result);
   }
   return result;
 }
@@ -453,6 +518,9 @@ bool EffeTuneProcessor::configureDspLocked(AutomationResourceLock &resources,
     if (!waitForUiRepack) {
       const auto &pipeline =
           snapshot.currentPipeline == 'B' ? snapshot.pipelineB : snapshot.pipelineA;
+      (void)refreshRuntimeExecutionAdmission(
+          pipeline, runtimePlugins_, hostSampleRate * snapshot.oversampling.factor,
+          static_cast<std::uint32_t>(configuredChannels));
       if (!engine_.rebuild(pipeline, runtimePlugins_, error)) {
         return false;
       }
@@ -482,7 +550,15 @@ bool EffeTuneProcessor::configureDspLocked(AutomationResourceLock &resources,
       return false;
     }
     resamplerLatencySamples_.store(resamplerLatency, std::memory_order_release);
+    const auto previousReportedLatency = trace::enabled()
+                                             ? latencySamples_.load(std::memory_order_acquire)
+                                             : 0u;
     latencySamples_.store(totalLatency, std::memory_order_release);
+    if (trace::enabled()) {
+      trace::latency(traceInstance_, trace::Event::latencyPrepared,
+                       previousReportedLatency, totalLatency, engine_.pipelineLatency(),
+                       resamplerLatency, snapshot.oversampling.factor);
+    }
     activeOversamplingFactor_.store(snapshot.oversampling.factor, std::memory_order_release);
     servicedLatencyRevision_.store(engine_.latencyRevision(),
                                    std::memory_order_release);
@@ -574,7 +650,15 @@ bool EffeTuneProcessor::queueDescriptorUpdateLocked(const PipelineState &pipelin
     return false;
   }
   pendingDescriptorCommand_ = std::move(command);
-  descriptorGeneration_.fetch_add(1, std::memory_order_acq_rel);
+  const auto generation = descriptorGeneration_.fetch_add(1, std::memory_order_acq_rel) + 1u;
+  if (trace::enabled()) {
+    trace::descriptor(traceInstance_, trace::Event::descriptorQueued, generation,
+                        static_cast<std::uint32_t>(pipeline.plugins.size()));
+    for (const auto &plugin : pipeline.plugins) {
+      trace::descriptor(traceInstance_, trace::Event::descriptorNode, generation,
+                          plugin.id, plugin.enabled);
+    }
+  }
   return true;
 }
 
@@ -732,6 +816,7 @@ void EffeTuneProcessor::commitPendingControllerWritesLocked() {
     return;
   }
   std::scoped_lock stateLock(stateMutex_);
+  auto activeTopologyChanged = false;
   for (std::size_t index = 0; index < kHostGestureCount; ++index) {
     auto &write = pendingControllerWrites_[index];
     if (!write.pending) {
@@ -757,12 +842,27 @@ void EffeTuneProcessor::commitPendingControllerWritesLocked() {
         target->identity != write.identity) {
       continue;
     }
+    const auto activeNodeEnableToggled =
+        target->applyKind == AutomationApplyKind::nodeEnable &&
+        (target->currentNormalized >= 0.5) != (write.normalized >= 0.5) &&
+        binding->pipeline == state_.currentPipeline;
     adoptAutomationAuthorityLocked(slot, write.normalized);
     (void)applyAutomationValue(state_, *binding, write.normalized);
+    activeTopologyChanged = activeTopologyChanged || activeNodeEnableToggled;
     publishControllerWriteHandoffLocked(index, write.normalized,
                                         write.authorityGeneration);
   }
   controllerWritePending_.store(false, std::memory_order_release);
+  // Registry adoption makes the later automation drain correctly see no new
+  // edge. Queue the descriptor here, after the document rewrite, while the
+  // pre-adoption comparison still tells whether the active graph changed.
+  if (activeTopologyChanged &&
+      processingReady_.load(std::memory_order_seq_cst) &&
+      !stateReplacementPending_.load(std::memory_order_acquire) &&
+      queueDescriptorUpdateLocked(state_.currentPipeline == 'B' ? state_.pipelineB
+                                                                : state_.pipelineA)) {
+    armLatencyNotification();
+  }
 }
 
 void EffeTuneProcessor::commitPendingControllerWritesIfAudioIdle(
@@ -810,65 +910,87 @@ void EffeTuneProcessor::commitPendingControllerWritesIfAudioIdle(
 void EffeTuneProcessor::synchronizeAutomationBindings(const bool notifyHost) {
   // This is the main topology-change path: it runs on every add/remove/reorder/
   // rename/enable while audio is playing and processingReady_ is still true.
-  // Enumerating the eligible targets re-parses every plug-in's JSON, so that
-  // work is done under stateMutex_ alone; only the bounded 256-slot registry
-  // projection stays inside processingResourcesMutex_, which keeps the other
-  // control threads blocked. stateMutex_ is released before
-  // processingResourcesMutex_ is taken, so the established
-  // processingResourcesMutex_ -> stateMutex_ order is never inverted, and every
-  // caller reaches here holding neither lock.
-  std::vector<AutomationTargetDescriptor> eligibleTargets;
-  {
-    std::scoped_lock stateLock(stateMutex_);
-    eligibleTargets = eligibleAutomationTargets(state_);
-  }
-
-  bool slotsChanged = false;
+  // The catalog and its projection are one control transaction. Building the
+  // catalog before taking processingResourcesMutex_ allowed another topology
+  // edit to commit in between, after which the old catalog could be projected
+  // onto the new document and keep a removed target active. The audio callback
+  // never takes this mutex, so keeping the unbounded JSON walk inside the
+  // control-side transaction does not weaken the real-time contract.
+  int32 restartFlags = 0;
   {
     // Leaving this scope releases the lock and only then ends the touches the
     // reconcile retired, so both host calls this function makes -- the endEdit
     // and the restartComponent below -- are issued with the mutex free.
     AutomationResourceLock resources{*this};
-    slotsChanged =
-        reconcileAutomationBindingsLocked(resources, eligibleTargets).slotsChanged;
+    // A restore deliberately keeps the old projection paired with the old
+    // playable runtime until rebuildPipeline installs the replacement as one
+    // generation. A topology update that linearized before setState() may
+    // arrive here after it; in that ordering the restore wins and performs the
+    // next projection itself.
+    if (stateReplacementPending_.load(std::memory_order_acquire)) {
+      return;
+    }
+    restartFlags = reconcileAutomationBindingsLocked(resources);
   }
-  if (notifyHost && slotsChanged) {
+  // An enable click changes topology, but not the bound parameter definition.
+  // Its value is reported by the gesture, just like a packed-parameter edit.
+  // Only an actual metadata change earns a global refresh on this path. Bulk
+  // restores use the value-change flag separately below.
+  if (notifyHost && (restartFlags & RestartFlags::kParamTitlesChanged) != 0) {
     if (auto *handler = getComponentHandler(); handler != nullptr) {
-      (void)handler->restartComponent(RestartFlags::kParamTitlesChanged |
-                                      RestartFlags::kParamValuesChanged);
+      traceRestartComponent(*handler, restartFlags, traceInstance_);
     }
   }
 }
 
 std::optional<std::uint32_t> EffeTuneProcessor::bindAutomationSlot(
-    const AutomationTargetIdentity &identity) {
-  // Enumerating the eligible targets re-parses every plug-in's JSON, which is
-  // unbounded work, and this runs on the first gesture of a Write-enabled knob
-  // while audio is playing. The catalog is therefore built under stateMutex_
-  // alone and then reused for both the bind and the reconcile below, so the
-  // other control threads are not blocked across it. Control-side work is
-  // serialized, so the snapshot cannot go stale across the hand-off, and
-  // stateMutex_ is released before processingResourcesMutex_ is taken, so the
-  // established processingResourcesMutex_ -> stateMutex_ order is never
-  // inverted.
-  std::vector<AutomationTargetDescriptor> eligibleTargets;
-  {
-    std::scoped_lock stateLock(stateMutex_);
-    eligibleTargets = eligibleAutomationTargets(state_);
-  }
-
+    const AutomationTargetIdentity &identity,
+    const std::optional<std::uint64_t> expectedStateEpoch) {
+  // The eligibility decision, binding reservation and projection belong to
+  // one control transaction. Otherwise a topology edit can replace state_
+  // after the catalog is built and the stale target can permanently consume a
+  // host slot. The audio callback never takes processingResourcesMutex_.
   std::optional<std::uint32_t> slot;
   auto capacityExhausted = false;
-  auto slotsChanged = false;
+  int32 restartFlags = 0;
   {
     AutomationResourceLock resources{*this};
+    // setState() keeps the old binding projection alive only so its existing
+    // lanes can finish gestures against the retained playable generation. A
+    // target that owns no lane must wait for the replacement runtime image:
+    // reserving one now would project the restored document onto the old DSP
+    // generation and permanently spend a host slot on a stale page update.
+    if (stateReplacementPending_.load(std::memory_order_acquire) ||
+        (expectedStateEpoch.has_value() &&
+         stateReplacementEpoch_.load(std::memory_order_acquire) !=
+             *expectedStateEpoch)) {
+      return std::nullopt;
+    }
+    AutomationReconcileResult reconcileResult;
     {
       std::scoped_lock stateLock(stateMutex_);
+      const auto eligibleTargets = eligibleAutomationTargets(state_);
+#if defined(EFFETUNE_PROCESSOR_TEST_HOOKS)
+      if (pauseAutomationCatalogBeforeProjectionForTesting_.load(
+              std::memory_order_acquire)) {
+        automationCatalogPausedBeforeProjectionForTesting_.store(
+            true, std::memory_order_release);
+        while (pauseAutomationCatalogBeforeProjectionForTesting_.load(
+            std::memory_order_acquire)) {
+          std::this_thread::yield();
+        }
+        automationCatalogPausedBeforeProjectionForTesting_.store(
+            false, std::memory_order_release);
+      }
+#endif
       slot = bindAutomationTarget(state_, eligibleTargets, identity, capacityExhausted);
+      if (slot.has_value()) {
+        reconcileResult = automationBindings_.reconcile(state_, eligibleTargets);
+      }
     }
     if (slot.has_value()) {
-      slotsChanged =
-          reconcileAutomationBindingsLocked(resources, eligibleTargets).slotsChanged;
+      restartFlags = finishAutomationReconcileLocked(
+          resources, reconcileResult, /*forceCurrentInitialization=*/false);
       // reconcile() is the authority on which slot is actually projected.
       slot = automationBindings_.findActiveSlot(identity);
     }
@@ -877,10 +999,9 @@ std::optional<std::uint32_t> EffeTuneProcessor::bindAutomationSlot(
       !automationCapacityWarningIssued_.exchange(true, std::memory_order_acq_rel)) {
     automationCapacityWarningPending_.store(true, std::memory_order_release);
   }
-  if (slotsChanged) {
+  if (restartFlags != 0) {
     if (auto *handler = getComponentHandler(); handler != nullptr) {
-      (void)handler->restartComponent(RestartFlags::kParamTitlesChanged |
-                                      RestartFlags::kParamValuesChanged);
+      traceRestartComponent(*handler, restartFlags, traceInstance_);
     }
   }
   return slot;
@@ -898,6 +1019,28 @@ EffeTuneProcessor::boundAutomationTarget(const ParamID parameterId) {
   const auto *target = automationBindings_.slot(slot);
   return target == nullptr ? std::nullopt
                            : std::optional<AutomationTargetDescriptor>(*target);
+}
+
+tresult PLUGIN_API EffeTuneProcessor::getParameterInfo(const int32 index,
+                                                       ParameterInfo &info) {
+  const auto result = SingleComponentEffect::getParameterInfo(index, info);
+  if (trace::enabled()) {
+    const auto accepted = result == kResultOk || result == kResultTrue;
+    // A failed query leaves the caller's output untouched; do not read it.
+    trace::parameterInfo(traceInstance_, trace::Event::getParameterInfo, index,
+                          accepted ? info.id : trace::kAllParameters,
+                          accepted ? info.stepCount : 0, accepted ? info.flags : 0,
+                          accepted ? info.defaultNormalizedValue : 0.0, accepted);
+  }
+  return result;
+}
+
+ParamValue PLUGIN_API EffeTuneProcessor::getParamNormalized(const ParamID tag) {
+  const auto value = SingleComponentEffect::getParamNormalized(tag);
+  if (trace::tracksParameter(tag)) {
+    trace::getParamNormalized(traceInstance_, tag, value);
+  }
+  return value;
 }
 
 tresult PLUGIN_API EffeTuneProcessor::getParamStringByValue(
@@ -1080,7 +1223,8 @@ tresult PLUGIN_API EffeTuneProcessor::setParamNormalized(const ParamID tag,
 
 std::optional<std::uint32_t> EffeTuneProcessor::resolveAutomationSlot(
     const AutomationTargetIdentity &identity, const double normalized,
-    const bool bindIfUnbound) {
+    const bool bindIfUnbound,
+    const std::optional<std::uint64_t> expectedStateEpoch) {
   // A value outside the normalized range describes no position of any control,
   // so nothing adopts it and no lane is claimed for it. Every other rejection
   // below is about lanes; this is the only one about the value itself, and it
@@ -1094,6 +1238,11 @@ std::optional<std::uint32_t> EffeTuneProcessor::resolveAutomationSlot(
   std::optional<std::uint32_t> slot;
   {
     std::scoped_lock resources(processingResourcesMutex_);
+    if (expectedStateEpoch.has_value() &&
+        stateReplacementEpoch_.load(std::memory_order_acquire) !=
+            *expectedStateEpoch) {
+      return std::nullopt;
+    }
     slot = automationBindings_.findActiveSlot(identity);
   }
   if (slot.has_value()) {
@@ -1117,7 +1266,7 @@ std::optional<std::uint32_t> EffeTuneProcessor::resolveAutomationSlot(
   // Claiming the lane republishes the whole parameter bank through
   // restartComponent(). It happens before the touch is opened, and never
   // between the touch opening and the first value inside it.
-  return bindAutomationSlot(identity);
+  return bindAutomationSlot(identity, expectedStateEpoch);
 }
 
 EffeTuneProcessor::AutomationEditOutcome EffeTuneProcessor::applyAutomationEdit(
@@ -1149,38 +1298,53 @@ EffeTuneProcessor::AutomationEditOutcome EffeTuneProcessor::applyAutomationEdit(
   return AutomationEditOutcome::bound;
 }
 
-AutomationReconcileResult EffeTuneProcessor::reconcileAutomationBindingsLocked(
+int32 EffeTuneProcessor::reconcileAutomationBindingsLocked(
     AutomationResourceLock &resources, const bool forceCurrentInitialization) {
   AutomationReconcileResult result;
   {
     std::scoped_lock stateLock(stateMutex_);
     const auto eligibleTargets = eligibleAutomationTargets(state_);
+#if defined(EFFETUNE_PROCESSOR_TEST_HOOKS)
+    if (pauseAutomationCatalogBeforeProjectionForTesting_.load(
+            std::memory_order_acquire)) {
+      automationCatalogPausedBeforeProjectionForTesting_.store(
+          true, std::memory_order_release);
+      while (pauseAutomationCatalogBeforeProjectionForTesting_.load(
+          std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      automationCatalogPausedBeforeProjectionForTesting_.store(
+          false, std::memory_order_release);
+    }
+#endif
     result = automationBindings_.reconcile(state_, eligibleTargets);
   }
-  finishAutomationReconcileLocked(resources, result, forceCurrentInitialization);
-  return result;
+  return finishAutomationReconcileLocked(resources, result,
+                                          forceCurrentInitialization);
 }
 
-AutomationReconcileResult EffeTuneProcessor::reconcileAutomationBindingsLocked(
-    AutomationResourceLock &resources,
-    const std::span<const AutomationTargetDescriptor> eligibleTargets,
-    const bool forceCurrentInitialization) {
-  AutomationReconcileResult result;
-  {
-    std::scoped_lock stateLock(stateMutex_);
-    result = automationBindings_.reconcile(state_, eligibleTargets);
-  }
-  finishAutomationReconcileLocked(resources, result, forceCurrentInitialization);
-  return result;
-}
-
-void EffeTuneProcessor::finishAutomationReconcileLocked(
-    AutomationResourceLock &resources, AutomationReconcileResult &result,
+int32 EffeTuneProcessor::finishAutomationReconcileLocked(
+    AutomationResourceLock &resources, const AutomationReconcileResult &result,
     const bool forceCurrentInitialization) {
   const auto metadataChanged = automationParameters_.apply(automationBindings_);
+  if (metadataChanged && trace::enabled()) {
+    // Read the bank directly: these are our published values, not host queries.
+    for (int32 index = 0; index < parameters.getParameterCount(); ++index) {
+      const auto *parameter = parameters.getParameterByIndex(index);
+      const auto &info = parameter->getInfo();
+      trace::parameterInfo(traceInstance_, trace::Event::parameterInfoPublished,
+                            index, info.id, info.stepCount, info.flags,
+                            info.defaultNormalizedValue, true);
+    }
+  }
   configureAutomationSchedulerLocked(resources, forceCurrentInitialization);
   publishAutomationApplyTableLocked();
-  result.slotsChanged = result.slotsChanged || metadataChanged;
+  // Registry slots include currentNormalized, so slotsChanged alone cannot
+  // establish that the host's cached ParameterInfo became invalid.
+  if (metadataChanged) {
+    return RestartFlags::kParamTitlesChanged | RestartFlags::kParamValuesChanged;
+  }
+  return result.slotsChanged ? RestartFlags::kParamValuesChanged : 0;
 }
 
 void EffeTuneProcessor::configureAutomationSchedulerLocked(
@@ -1495,7 +1659,26 @@ void EffeTuneProcessor::drainAutomationValues() {
   if (!activeTopologyChanged || !processingReady_.load(std::memory_order_seq_cst)) {
     return;
   }
+#if defined(EFFETUNE_PROCESSOR_TEST_HOOKS)
+  if (pauseAutomationDrainBeforeDescriptorForTesting_.load(
+          std::memory_order_acquire)) {
+    automationDrainPausedBeforeDescriptorForTesting_.store(
+        true, std::memory_order_release);
+    while (pauseAutomationDrainBeforeDescriptorForTesting_.load(
+        std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    automationDrainPausedBeforeDescriptorForTesting_.store(
+        false, std::memory_order_release);
+  }
+#endif
   std::scoped_lock descriptorResources(processingResourcesMutex_);
+  // setState() can publish a replacement after the first under-lock recheck
+  // and while the unbounded document rewrite runs without this mutex. Do not
+  // encode that replacement into a descriptor for the old runtime generation.
+  if (stateReplacementPending_.load(std::memory_order_acquire)) {
+    return;
+  }
   std::scoped_lock descriptorState(stateMutex_);
   if (queueDescriptorUpdateLocked(state_.currentPipeline == 'B' ? state_.pipelineB
                                                                 : state_.pipelineA)) {
@@ -1559,6 +1742,63 @@ void EffeTuneProcessor::appendActiveAutomationSnapshot(choc::value::Value &resul
   }
   automationDeltaPending_.store(false, std::memory_order_release);
   result.addMember("automationDeltas", std::move(deltas));
+}
+
+void EffeTuneProcessor::appendExecutionStates(choc::value::Value &result) {
+  auto states = choc::value::createEmptyArray();
+  std::scoped_lock runtimeState(processingResourcesMutex_, stateMutex_);
+  // Host-context publication also owns processingResourcesMutex_, so reading
+  // after taking it keeps the reason paired with the admission flags below.
+  const auto context = readHostContext();
+  const auto &pipeline = state_.currentPipeline == 'B' ? state_.pipelineB
+                                                       : state_.pipelineA;
+  for (const auto &logical : pipeline.plugins) {
+    if (isSectionPlugin(logical)) {
+      continue;
+    }
+
+    const auto runtime = std::find_if(
+        runtimePlugins_.begin(), runtimePlugins_.end(),
+        [&logical](const RuntimePlugin &candidate) {
+          return candidate.logicalId == logical.id;
+        });
+    auto pluginType = runtime != runtimePlugins_.end() ? runtime->type
+                                                       : std::string{};
+    if (pluginType.empty()) {
+      try {
+        const auto extra = choc::json::parse(logical.extraJson);
+        pluginType = extra["type"].getWithDefault<std::string>({});
+      } catch (const choc::json::ParseError &) {
+        // StateCodec owns this JSON. A malformed legacy extra has no stable
+        // identity to route back to a WebView plug-in, so omit it.
+      }
+    }
+    if (pluginType.empty()) {
+      continue;
+    }
+
+    auto encoded = choc::value::createObject({});
+    encoded.addMember("pluginId", static_cast<std::int64_t>(logical.id));
+    encoded.addMember("pluginType", pluginType);
+    if (runtime == runtimePlugins_.end()) {
+      encoded.addMember("state", "bypassed");
+      encoded.addMember("reason", "wasmUnavailable");
+    } else if (!runtime->contextuallyBypassed) {
+      encoded.addMember("state", "active");
+    } else {
+      encoded.addMember("state", "bypassed");
+      const auto support = executionContextSupport(
+          runtime->executionCapabilities, logical.channel,
+          context.engineSampleRate, context.channels);
+      encoded.addMember(
+          "reason",
+          support == ExecutionContextSupport::unsupportedSampleRate
+              ? "unsupportedSampleRate"
+              : "unsupportedChannelMode");
+    }
+    states.addArrayElement(std::move(encoded));
+  }
+  result.addMember("executionStates", std::move(states));
 }
 
 void EffeTuneProcessor::appendDeferredDiagnostics(choc::value::Value &result) {
@@ -1684,7 +1924,7 @@ bool EffeTuneProcessor::performHostEditTransaction(
     return false;
   }
   const auto gestureIndex = hostGestureIndex(parameterId);
-  const auto previous = getParamNormalized(parameterId);
+  const auto previous = SingleComponentEffect::getParamNormalized(parameterId);
   if (tracing) {
     trace::txnBegin(traceInstance_, parameterId, normalized, previous, beginGesture,
                     endGesture);
@@ -1702,40 +1942,14 @@ bool EffeTuneProcessor::performHostEditTransaction(
   // host already believes is being held.
   if (beginGesture && gestureIndex != kNoHostGestureIndex &&
       !hostGestureOpen_[gestureIndex].load(std::memory_order_seq_cst)) {
-    hostGestureOpen_[gestureIndex].store(true, std::memory_order_seq_cst);
-    if (tracing) {
-      trace::touchOpened(traceInstance_, parameterId, previous);
-    }
-    const auto beginResult = beginEdit(parameterId);
-    if (tracing) {
-      trace::hostEdit(traceInstance_, trace::Event::hostBeginEdit, parameterId,
-                      previous, static_cast<std::int32_t>(beginResult));
-    }
-    if (!accepted(beginResult)) {
-      hostGestureOpen_[gestureIndex].store(false, std::memory_order_seq_cst);
+    if (!openHostGesture(gestureIndex, parameterId, previous)) {
       if (tracing) {
-        trace::touchClosed(traceInstance_, parameterId, false);
         trace::txnEnd(traceInstance_, parameterId, normalized, previous, traceFlags);
       }
       return false;
     }
     traceFlags |= trace::kFlagOpenedHere;
     openedHere = true;
-    // The value the parameter held immediately before the hand arrived, stated
-    // once at the open. Two host models fit the measured Sonar traces -- one
-    // where a value equal to the lane's own creates no point, so a host that
-    // punches in needs nothing from us, and one where the punch-in takes the
-    // parameter's current value and the next performEdit of the same automation
-    // tick overwrites it. This call is inert under the first, redundant under
-    // the second, and is what puts a point at the punch-in position under a
-    // host that does neither. Its answer says nothing about the user's value,
-    // which has not been offered yet, so it is not folded into `success`.
-    const auto anchorResult = performEdit(parameterId, previous);
-    if (tracing) {
-      trace::hostEdit(traceInstance_, trace::Event::hostPerformEdit, parameterId,
-                      previous, static_cast<std::int32_t>(anchorResult));
-    }
-    (void)anchorResult;
   }
   // The base class, deliberately, and not our own override. This transaction is
   // the host-facing half of an edit and nothing else: the caller adopts the
@@ -1794,6 +2008,74 @@ bool EffeTuneProcessor::performHostEditTransaction(
     trace::txnEnd(traceInstance_, parameterId, normalized, previous, traceFlags);
   }
   return success;
+}
+
+bool EffeTuneProcessor::openHostGesture(const std::size_t index,
+                                        const ParamID parameterId,
+                                        const double previous) noexcept {
+  if (index >= kHostGestureCount) {
+    return false;
+  }
+  if (hostGestureOpen_[index].load(std::memory_order_seq_cst)) {
+    return true;
+  }
+
+  hostGestureOpen_[index].store(true, std::memory_order_seq_cst);
+  const auto tracing = trace::enabled();
+  if (tracing) {
+    trace::touchOpened(traceInstance_, parameterId, previous);
+  }
+  const auto beginResult = beginEdit(parameterId);
+  if (tracing) {
+    trace::hostEdit(traceInstance_, trace::Event::hostBeginEdit, parameterId,
+                    previous, static_cast<std::int32_t>(beginResult));
+  }
+  const auto accepted = beginResult == kResultOk || beginResult == kResultTrue;
+  if (!accepted) {
+    hostGestureOpen_[index].store(false, std::memory_order_seq_cst);
+    if (tracing) {
+      trace::touchClosed(traceInstance_, parameterId, false);
+    }
+    return false;
+  }
+
+  // State the value the parameter held when the hand arrived. This is the same
+  // punch-in anchor used by an ordinary value-led gesture, but pointerdown can
+  // now place it before a click-activated control reports its changed value.
+  const auto anchorResult = performEdit(parameterId, previous);
+  if (tracing) {
+    trace::hostEdit(traceInstance_, trace::Event::hostPerformEdit, parameterId,
+                    previous, static_cast<std::int32_t>(anchorResult));
+  }
+  return true;
+}
+
+void EffeTuneProcessor::reportHostEditToOpenGesture(
+    const ParamID parameterId, const double normalized,
+    const bool endGesture) noexcept {
+  if (!std::isfinite(normalized) || normalized < 0.0 || normalized > 1.0) {
+    return;
+  }
+  const auto gestureIndex = hostGestureIndex(parameterId);
+  if (gestureIndex == kNoHostGestureIndex ||
+      !hostGestureOpen_[gestureIndex].load(std::memory_order_seq_cst)) {
+    return;
+  }
+  // Preserve the ordinary sub-block hold rule for a touch that genuinely
+  // predates the restore, but deliberately skip setParamNormalized(): this
+  // stale value belongs only in the host's old touch, never in the restored
+  // Parameter, registry or scheduler.
+  if (!holdHostEditValue(gestureIndex, normalized, /*atOpen=*/false)) {
+    const auto result = performEdit(parameterId, normalized);
+    if (trace::enabled()) {
+      trace::hostEdit(traceInstance_, trace::Event::hostPerformEdit, parameterId,
+                      normalized, static_cast<std::int32_t>(result));
+    }
+  }
+  if (endGesture &&
+      hostGestureOpen_[gestureIndex].load(std::memory_order_seq_cst)) {
+    (void)closeHostGesture(gestureIndex);
+  }
 }
 
 bool EffeTuneProcessor::holdHostEditValue(const std::size_t index,
@@ -2183,6 +2465,40 @@ tresult PLUGIN_API EffeTuneProcessor::process(ProcessData &data) {
     BlockEpochScope &operator=(const BlockEpochScope &) = delete;
     ~BlockEpochScope() noexcept { epoch.fetch_add(1, std::memory_order_seq_cst); }
   } const blockEpoch{processBlockEpoch_};
+  // Match the upstream AudioWorklet CPU meter: average this instance's whole
+  // callback time over approximately one second of rendered audio. The scope
+  // owns every return path, performs no allocation or locking, and publishes a
+  // fixed-point atomic value for the control side to read.
+  struct PipelineCpuMeasurementScope {
+    std::chrono::steady_clock::time_point startedAt;
+    Steinberg::int32 frames;
+    double sampleRate;
+    double &audioSeconds;
+    std::chrono::steady_clock::duration &elapsed;
+    std::atomic<std::uint32_t> &publishedHundredths;
+
+    ~PipelineCpuMeasurementScope() noexcept {
+      if (frames <= 0 || !std::isfinite(sampleRate) || sampleRate <= 0.0) {
+        return;
+      }
+      elapsed += std::chrono::steady_clock::now() - startedAt;
+      audioSeconds += static_cast<double>(frames) / sampleRate;
+      if (audioSeconds < 1.0) {
+        return;
+      }
+      const auto elapsedSeconds = std::chrono::duration<double>(elapsed).count();
+      const auto hundredths = std::clamp(
+          std::round(elapsedSeconds * 10000.0 / audioSeconds), 0.0,
+          static_cast<double>(std::numeric_limits<std::uint32_t>::max()));
+      publishedHundredths.store(static_cast<std::uint32_t>(hundredths),
+                                std::memory_order_release);
+      audioSeconds = 0.0;
+      elapsed = {};
+    }
+  } const pipelineCpuMeasurement{
+      std::chrono::steady_clock::now(), data.numSamples,
+      hostSampleRate_.load(std::memory_order_acquire), pipelineCpuAudioSeconds_,
+      pipelineCpuElapsed_, pipelineCpuAverageHundredths_};
   // A control thread is rebuilding the block timeline this callback would
   // touch before it ever reaches the processing gate. Nothing below is safe to
   // run against that, and nothing is lost either: the scheduler and the output
@@ -2650,7 +2966,7 @@ void EffeTuneProcessor::notifyLatencyChange(const uint32 previousLatency) {
     return;
   }
   if (auto *handler = getComponentHandler(); handler != nullptr) {
-    (void)handler->restartComponent(RestartFlags::kLatencyChanged);
+    traceRestartComponent(*handler, RestartFlags::kLatencyChanged, traceInstance_);
     latencyDebounceArmed_.store(false, std::memory_order_release);
     latencyNotificationPending_.store(false, std::memory_order_release);
   }
@@ -2670,6 +2986,14 @@ void EffeTuneProcessor::queueLatencyNotification(const bool restartDebounce) {
   if (restartDebounce || !latencyDebounceArmed_.load(std::memory_order_acquire)) {
     armLatencyNotification();
   }
+}
+
+std::uint32_t EffeTuneProcessor::processingLatencySamples() const noexcept {
+  const auto oversamplingFactor =
+      std::max(activeOversamplingFactor_.load(std::memory_order_acquire), 1u);
+  return calculateTotalLatency(
+      resamplerLatencySamples_.load(std::memory_order_acquire), oversamplingFactor,
+      engine_.pipelineLatency());
 }
 
 bool EffeTuneProcessor::synchronizeLatencyLocked(bool &latencyChanged) {
@@ -2693,6 +3017,12 @@ bool EffeTuneProcessor::synchronizeLatencyLocked(bool &latencyChanged) {
   recordPipelinePlanRefreshOutcome(true);
   latencySamples_.store(next, std::memory_order_release);
   latencyChanged = previous != next;
+  if (trace::enabled()) {
+    trace::latency(traceInstance_, trace::Event::latencySynced, previous, next,
+                     engine_.pipelineLatency(),
+                     resamplerLatencySamples_.load(std::memory_order_acquire),
+                     activeOversamplingFactor_.load(std::memory_order_acquire));
+  }
   return true;
 }
 
@@ -2888,6 +3218,7 @@ void EffeTuneProcessor::serviceLatencyUpdates(const bool restartDebounce) {
       std::uint64_t appliedRevision = 0;
       std::string error;
       auto applied = false;
+      const auto previousPipelineLatency = trace::enabled() ? engine_.pipelineLatency() : 0u;
 #if defined(EFFETUNE_PROCESSOR_TEST_HOOKS)
       if (pipelinePlanRefreshFailuresForTesting_ != 0) {
         --pipelinePlanRefreshFailuresForTesting_;
@@ -2896,6 +3227,10 @@ void EffeTuneProcessor::serviceLatencyUpdates(const bool restartDebounce) {
       if (pendingDescriptorCommand_.has_value()) {
         applied = engine_.applyDescriptorCommand(*pendingDescriptorCommand_,
                                                  appliedRevision, &error);
+      }
+      if (trace::enabled()) {
+        trace::descriptorApplied(traceInstance_, descriptorGeneration,
+                                   previousPipelineLatency, engine_.pipelineLatency(), applied);
       }
       if (!applied) {
         failedDescriptorGeneration_ = descriptorGeneration;
@@ -3006,7 +3341,7 @@ void EffeTuneProcessor::serviceLatencyUpdates(const bool restartDebounce) {
   latencyDebounceArmed_.store(false, std::memory_order_release);
   if (latencyNotificationPending_.exchange(false, std::memory_order_acq_rel)) {
     if (auto *handler = getComponentHandler(); handler != nullptr) {
-      (void)handler->restartComponent(RestartFlags::kLatencyChanged);
+      traceRestartComponent(*handler, RestartFlags::kLatencyChanged, traceInstance_);
     }
   }
 }
@@ -3015,6 +3350,11 @@ tresult PLUGIN_API EffeTuneProcessor::setState(IBStream *stream) {
   std::string json;
   PluginStateDocument decoded;
   if (!readStream(stream, json) || !StateCodec::decode(json, decoded)) {
+    return kResultFalse;
+  }
+  if (exceedsNativeStateCapacity(decoded.pipelineA, engine_.kernels()) ||
+      (decoded.pipelineBInitialized &&
+       exceedsNativeStateCapacity(decoded.pipelineB, engine_.kernels()))) {
     return kResultFalse;
   }
   // A restore replaces the pipeline the user's hand was on and then destroys
@@ -3047,18 +3387,25 @@ tresult PLUGIN_API EffeTuneProcessor::setState(IBStream *stream) {
     }
     // The decoded document is now the save/UI authority, but every object the
     // audio callback reads still belongs to the old generation. Publishing the
-    // marker last lets the drain's under-lock recheck distinguish those worlds.
+    // monotonic epoch and marker last lets an update that outlives the complete
+    // pending true -> false cycle distinguish those worlds.
+    stateReplacementEpoch_.fetch_add(1, std::memory_order_release);
+    replacementPageAuthorized_ = false;
     stateReplacementPending_.store(true, std::memory_order_release);
   }
   // The host-facing Parameter may reflect the restored chunk immediately. The
   // override sees the pending marker and deliberately leaves the old bypass
   // atomic and scheduler untouched until the runtime replacement arrives.
   setParamNormalized(kBypassParameterId, restoredBypass ? 1.0 : 0.0);
+  std::shared_ptr<WebViewHost> webView;
   {
     std::scoped_lock editorLock(editorMutex_);
-    if (webView_ != nullptr) {
-      (void)webView_->evaluate("window.location.reload();", {});
+    if (!editorTerminating_) {
+      webView = webView_;
     }
+  }
+  if (webView != nullptr) {
+    (void)webView->evaluate("window.location.reload();", {});
   }
   return kResultOk;
 }
@@ -3092,7 +3439,11 @@ tresult PLUGIN_API EffeTuneProcessor::getState(IBStream *stream) {
 }
 
 uint32 PLUGIN_API EffeTuneProcessor::getLatencySamples() {
-  return latencySamples_.load(std::memory_order_acquire);
+  const auto latency = latencySamples_.load(std::memory_order_acquire);
+  if (trace::enabled()) {
+    trace::latencyRead(traceInstance_, latency);
+  }
+  return latency;
 }
 
 tresult PLUGIN_API EffeTuneProcessor::setAutomationState(const int32 state) {
@@ -3120,25 +3471,52 @@ IPlugView *PLUGIN_API EffeTuneProcessor::createView(const FIDString name) {
 bool EffeTuneProcessor::attachEditor(void *owner, void *parent,
                                      const std::int32_t width,
                                      const std::int32_t height) {
-  std::scoped_lock editorLock(editorMutex_);
+  std::shared_ptr<WebViewHost> webView;
   try {
-    if (webView_ == nullptr) {
-      webView_ = std::make_unique<WebViewHost>(
-          [this](const std::string_view message) { return handleUiMessage(message); });
+    {
+      std::scoped_lock editorLock(editorMutex_);
+      if (editorTerminating_) {
+        return false;
+      }
+      webView = webView_;
     }
-    return webView_->attach(owner, parent, width, height);
+    if (webView == nullptr) {
+      auto created = std::make_shared<WebViewHost>(
+          [this](const std::string_view message) {
+            return handleUiMessage(message);
+          });
+      std::scoped_lock editorLock(editorMutex_);
+      if (!editorTerminating_ && webView_ == nullptr) {
+        webView_ = created;
+      }
+      webView = webView_;
+    }
+    if (webView == nullptr) {
+      return false;
+    }
+    return webView->attach(owner, parent, width, height);
   } catch (const std::exception &) {
-    webView_.reset();
+    {
+      std::scoped_lock editorLock(editorMutex_);
+      if (webView_ == webView) {
+        webView_.reset();
+      }
+    }
+    webView.reset();
     return false;
   }
 }
 
 void EffeTuneProcessor::detachEditor(void *owner) noexcept {
+  std::shared_ptr<WebViewHost> webView;
   {
     std::scoped_lock editorLock(editorMutex_);
-    if (webView_ != nullptr) {
-      webView_->detach(owner);
+    if (!editorTerminating_) {
+      webView = webView_;
     }
+  }
+  if (webView != nullptr) {
+    webView->detach(owner);
   }
   // The editor is the only thing that can hold a touch open, and it is gone.
   // Its own pointer-release path can no longer run, so this is the last chance
@@ -3148,9 +3526,15 @@ void EffeTuneProcessor::detachEditor(void *owner) noexcept {
 
 void EffeTuneProcessor::resizeEditor(void *owner, const std::int32_t width,
                                      const std::int32_t height) noexcept {
-  std::scoped_lock editorLock(editorMutex_);
-  if (webView_ != nullptr) {
-    webView_->resize(owner, width, height);
+  std::shared_ptr<WebViewHost> webView;
+  {
+    std::scoped_lock editorLock(editorMutex_);
+    if (!editorTerminating_) {
+      webView = webView_;
+    }
+  }
+  if (webView != nullptr) {
+    webView->resize(owner, width, height);
   }
 }
 
@@ -3196,12 +3580,57 @@ namespace {
 
 std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
   const trace::ScopedRole traceRole{trace::Role::ui};
+  std::uint64_t requestStateEpoch = 0;
+  std::uint64_t requestPageGeneration = 0;
+  auto requestStartedDuringStateReplacement = false;
+  requestStateEpoch = stateReplacementEpoch_.load(std::memory_order_acquire);
+  requestPageGeneration = uiPageGeneration_.load(std::memory_order_acquire);
+  requestStartedDuringStateReplacement =
+      stateReplacementPending_.load(std::memory_order_acquire);
   RoutedUiMessage message;
   std::string error;
   if (!MessageRouter::decode(request, message, &error)) {
     return bridgeResult(false, error);
   }
   drainAutomationValues();
+
+  const auto pauseBulkRequestBeforeCommitForTesting = [this] {
+#if defined(EFFETUNE_PROCESSOR_TEST_HOOKS)
+    if (pauseNextBulkRequestBeforeCommitForTesting_.exchange(
+            false, std::memory_order_acq_rel)) {
+      bulkRequestPausedBeforeCommitForTesting_.store(true,
+                                                     std::memory_order_release);
+      while (!releaseBulkRequestBeforeCommitForTesting_.load(
+          std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      bulkRequestPausedBeforeCommitForTesting_.store(false,
+                                                     std::memory_order_release);
+      releaseBulkRequestBeforeCommitForTesting_.store(false,
+                                                      std::memory_order_release);
+    }
+#endif
+  };
+  // Callers hold processingResourcesMutex_. A bulk request is allowed to
+  // commit only into the state and page generation in which it entered the
+  // bridge; observing the same instantaneous pending flag is insufficient
+  // because a complete restore can make it false again.
+  const auto bulkRequestCrossedGenerationLocked = [&] {
+    return stateReplacementEpoch_.load(std::memory_order_acquire) !=
+               requestStateEpoch ||
+           uiPageGeneration_.load(std::memory_order_acquire) !=
+               requestPageGeneration;
+  };
+  const auto authorizedReplacementRequestLocked = [&] {
+    return requestStartedDuringStateReplacement &&
+           stateReplacementPending_.load(std::memory_order_acquire) &&
+           replacementPageAuthorized_ &&
+           replacementPageStateEpoch_ ==
+               stateReplacementEpoch_.load(std::memory_order_acquire) &&
+           replacementPageGeneration_ ==
+               uiPageGeneration_.load(std::memory_order_acquire) &&
+           !bulkRequestCrossedGenerationLocked();
+  };
 
   if (message.action == UiAction::hostInfo) {
     // A page announcing its own startup is the boundary a state restore cannot
@@ -3216,6 +3645,17 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     // is unconditional and cannot be missed by a race between the two.
     if (message.startupHandshake) {
       closeOpenHostGestures();
+      std::scoped_lock resources(processingResourcesMutex_);
+      const auto pageGeneration =
+          uiPageGeneration_.fetch_add(1, std::memory_order_release) + 1;
+      if (stateReplacementPending_.load(std::memory_order_acquire)) {
+        replacementPageGeneration_ = pageGeneration;
+        replacementPageStateEpoch_ =
+            stateReplacementEpoch_.load(std::memory_order_acquire);
+        replacementPageAuthorized_ = true;
+      } else {
+        replacementPageAuthorized_ = false;
+      }
     }
     serviceLatencyUpdates();
     const auto context = readHostContext();
@@ -3238,12 +3678,25 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     if (oversampling.quality == FilterQuality::high) quality = "high";
     if (oversampling.quality == FilterQuality::ultra) quality = "ultra";
     result.addMember("oversamplingQuality", quality);
-    result.addMember("latencySamples", static_cast<std::int64_t>(latencySamples_.load()));
+    const auto reportedLatency = latencySamples_.load(std::memory_order_acquire);
+    const auto processingLatency = processingLatencySamples();
+    result.addMember("latencySamples", static_cast<std::int64_t>(reportedLatency));
+    result.addMember("processingLatencySamples",
+                     static_cast<std::int64_t>(processingLatency));
+    result.addMember("latencyCompensated", processingLatency == reportedLatency);
+    result.addMember(
+        "pipelineCpuAverage",
+        static_cast<double>(pipelineCpuAverageHundredths_.load(std::memory_order_acquire)) /
+            100.0);
     result.addMember("masterBypass", bypass_.load(std::memory_order_acquire));
     result.addMember("dspReady", processingReady_.load(std::memory_order_seq_cst));
+    result.addMember(
+        "stateReplacementPending",
+        stateReplacementPending_.load(std::memory_order_acquire));
     result.addMember("contextGeneration",
                      static_cast<std::int64_t>(context.generation));
     result.addMember("version", std::string(EFFETUNE_PLUGIN_VERSION_STR));
+    appendExecutionStates(result);
     appendAutomationDeltas(result);
     appendDeferredDiagnostics(result);
     return choc::json::toString(result);
@@ -3281,6 +3734,16 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
                      static_cast<std::int64_t>(context.generation));
     result.addMember("engineSampleRate", context.engineSampleRate);
     result.addMember("channels", static_cast<std::int64_t>(context.channels));
+    const auto reportedLatency = latencySamples_.load(std::memory_order_acquire);
+    const auto processingLatency = processingLatencySamples();
+    result.addMember("latencySamples", static_cast<std::int64_t>(reportedLatency));
+    result.addMember("processingLatencySamples",
+                     static_cast<std::int64_t>(processingLatency));
+    result.addMember("latencyCompensated", processingLatency == reportedLatency);
+    result.addMember(
+        "pipelineCpuAverage",
+        static_cast<double>(pipelineCpuAverageHundredths_.load(std::memory_order_acquire)) /
+            100.0);
     result.addMember("packet", bytes == 0
                                    ? std::string{}
                                    : choc::base64::encodeToString(telemetryScratch_.data(), bytes));
@@ -3576,6 +4039,30 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     return automationEditResult(outcome == AutomationEditOutcome::bound);
   }
 
+  if (message.action == UiAction::beginAutomationGesture) {
+    // The pointer is down on a click-activated control, but the click carrying
+    // its new value has not happened yet. Only an existing binding can be
+    // opened here: merely pressing an unbound control must not permanently
+    // consume a finite automation slot or create a lane before a value changes.
+    const ScopedHostGroupEdit group{*this, message.automationEdits.size() > 1u,
+                                    traceInstance_};
+    for (const auto &target : message.automationEdits) {
+      std::optional<std::uint32_t> slot;
+      {
+        std::scoped_lock resources(processingResourcesMutex_);
+        slot = automationBindings_.findActiveSlot(
+            {target.pipeline, target.pluginId, target.pluginType,
+             target.parameterKey, target.elementIndex});
+      }
+      if (slot.has_value()) {
+        const auto parameterId = automationParameterId(*slot);
+        (void)openHostGesture(*slot, parameterId,
+                              SingleComponentEffect::getParamNormalized(parameterId));
+      }
+    }
+    return bridgeResult(true);
+  }
+
   if (message.action == UiAction::endAutomationGesture) {
     // The user released the pointer. Every target the gesture moved has to stop
     // being reported as held, or the host keeps believing the hand is on the
@@ -3607,8 +4094,12 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
   }
 
   if (message.action == UiAction::setOversampling) {
+    OversamplingSettings previousOversampling;
+    const auto previousProcessingReady =
+        processingReady_.load(std::memory_order_seq_cst);
     {
       std::scoped_lock stateLock(stateMutex_);
+      previousOversampling = state_.oversampling;
       state_.oversampling = message.oversampling;
     }
     const auto previousLatency = latencySamples_.load(std::memory_order_acquire);
@@ -3617,11 +4108,35 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
               hostSampleRate_.load(std::memory_order_acquire),
               maxHostFrames_.load(std::memory_order_acquire),
               configuredChannels_.load(std::memory_order_acquire), &error)) {
+        {
+          std::scoped_lock stateLock(stateMutex_);
+          state_.oversampling = previousOversampling;
+        }
+        std::string restoreError;
+        AutomationResourceLock resources{*this};
+        EngineMutationWindow restoreWindow{*this};
+        const auto restored = configureDspLocked(
+            resources, &restoreError,
+            /*waitForUiRepack=*/!previousProcessingReady);
+        restoreWindow.setRestoreOnClose(previousProcessingReady && restored);
         return bridgeResult(false, error);
       }
       notifyLatencyChange(previousLatency);
     }
-    return bridgeResult(true);
+    auto result = choc::value::createObject({});
+    result.addMember("ok", true);
+    result.addMember("success", true);
+    {
+      std::scoped_lock resources(processingResourcesMutex_);
+      if (std::any_of(runtimePlugins_.begin(), runtimePlugins_.end(),
+                      [](const RuntimePlugin &runtime) {
+                        return runtime.contextuallyBypassed;
+                      })) {
+        result.addMember("skippedUnsupported", true);
+      }
+    }
+    appendExecutionStates(result);
+    return choc::json::toString(result);
   }
 
   const auto decodePipeline = [this](std::vector<RoutedPlugin> &source,
@@ -3630,7 +4145,8 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     pipeline.plugins.reserve(source.size());
     runtimes.reserve(source.size());
     for (auto &plugin : source) {
-      if (!plugin.runtime.type.empty() && engine_.kernels().contains(plugin.runtime.type)) {
+      if (!plugin.runtime.type.empty() &&
+          engine_.kernels().contains(plugin.runtime.type)) {
         runtimes.push_back(std::move(plugin.runtime));
       } else if (!isSectionPlugin(plugin.logical)) {
         plugin.logical.unknown = true;
@@ -3660,8 +4176,22 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
       }
     }
   };
-  const auto overlayBoundPipelineValues = [this](const char side,
-                                                 PipelineState &pipeline) {
+  const auto normalizedForBulkTarget = [&message](
+                                           const AutomationTargetIdentity &identity,
+                                           const double current) {
+    auto normalized = current;
+    for (const auto &edit : message.automationEdits) {
+      if (identity == AutomationTargetIdentity{
+                          edit.pipeline, edit.pluginId, edit.pluginType,
+                          edit.parameterKey, edit.elementIndex}) {
+        normalized = edit.normalized;
+      }
+    }
+    return normalized;
+  };
+  const auto overlayBoundPipelineValues = [this, &normalizedForBulkTarget](
+                                               const char side,
+                                               PipelineState &pipeline) {
     PluginStateDocument authority;
     auto &authorityPipeline = side == 'B' ? authority.pipelineB : authority.pipelineA;
     authorityPipeline = std::move(pipeline);
@@ -3669,13 +4199,16 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
       const auto *binding = automationBindings_.binding(slot);
       const auto *target = automationBindings_.slot(slot);
       if (binding != nullptr && target != nullptr && binding->pipeline == side) {
-        (void)applyAutomationValue(authority, *binding, target->currentNormalized);
+        (void)applyAutomationValue(
+            authority, *binding,
+            normalizedForBulkTarget(target->identity, target->currentNormalized));
       }
     }
     pipeline = std::move(authorityPipeline);
   };
   const auto overlayBoundRuntimeValues =
-      [this](const char side, std::vector<RuntimePlugin> &runtimes) {
+      [this, &normalizedForBulkTarget](const char side,
+                                      std::vector<RuntimePlugin> &runtimes) {
     for (const auto slot : automationBindings_.activeSlots()) {
       const auto *binding = automationBindings_.binding(slot);
       const auto *target = automationBindings_.slot(slot);
@@ -3688,26 +4221,50 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
             return candidate.logicalId == binding->pluginId;
           });
       const auto packed = denormalizeAutomationPackedValue(
-          *target, target->currentNormalized);
+          *target,
+          normalizedForBulkTarget(target->identity, target->currentNormalized));
       if (runtime != runtimes.end() && packed.has_value() &&
           target->packedOffset < runtime->packedParameters.size()) {
         runtime->packedParameters[target->packedOffset] = *packed;
       }
     }
   };
+  const auto restorePreviousPlayableGeneration =
+      [this](EngineMutationWindow &engineWindow,
+             const PipelineState &previousPipeline) {
+        if (!engineWindow.wasReady()) {
+          engineWindow.setRestoreOnClose(false);
+          return;
+        }
+        std::string restoreError;
+        auto restoredLatencyChanged = false;
+        if (engine_.rebuild(previousPipeline, runtimePlugins_, &restoreError) &&
+            synchronizeLatencyLocked(restoredLatencyChanged)) {
+          engineWindow.setRestoreOnClose(true);
+          return;
+        }
+        engineWindow.setRestoreOnClose(false);
+        recordProcessTransactionFailure(
+            ProcessTransactionError::processingNotReady);
+      };
 
   if (message.action == UiAction::rebuildPipeline) {
     PipelineState pipeline;
     std::vector<RuntimePlugin> runtimes;
     decodePipeline(message.plugins, pipeline, runtimes);
+    pauseBulkRequestBeforeCommitForTesting();
+    auto contextuallyUnsupported = false;
     if (stateReplacementPending_.load(std::memory_order_acquire)) {
       const auto previousLatency = latencySamples_.load(std::memory_order_acquire);
-      AutomationReconcileResult automationResult;
+      int32 automationRestartFlags = 0;
       {
         // setState() retained one complete old generation. The decoded
         // document, replacement runtime image, bindings, scheduler, apply table
         // and engine become live together inside this single quiet window.
         AutomationResourceLock resources{*this};
+        if (!authorizedReplacementRequestLocked()) {
+          return bridgeResult(true);
+        }
         EngineMutationWindow engineWindow{*this};
         const AudioTimelineWindow timelineWindow{*this};
         acknowledgePublishedAutomationLocked();
@@ -3742,7 +4299,7 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
         runtimePlugins_ = std::move(runtimes);
         runtimeParameterDirty_.fill(false);
         runtimeFullImageDirty_.fill(false);
-        automationResult = reconcileAutomationBindingsLocked(
+        automationRestartFlags = reconcileAutomationBindingsLocked(
             resources, /*forceCurrentInitialization=*/true);
         overlayBoundRuntimeValues(message.pipeline, runtimePlugins_);
         publishAutomationApplyTableLocked();
@@ -3759,14 +4316,19 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
           engineWindow.setRestoreOnClose(false);
           return bridgeResult(false, error);
         }
+        contextuallyUnsupported = std::any_of(
+            runtimePlugins_.begin(), runtimePlugins_.end(),
+            [](const RuntimePlugin &runtime) {
+              return runtime.contextuallyBypassed;
+            });
         stateReplacementPending_.store(false, std::memory_order_release);
+        replacementPageAuthorized_ = false;
         engineWindow.setRestoreOnClose(
             maxHostFrames_.load(std::memory_order_acquire) > 0);
       }
-      if (automationResult.slotsChanged) {
+      if (automationRestartFlags != 0) {
         if (auto *handler = getComponentHandler(); handler != nullptr) {
-          (void)handler->restartComponent(RestartFlags::kParamTitlesChanged |
-                                          RestartFlags::kParamValuesChanged);
+          traceRestartComponent(*handler, automationRestartFlags, traceInstance_);
         }
       }
       notifyLatencyChange(previousLatency);
@@ -3775,38 +4337,25 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
       result.addMember("success", true);
       result.addMember(
           "skippedUnsupported",
-          std::any_of(pipeline.plugins.begin(), pipeline.plugins.end(),
-                      [](const PluginState &plugin) { return plugin.unknown; }));
+          contextuallyUnsupported ||
+              std::any_of(pipeline.plugins.begin(), pipeline.plugins.end(),
+                          [](const PluginState &plugin) { return plugin.unknown; }));
+      appendExecutionStates(result);
       appendActiveAutomationSnapshot(result);
       return choc::json::toString(result);
     }
-    {
-      std::scoped_lock resources(processingResourcesMutex_);
-      adoptNamedAutomationEditsLocked(message.automationEdits);
-      std::scoped_lock stateLock(stateMutex_);
-      const auto &preserved = message.pipeline == 'B' ? state_.pipelineB : state_.pipelineA;
-      auto &preserveMissing =
-          message.pipeline == 'B' ? preserveMissingPipelineB_ : preserveMissingPipelineA_;
-      pipeline = undoOpaqueState_.reconcile(message.pipeline, preserved, std::move(pipeline),
-                                            preserveMissing);
-      overlayBoundPipelineValues(message.pipeline, pipeline);
-      preserveMissing = false;
-      state_.currentPipeline = message.pipeline;
-      activePipeline_.store(message.pipeline, std::memory_order_release);
-      (message.pipeline == 'B' ? state_.pipelineB : state_.pipelineA) = pipeline;
-      if (message.pipeline == 'B') {
-        state_.pipelineBInitialized = true;
-      }
-      hasSavedState_ = true;
-    }
-    synchronizeAutomationBindings(true);
-    const auto retainedAssets = pruneAssetTransfers();
-    const auto skippedUnsupported =
-        std::any_of(pipeline.plugins.begin(), pipeline.plugins.end(),
-                    [](const PluginState &plugin) { return plugin.unknown; });
+    auto skippedUnsupported = std::any_of(
+        pipeline.plugins.begin(), pipeline.plugins.end(),
+        [](const PluginState &plugin) { return plugin.unknown; });
     auto latencyChanged = false;
+    int32 automationRestartFlags = 0;
     {
-      std::scoped_lock resources(processingResourcesMutex_);
+      AutomationResourceLock resources{*this};
+      if (requestStartedDuringStateReplacement ||
+          stateReplacementPending_.load(std::memory_order_acquire) ||
+          bulkRequestCrossedGenerationLocked()) {
+        return bridgeResult(true);
+      }
       // Closing the gate and proving the audio thread out of process() belong
       // inside this lock: a window opened before it would be reopened by
       // whichever control thread already held the lock, and the instances and
@@ -3814,27 +4363,72 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
       // window also claims the engine, which is what keeps the one block an
       // explicit topology edit costs from reporting itself as a DSP failure.
       EngineMutationWindow engineWindow{*this};
-      // The engine is already quiet for the rebuild below, so evicting the
-      // asset cache here costs nothing instead of a window of its own.
-      engine_.retainAssets(retainedAssets);
-      parameterMailbox_.discardPending();
-      discardPendingDescriptorLocked();
+      PipelineState previousPipeline;
+      auto candidateUndoOpaqueState = undoOpaqueState_;
+      {
+        std::scoped_lock stateLock(stateMutex_);
+        previousPipeline = state_.currentPipeline == 'B' ? state_.pipelineB
+                                                         : state_.pipelineA;
+        const auto &preserved =
+            message.pipeline == 'B' ? state_.pipelineB : state_.pipelineA;
+        const auto preserveMissing =
+            message.pipeline == 'B' ? preserveMissingPipelineB_
+                                    : preserveMissingPipelineA_;
+        pipeline = candidateUndoOpaqueState.reconcile(
+            message.pipeline, preserved, std::move(pipeline), preserveMissing);
+        overlayBoundPipelineValues(message.pipeline, pipeline);
+      }
       overlayBoundRuntimeValues(message.pipeline, runtimes);
-      runtimePlugins_ = std::move(runtimes);
-      publishAutomationApplyTableLocked();
-      runtimeParameterDirty_.fill(false);
-      runtimeFullImageDirty_.fill(false);
-      if (!engine_.rebuild(pipeline, runtimePlugins_, &error)) {
-        engineWindow.setRestoreOnClose(false);
+      const auto executionContext = readHostContext();
+      contextuallyUnsupported = refreshRuntimeExecutionAdmission(
+          pipeline, runtimes, executionContext.engineSampleRate,
+          executionContext.channels);
+      skippedUnsupported = skippedUnsupported || contextuallyUnsupported;
+      if (!engine_.rebuild(pipeline, runtimes, &error)) {
+        restorePreviousPlayableGeneration(engineWindow, previousPipeline);
         return bridgeResult(false, error);
       }
       if (!synchronizeLatencyLocked(latencyChanged)) {
-        engineWindow.setRestoreOnClose(false);
+        restorePreviousPlayableGeneration(engineWindow, previousPipeline);
         return bridgeResult(false, "Unable to prepare the master-bypass delay");
       }
+      // Only a fully rebuilt and latency-valid engine may become the logical,
+      // automation and runtime authority. A refused image leaves every old
+      // control-side generation untouched and is rebuilt above before the gate
+      // can reopen.
+      adoptNamedAutomationEditsLocked(message.automationEdits);
+      undoOpaqueState_ = std::move(candidateUndoOpaqueState);
+      {
+        std::scoped_lock stateLock(stateMutex_);
+        state_.currentPipeline = message.pipeline;
+        (message.pipeline == 'B' ? state_.pipelineB : state_.pipelineA) =
+            pipeline;
+        if (message.pipeline == 'B') {
+          state_.pipelineBInitialized = true;
+        }
+        (message.pipeline == 'B' ? preserveMissingPipelineB_
+                                 : preserveMissingPipelineA_) = false;
+        hasSavedState_ = true;
+      }
+      activePipeline_.store(message.pipeline, std::memory_order_release);
+      runtimePlugins_ = std::move(runtimes);
+      automationRestartFlags = reconcileAutomationBindingsLocked(resources);
+      publishAutomationApplyTableLocked();
+      runtimeParameterDirty_.fill(false);
+      runtimeFullImageDirty_.fill(false);
+      parameterMailbox_.discardPending();
+      discardPendingDescriptorLocked();
+      // Asset eviction is destructive too, so it follows the commit rather
+      // than making a failed candidate unable to restore its old instances.
+      engine_.retainAssets(pruneAssetTransfers());
       // This is the path that first makes the DSP playable after a UI repack,
       // so it opens the gate rather than restoring what it found.
       engineWindow.setRestoreOnClose(true);
+    }
+    if (automationRestartFlags != 0) {
+      if (auto *handler = getComponentHandler(); handler != nullptr) {
+        traceRestartComponent(*handler, automationRestartFlags, traceInstance_);
+      }
     }
     if (latencyChanged) {
       queueLatencyNotification(true);
@@ -3843,6 +4437,7 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     result.addMember("ok", true);
     result.addMember("success", true);
     result.addMember("skippedUnsupported", skippedUnsupported);
+    appendExecutionStates(result);
     appendActiveAutomationSnapshot(result);
     return choc::json::toString(result);
   }
@@ -3853,71 +4448,109 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     std::vector<RuntimePlugin> runtimesA;
     std::vector<RuntimePlugin> runtimesB;
     decodePipeline(message.pipelineA, pipelineA, runtimesA);
+    auto contextuallyUnsupportedA = false;
+    auto contextuallyUnsupportedB = false;
     if (message.pipelineBInitialized) {
       decodePipeline(message.pipelineB, pipelineB, runtimesB);
     }
+    pauseBulkRequestBeforeCommitForTesting();
 
     PipelineState active;
     std::vector<RuntimePlugin> activeRuntimes;
-    {
-      std::scoped_lock resources(processingResourcesMutex_);
-      adoptNamedAutomationEditsLocked(message.automationEdits);
-      std::scoped_lock stateLock(stateMutex_);
-      pipelineA = undoOpaqueState_.reconcile('A', state_.pipelineA, std::move(pipelineA), false);
-      if (message.pipelineBInitialized) {
-        pipelineB = undoOpaqueState_.reconcile('B', state_.pipelineB, std::move(pipelineB), false);
-      } else {
-        (void)undoOpaqueState_.reconcile('B', state_.pipelineB, {}, false);
-      }
-      overlayBoundPipelineValues('A', pipelineA);
-      if (message.pipelineBInitialized) {
-        overlayBoundPipelineValues('B', pipelineB);
-      }
-      state_.pipelineA = pipelineA;
-      state_.pipelineB = message.pipelineBInitialized ? pipelineB : PipelineState{};
-      state_.pipelineBInitialized = message.pipelineBInitialized;
-      state_.currentPipeline = message.pipeline;
-      activePipeline_.store(message.pipeline, std::memory_order_release);
-      preserveMissingPipelineA_ = false;
-      preserveMissingPipelineB_ = false;
-      hasSavedState_ = true;
-      active = message.pipeline == 'B' ? state_.pipelineB : state_.pipelineA;
-      activeRuntimes = message.pipeline == 'B' ? std::move(runtimesB) : std::move(runtimesA);
-    }
-    synchronizeAutomationBindings(true);
-    const auto retainedAssets = pruneAssetTransfers();
-
-    const auto skippedUnsupported =
-        std::any_of(pipelineA.plugins.begin(), pipelineA.plugins.end(),
-                    [](const PluginState &plugin) { return plugin.unknown; }) ||
-        std::any_of(pipelineB.plugins.begin(), pipelineB.plugins.end(),
-                    [](const PluginState &plugin) { return plugin.unknown; });
     auto latencyChanged = false;
+    int32 automationRestartFlags = 0;
     {
-      std::scoped_lock resources(processingResourcesMutex_);
+      AutomationResourceLock resources{*this};
+      if (requestStartedDuringStateReplacement ||
+          stateReplacementPending_.load(std::memory_order_acquire) ||
+          bulkRequestCrossedGenerationLocked()) {
+        return bridgeResult(true);
+      }
       // Same window as pipeline/rebuild, and for the same two reasons: the gate
       // may only be closed under this lock, and the block the edit costs is the
       // user's own operation rather than a DSP failure to report.
       EngineMutationWindow engineWindow{*this};
-      // The engine is already quiet for the rebuild below, so evicting the
-      // asset cache here costs nothing instead of a window of its own.
-      engine_.retainAssets(retainedAssets);
-      parameterMailbox_.discardPending();
-      discardPendingDescriptorLocked();
+      PipelineState previousPipeline;
+      auto candidateUndoOpaqueState = undoOpaqueState_;
+      {
+        std::scoped_lock stateLock(stateMutex_);
+        previousPipeline = state_.currentPipeline == 'B' ? state_.pipelineB
+                                                         : state_.pipelineA;
+        pipelineA = candidateUndoOpaqueState.reconcile(
+            'A', state_.pipelineA, std::move(pipelineA), false);
+        if (message.pipelineBInitialized) {
+          pipelineB = candidateUndoOpaqueState.reconcile(
+              'B', state_.pipelineB, std::move(pipelineB), false);
+        } else {
+          (void)candidateUndoOpaqueState.reconcile(
+              'B', state_.pipelineB, {}, false);
+        }
+        overlayBoundPipelineValues('A', pipelineA);
+        if (message.pipelineBInitialized) {
+          overlayBoundPipelineValues('B', pipelineB);
+        }
+        active = message.pipeline == 'B' ? pipelineB : pipelineA;
+      }
+      activeRuntimes = message.pipeline == 'B' ? std::move(runtimesB)
+                                               : std::move(runtimesA);
       overlayBoundRuntimeValues(message.pipeline, activeRuntimes);
-      runtimePlugins_ = std::move(activeRuntimes);
-      publishAutomationApplyTableLocked();
-      runtimeParameterDirty_.fill(false);
-      runtimeFullImageDirty_.fill(false);
-      if (!engine_.rebuild(active, runtimePlugins_, &error)) {
-        engineWindow.setRestoreOnClose(false);
+      // Decoding happens before this transaction, but admission belongs here,
+      // after reconciliation and against the fresh host context, with the
+      // runtime generation that is actually rebuilt.
+      const auto executionContext = readHostContext();
+      if (message.pipeline == 'B') {
+        contextuallyUnsupportedA = refreshRuntimeExecutionAdmission(
+            pipelineA, runtimesA, executionContext.engineSampleRate,
+            executionContext.channels);
+        contextuallyUnsupportedB = refreshRuntimeExecutionAdmission(
+            pipelineB, activeRuntimes, executionContext.engineSampleRate,
+            executionContext.channels);
+      } else {
+        contextuallyUnsupportedA = refreshRuntimeExecutionAdmission(
+            pipelineA, activeRuntimes, executionContext.engineSampleRate,
+            executionContext.channels);
+        if (message.pipelineBInitialized) {
+          contextuallyUnsupportedB = refreshRuntimeExecutionAdmission(
+              pipelineB, runtimesB, executionContext.engineSampleRate,
+              executionContext.channels);
+        }
+      }
+      if (!engine_.rebuild(active, activeRuntimes, &error)) {
+        restorePreviousPlayableGeneration(engineWindow, previousPipeline);
         return bridgeResult(false, error);
       }
       if (!synchronizeLatencyLocked(latencyChanged)) {
-        engineWindow.setRestoreOnClose(false);
+        restorePreviousPlayableGeneration(engineWindow, previousPipeline);
         return bridgeResult(false, "Unable to prepare the master-bypass delay");
       }
+      adoptNamedAutomationEditsLocked(message.automationEdits);
+      undoOpaqueState_ = std::move(candidateUndoOpaqueState);
+      {
+        std::scoped_lock stateLock(stateMutex_);
+        state_.pipelineA = pipelineA;
+        state_.pipelineB = message.pipelineBInitialized ? pipelineB
+                                                        : PipelineState{};
+        state_.pipelineBInitialized = message.pipelineBInitialized;
+        state_.currentPipeline = message.pipeline;
+        preserveMissingPipelineA_ = false;
+        preserveMissingPipelineB_ = false;
+        hasSavedState_ = true;
+      }
+      activePipeline_.store(message.pipeline, std::memory_order_release);
+      runtimePlugins_ = std::move(activeRuntimes);
+      automationRestartFlags = reconcileAutomationBindingsLocked(resources);
+      publishAutomationApplyTableLocked();
+      runtimeParameterDirty_.fill(false);
+      runtimeFullImageDirty_.fill(false);
+      parameterMailbox_.discardPending();
+      discardPendingDescriptorLocked();
+      engine_.retainAssets(pruneAssetTransfers());
       engineWindow.setRestoreOnClose(true);
+    }
+    if (automationRestartFlags != 0) {
+      if (auto *handler = getComponentHandler(); handler != nullptr) {
+        traceRestartComponent(*handler, automationRestartFlags, traceInstance_);
+      }
     }
     if (latencyChanged) {
       queueLatencyNotification(true);
@@ -3925,65 +4558,224 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     auto result = choc::value::createObject({});
     result.addMember("ok", true);
     result.addMember("success", true);
+    const auto skippedUnsupported =
+        contextuallyUnsupportedA || contextuallyUnsupportedB ||
+        std::any_of(pipelineA.plugins.begin(), pipelineA.plugins.end(),
+                    [](const PluginState &plugin) { return plugin.unknown; }) ||
+        std::any_of(pipelineB.plugins.begin(), pipelineB.plugins.end(),
+                    [](const PluginState &plugin) { return plugin.unknown; });
     result.addMember("skippedUnsupported", skippedUnsupported);
+    appendExecutionStates(result);
     appendActiveAutomationSnapshot(result);
     return choc::json::toString(result);
   }
 
   if (message.action == UiAction::updatePlugin && !message.plugins.empty()) {
     auto &update = message.plugins.front();
+    std::uint64_t updateStateEpoch = 0;
+    std::vector<std::optional<std::uint32_t>> updateGestureSlots(
+        message.automationEdits.size());
+    // Callers hold processingResourcesMutex_. The slot snapshot belongs to the
+    // same generation as the image decision: if a later restore replaces that
+    // generation, these are the only lanes whose already-open host touches a
+    // stale edit may still report into.
+    const auto captureUpdateGenerationLocked = [&] {
+      updateStateEpoch =
+          stateReplacementEpoch_.load(std::memory_order_acquire);
+      for (std::size_t index = 0; index < message.automationEdits.size(); ++index) {
+        const auto &edit = message.automationEdits[index];
+        updateGestureSlots[index] = automationBindings_.findActiveSlot(
+            {edit.pipeline, edit.pluginId, edit.pluginType, edit.parameterKey,
+             edit.elementIndex});
+      }
+    };
+    const auto pauseBeforeAutomationEditsForTesting = [this] {
+#if defined(EFFETUNE_PROCESSOR_TEST_HOOKS)
+      if (pausePluginUpdateBeforeAutomationEditsForTesting_.load(
+              std::memory_order_acquire)) {
+        pluginUpdatePausedBeforeAutomationEditsForTesting_.store(
+            true, std::memory_order_release);
+        while (pausePluginUpdateBeforeAutomationEditsForTesting_.load(
+            std::memory_order_acquire)) {
+          std::this_thread::yield();
+        }
+        pluginUpdatePausedBeforeAutomationEditsForTesting_.store(
+            false, std::memory_order_release);
+      }
+#endif
+    };
     // Every way this message can be accepted ends here, so the gestures the UI
     // bundled with the image are written to the host in one place: after the
     // image itself reached the DSP, and in the order the user made them. The
-    // bulk routes adopt only bound targets, but a plug-in update is a user
-    // gesture, so an unbound target still claims a lane through the Write gate.
-    // An entry that clears bindIfUnbound claims nothing. Nothing about the
-    // edits is answered: each one becomes the plug-in's own value whether or
-    // not the host takes it, so there is nothing for the UI to reconcile and no
-    // entry it could be asked to put back.
-    const auto updateAccepted = [this, &message](const bool rebuildAssets) {
+    // bulk routes adopt only bound targets, but an ordinary plug-in update is a
+    // user gesture, so an unbound target still claims a lane through the Write
+    // gate. The one exception is a frame made stale by state replacement: its
+    // captured slot may only finish reporting an already-open host touch and
+    // never reaches the normal bind/adopt path. An entry that clears
+    // bindIfUnbound claims nothing.
+    // Nothing about the edits is answered: each bound one becomes the plug-in's
+    // own value whether or not the host takes it, so there is nothing for the UI
+    // to reconcile and no entry it could be asked to put back.
+    const auto updateAccepted =
+        [this, &message, &update, &updateGestureSlots,
+         &updateStateEpoch,
+         &pauseBeforeAutomationEditsForTesting](const bool rebuildAssets,
+                                                const bool imageAlreadyStale) {
       auto result = choc::value::createObject({});
       result.addMember("ok", true);
       result.addMember("success", true);
+      if (update.runtime.contextuallyBypassed) {
+        result.addMember("skippedUnsupported", true);
+      }
       if (rebuildAssets) {
         result.addMember("rebuildAssets", true);
       }
-      {
-        // Every lane the batch needs is claimed here, ahead of the group.
-        // Claiming one republishes the whole parameter bank through
-        // restartComponent(), and that is not a call to make while the host
-        // believes a group edit is in progress: the SDK's own worked example
-        // brackets the begin/perform/end run and nothing else, and a host asked
-        // to re-enumerate its parameters mid-group is being asked to do two
-        // things at once. It is not a rare case either -- the first frame of a
-        // drag on a target that owns no lane is exactly when the binding
-        // happens, which is the common case, not the exception. The resolve is
-        // idempotent, so the loop below finds these lanes already bound and
-        // issues no restart of its own, and a batch that binds nothing pays one
-        // registry lookup per edit.
-        for (const auto &edit : message.automationEdits) {
-          (void)resolveAutomationSlot(
-              {edit.pipeline, edit.pluginId, edit.pluginType, edit.parameterKey,
-               edit.elementIndex},
-              edit.normalized, edit.bindIfUnbound);
+      const auto finishResult = [this, &result] {
+        appendExecutionStates(result);
+        return choc::json::toString(result);
+      };
+      const auto reportStaleEdits = [&](const std::size_t first) {
+        for (auto index = first; index < message.automationEdits.size(); ++index) {
+          if (!updateGestureSlots[index].has_value()) {
+            continue;
+          }
+          const auto &edit = message.automationEdits[index];
+          reportHostEditToOpenGesture(
+              automationParameterId(*updateGestureSlots[index]), edit.normalized,
+              edit.endGesture);
         }
-        // The shim coalesces per plug-in per animation frame, so this batch is
-        // one frame of one drag on one plug-in: exactly the run the SDK's group
-        // edit is for. A batch that carries a single edit gains nothing from a
-        // group and is left alone; the count is known before the loop starts, so
-        // the choice costs nothing.
-        const ScopedHostGroupEdit group{*this, message.automationEdits.size() > 1u,
-                                        traceInstance_};
-        for (const auto &edit : message.automationEdits) {
-          (void)applyAutomationEdit(
-              {edit.pipeline, edit.pluginId, edit.pluginType, edit.parameterKey,
-               edit.elementIndex},
-              edit.normalized,
-              {edit.bindIfUnbound, edit.beginGesture, edit.endGesture});
+      };
+      auto generationCrossed = imageAlreadyStale;
+      {
+        std::scoped_lock resources(processingResourcesMutex_);
+        generationCrossed = generationCrossed ||
+                            stateReplacementEpoch_.load(
+                                std::memory_order_acquire) != updateStateEpoch;
+      }
+      // Test the boundary after the first epoch comparison, not merely the gap
+      // before this function. Every actual side effect below performs its own
+      // under-lock comparison too, so a restore here or between batch members
+      // cannot turn a stale edit current again.
+      if (!imageAlreadyStale) {
+        pauseBeforeAutomationEditsForTesting();
+        std::scoped_lock resources(processingResourcesMutex_);
+        generationCrossed = generationCrossed ||
+                            stateReplacementEpoch_.load(
+                                std::memory_order_acquire) != updateStateEpoch;
+      }
+      if (generationCrossed) {
+        // The plug-in image and every value-adoption side effect belong to a
+        // generation that no longer exists. Preserve only host reporting for a
+        // touch that was both bound in that generation and is still open now;
+        // never open one, claim a slot, or touch restored native authority.
+        reportStaleEdits(0);
+        return finishResult();
+      }
+      // Every lane the batch needs is claimed ahead of the host group. The
+      // expected epoch is rechecked inside each resolve/bind transaction, so a
+      // restore between entries prevents every later reservation.
+      for (std::size_t index = 0; index < message.automationEdits.size(); ++index) {
+        const auto &edit = message.automationEdits[index];
+        updateGestureSlots[index] = resolveAutomationSlot(
+            {edit.pipeline, edit.pluginId, edit.pluginType, edit.parameterKey,
+             edit.elementIndex},
+            edit.normalized, edit.bindIfUnbound, updateStateEpoch);
+        auto staleAfterResolve = false;
+        {
+          std::scoped_lock resources(processingResourcesMutex_);
+          staleAfterResolve =
+              stateReplacementEpoch_.load(std::memory_order_acquire) !=
+              updateStateEpoch;
+        }
+        if (staleAfterResolve) {
+          reportStaleEdits(0);
+          return finishResult();
         }
       }
-      return choc::json::toString(result);
+
+      // The shim coalesces per plug-in per animation frame, so this batch is
+      // one frame of one drag on one plug-in: exactly the run the SDK's group
+      // edit is for. Binding has already finished above, outside the group.
+      const ScopedHostGroupEdit group{*this, message.automationEdits.size() > 1u,
+                                      traceInstance_};
+      for (std::size_t index = 0; index < message.automationEdits.size(); ++index) {
+        if (!updateGestureSlots[index].has_value()) {
+          continue;
+        }
+        const auto slot = *updateGestureSlots[index];
+        const auto &edit = message.automationEdits[index];
+        const AutomationTargetIdentity identity{
+            edit.pipeline, edit.pluginId, edit.pluginType, edit.parameterKey,
+            edit.elementIndex};
+        auto staleBeforeHostCall = false;
+        {
+          std::scoped_lock resources(processingResourcesMutex_);
+          const auto *target = automationBindings_.slot(slot);
+          staleBeforeHostCall =
+              stateReplacementEpoch_.load(std::memory_order_acquire) !=
+                  updateStateEpoch ||
+                                target == nullptr ||
+                                target->identity != identity;
+        }
+        if (staleBeforeHostCall) {
+          reportStaleEdits(index);
+          return finishResult();
+        }
+
+        (void)performHostEditTransaction(automationParameterId(slot),
+                                         edit.normalized, edit.beginGesture,
+                                         edit.endGesture);
+        auto staleAfterHostCall = false;
+        {
+          std::scoped_lock resources(processingResourcesMutex_);
+          const auto *target = automationBindings_.slot(slot);
+          if (stateReplacementEpoch_.load(std::memory_order_acquire) ==
+                  updateStateEpoch &&
+              target != nullptr &&
+              target->identity == identity) {
+            adoptAutomationEditLocked(slot, edit.normalized);
+          } else {
+            // performHostEditTransaction updates the host-facing Parameter
+            // before notifying the host. Put that display value back without
+            // adopting it into any native authority when a restore crossed the
+            // host call itself.
+            if (target != nullptr) {
+              automationParameters_.setHostAdoptedValue(
+                  slot, target->currentNormalized);
+            } else {
+              (void)SingleComponentEffect::setParamNormalized(
+                  automationParameterId(slot), 0.0);
+            }
+            staleAfterHostCall = true;
+          }
+        }
+        if (staleAfterHostCall) {
+          // setState() closes every touch before incrementing the epoch. Any
+          // touch still open after the mismatch was opened by this stale host
+          // transaction after that close and must not outlive it.
+          (void)closeHostGesture(slot);
+          reportStaleEdits(index + 1u);
+          return finishResult();
+        }
+      }
+      return finishResult();
     };
+    // setState() has already made the decoded document authoritative, while
+    // deliberately leaving one complete old runtime generation alive until the
+    // reloaded page supplies its replacement. The dying page can still flush a
+    // final plug-in image in that interval. It is stale by definition and may
+    // not overwrite the restored document, runtime shadow or pending engine
+    // work. Its bundled gesture may only finish reporting an old-generation
+    // host touch that was already open; it may not open one or adopt into the
+    // restored binding/scheduler state.
+    {
+      std::unique_lock resources(processingResourcesMutex_);
+      if (stateReplacementPending_.load(std::memory_order_acquire)) {
+        captureUpdateGenerationLocked();
+        resources.unlock();
+        return updateAccepted(false, /*imageAlreadyStale=*/true);
+      }
+    }
     // Nothing is committed while the update can still be refused. The UI rolls
     // an update that fails back without republishing it, so a state document or
     // a runtime image that already carries the new value would be stranded
@@ -4031,8 +4823,12 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
         }
       }
     }
+
     // Runs once every step that could still fail has succeeded, so the state
     // document only ever holds a value the operation actually delivered.
+    // Every caller holds processingResourcesMutex_: setState() publishes its
+    // pending marker under that same lock, so the logical image cannot cross a
+    // restore after the caller's final under-lock recheck.
     const auto commitPluginUpdate = [&] {
       {
         std::scoped_lock stateLock(stateMutex_);
@@ -4051,55 +4847,108 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
         }
         hasSavedState_ = true;
       }
-      if (topologyChanged) {
-        synchronizeAutomationBindings(true);
-      }
     };
 
     if (!activePipeline) {
+      std::unique_lock resources(processingResourcesMutex_);
+      if (stateReplacementPending_.load(std::memory_order_acquire)) {
+        captureUpdateGenerationLocked();
+        resources.unlock();
+        return updateAccepted(false, /*imageAlreadyStale=*/true);
+      }
       commitPluginUpdate();
-      return updateAccepted(false);
+      captureUpdateGenerationLocked();
+      resources.unlock();
+      if (topologyChanged) {
+        synchronizeAutomationBindings(true);
+      }
+      return updateAccepted(false, /*imageAlreadyStale=*/false);
     }
     if (update.runtime.type.empty()) {
+      std::unique_lock resources(processingResourcesMutex_);
+      if (stateReplacementPending_.load(std::memory_order_acquire)) {
+        captureUpdateGenerationLocked();
+        resources.unlock();
+        return updateAccepted(false, /*imageAlreadyStale=*/true);
+      }
       if (topologyChanged && processingReady_.load(std::memory_order_seq_cst)) {
-        if (!queueDescriptorUpdate(current, &error)) {
+        if (!queueDescriptorUpdateLocked(current, &error)) {
           return bridgeResult(false, error);
         }
         armLatencyNotification();
       }
       commitPluginUpdate();
-      return updateAccepted(false);
+      captureUpdateGenerationLocked();
+      resources.unlock();
+      if (topologyChanged) {
+        synchronizeAutomationBindings(true);
+      }
+      return updateAccepted(false, /*imageAlreadyStale=*/false);
     }
-    auto canReuseInstance = false;
-    auto processingReady = false;
-    auto runtimeCapacityAvailable = true;
+#if defined(EFFETUNE_PROCESSOR_TEST_HOOKS)
+    if (pausePluginUpdateBeforeRuntimeTransactionForTesting_.load(
+            std::memory_order_acquire)) {
+      pluginUpdatePausedBeforeRuntimeTransactionForTesting_.store(
+          true, std::memory_order_release);
+      while (pausePluginUpdateBeforeRuntimeTransactionForTesting_.load(
+          std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      pluginUpdatePausedBeforeRuntimeTransactionForTesting_.store(
+          false, std::memory_order_release);
+    }
+#endif
+    auto latencyChanged = false;
+    auto rebuildAssets = false;
     {
-      std::scoped_lock resources(processingResourcesMutex_);
-      // The runtime image carries the gesture value unchanged for the same
-      // reason the state document above does.
-      const auto runtime = std::find_if(
+      std::unique_lock resources(processingResourcesMutex_);
+      // The unlocked fast-path check above avoids decoding work for an update
+      // that was already stale. This check is the transaction boundary: a
+      // concurrent setState() either publishes first and makes the complete
+      // plug-in image a no-op, or waits until this logical/runtime generation
+      // has committed and then replaces it as a whole.
+      if (stateReplacementPending_.load(std::memory_order_acquire)) {
+        captureUpdateGenerationLocked();
+        resources.unlock();
+        return updateAccepted(false, /*imageAlreadyStale=*/true);
+      }
+      // Context publication and runtime replacement use this same lock. Reading
+      // the context here makes admission, reuse, replacement, and the response
+      // one decision instead of allowing setupProcessing() to land between
+      // them and have a stale UI update overwrite its new admission state.
+      const auto context = readHostContext();
+      update.runtime.contextuallyBypassed = !supportsExecutionContext(
+          update.runtime.executionCapabilities, replacement.channel,
+          context.engineSampleRate, context.channels);
+      auto runtime = std::find_if(
           runtimePlugins_.begin(), runtimePlugins_.end(),
           [&update](const RuntimePlugin &plugin) {
-            return plugin.logicalId == update.runtime.logicalId;
+            return plugin.logicalId == update.logical.id;
           });
-      canReuseInstance = runtime != runtimePlugins_.end() &&
-                         runtime->type == update.runtime.type &&
-                         runtime->paramsHash == update.runtime.paramsHash &&
-                         runtime->tapId == update.runtime.tapId;
-      processingReady = processingReady_.load(std::memory_order_seq_cst);
-      runtimeCapacityAvailable = runtime != runtimePlugins_.end() ||
-                                 runtimePlugins_.size() < kMaxPluginInstances;
-      if (!runtimeCapacityAvailable) {
+      const auto runtimeMissing = runtime == runtimePlugins_.end();
+      if (runtimeMissing && runtimePlugins_.size() >= kMaxPluginInstances) {
         return bridgeResult(false, "Pipeline exceeds 96 native DSP instances");
       }
-      if (!processingReady) {
+      const auto canReuseInstance = !runtimeMissing &&
+                                    runtime->type == update.runtime.type &&
+                                    runtime->paramsHash == update.runtime.paramsHash &&
+                                    runtime->tapId == update.runtime.tapId &&
+                                    runtime->executionCapabilities ==
+                                        update.runtime.executionCapabilities &&
+                                    runtime->contextuallyBypassed ==
+                                        update.runtime.contextuallyBypassed &&
+                                    runtime->packedParameters.size() ==
+                                        update.runtime.packedParameters.size() &&
+                                    runtime->parameterBytes.size() ==
+                                        update.runtime.parameterBytes.size();
+      if (!processingReady_.load(std::memory_order_seq_cst)) {
         // Re-seating the runtime image can reallocate the vector a block is
         // walking. The flag being clear says only that somebody else intends to
         // stop the audio thread, not that it has left: safety comes from this
         // thread waiting the block out itself. The window is free here -- the
         // flag is already clear, so nothing is restored when it closes.
         const EngineMutationWindow engineWindow{*this};
-        if (runtime == runtimePlugins_.end()) {
+        if (runtimeMissing) {
           runtimePlugins_.push_back(update.runtime);
           runtimeParameterDirty_[runtimePlugins_.size() - 1u] = false;
           runtimeFullImageDirty_[runtimePlugins_.size() - 1u] = false;
@@ -4111,125 +4960,93 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
           runtimeFullImageDirty_[runtimeIndex] = false;
         }
         publishAutomationApplyTableLocked();
-      }
-    }
-    if (!processingReady) {
-      commitPluginUpdate();
-      return updateAccepted(false);
-    }
-    if (canReuseInstance) {
-      if (topologyChanged) {
-        std::scoped_lock resources(processingResourcesMutex_);
-        const auto runtime = std::find_if(
-            runtimePlugins_.begin(), runtimePlugins_.end(),
-            [&update](const RuntimePlugin &plugin) {
-              return plugin.logicalId == update.runtime.logicalId &&
-                     plugin.type == update.runtime.type &&
-                     plugin.paramsHash == update.runtime.paramsHash &&
-                     plugin.tapId == update.runtime.tapId;
-            });
-        if (runtime == runtimePlugins_.end() ||
-            runtime->packedParameters.size() != update.runtime.packedParameters.size() ||
-            runtime->parameterBytes.size() != update.runtime.parameterBytes.size()) {
-          return bridgeResult(false, "Native DSP instance changed during topology update");
+      } else if (canReuseInstance) {
+        if (topologyChanged) {
+          if (!queueDescriptorUpdateLocked(current, &error)) {
+            return bridgeResult(false, error);
+          }
         }
-        if (!queueDescriptorUpdateLocked(current, &error)) {
-          return bridgeResult(false, error);
+        AudioCommand command;
+        command.type = AudioCommandType::setParameters;
+        command.logicalId = update.runtime.logicalId;
+        command.paramsHash = update.runtime.paramsHash;
+        command.floatCount =
+            static_cast<std::uint32_t>(update.runtime.packedParameters.size());
+        command.parameterByteCount =
+            static_cast<std::uint32_t>(update.runtime.parameterBytes.size());
+        std::copy(update.runtime.packedParameters.begin(),
+                  update.runtime.packedParameters.end(), command.packed.begin());
+        std::copy(update.runtime.parameterBytes.begin(),
+                  update.runtime.parameterBytes.end(),
+                  command.parameterBytes.begin());
+        if (!parameterMailbox_.publish(command)) {
+          return bridgeResult(false, "Native DSP parameter mailbox is unavailable");
         }
-      }
-      // Both branches publish the image the same way. Adoption marks the
-      // instance parameter- and full-image dirty, which is exactly what the
-      // topology branch used to do by writing the runtime image directly, and
-      // it keeps the mailbox the single owner of that hand-off.
-      AudioCommand command;
-      command.type = AudioCommandType::setParameters;
-      command.logicalId = update.runtime.logicalId;
-      command.paramsHash = update.runtime.paramsHash;
-      command.floatCount = static_cast<std::uint32_t>(update.runtime.packedParameters.size());
-      command.parameterByteCount =
-          static_cast<std::uint32_t>(update.runtime.parameterBytes.size());
-      std::copy(update.runtime.packedParameters.begin(), update.runtime.packedParameters.end(),
-                command.packed.begin());
-      std::copy(update.runtime.parameterBytes.begin(), update.runtime.parameterBytes.end(),
-                command.parameterBytes.begin());
-      if (!parameterMailbox_.publish(command)) {
-        return bridgeResult(false, "Native DSP parameter mailbox is unavailable");
-      }
-      parameterImageGeneration_.fetch_add(1, std::memory_order_acq_rel);
-      armLatencyNotification();
-      commitPluginUpdate();
-      return updateAccepted(false);
-    }
-    auto latencyChanged = false;
-    {
-      std::scoped_lock resources(processingResourcesMutex_);
-      // Same window as the two bulk rebuild routes: the gate may only be closed
-      // under this lock, and the single block this topology edit costs is the
-      // user's own operation rather than a DSP failure to report.
-      EngineMutationWindow engineWindow{*this};
-      const auto runtime = std::find_if(
-          runtimePlugins_.begin(), runtimePlugins_.end(),
-          [&update](const RuntimePlugin &plugin) {
-            return plugin.logicalId == update.runtime.logicalId;
-          });
-      const auto runtimeIndex =
-          static_cast<std::size_t>(runtime - runtimePlugins_.begin());
-      const auto inserted = runtime == runtimePlugins_.end();
-      RuntimePlugin previousRuntime;
-      if (inserted) {
-        runtimePlugins_.push_back(update.runtime);
+        parameterImageGeneration_.fetch_add(1, std::memory_order_acq_rel);
+        armLatencyNotification();
       } else {
-        previousRuntime = std::move(*runtime);
-        *runtime = update.runtime;
-      }
-      publishAutomationApplyTableLocked();
-      // The runtime image is the second half of the same commit as the state
-      // document, so a failure below has to leave it as it was. Restoring the
-      // image is only half of that: EngineHost::rebuild destroys its instances
-      // on every failure path, and a successful rebuild leaves the engine
-      // holding the new image, so the previous topology has to be rebuilt from
-      // the restored image before the DSP can process again.
-      const auto restoreRuntimeImage = [&] {
-        if (inserted) {
-          runtimePlugins_.pop_back();
+        // Same window as the two bulk rebuild routes: the gate may only be
+        // closed under this lock, and the single block this topology edit costs
+        // is the user's own operation rather than a DSP failure to report.
+        EngineMutationWindow engineWindow{*this};
+        const auto runtimeIndex =
+            static_cast<std::size_t>(runtime - runtimePlugins_.begin());
+        RuntimePlugin previousRuntime;
+        if (runtimeMissing) {
+          runtimePlugins_.push_back(update.runtime);
         } else {
-          runtimePlugins_[runtimeIndex] = std::move(previousRuntime);
+          previousRuntime = std::move(*runtime);
+          *runtime = update.runtime;
         }
         publishAutomationApplyTableLocked();
-        std::string restoreError;
-        auto restoredLatencyChanged = false;
-        if (engine_.rebuild(previous, runtimePlugins_, &restoreError) &&
-            synchronizeLatencyLocked(restoredLatencyChanged)) {
-          engineWindow.setRestoreOnClose(true);
-          return;
+        const auto restoreRuntimeImage = [&] {
+          if (runtimeMissing) {
+            runtimePlugins_.pop_back();
+          } else {
+            runtimePlugins_[runtimeIndex] = std::move(previousRuntime);
+          }
+          publishAutomationApplyTableLocked();
+          std::string restoreError;
+          auto restoredLatencyChanged = false;
+          if (engine_.rebuild(previous, runtimePlugins_, &restoreError) &&
+              synchronizeLatencyLocked(restoredLatencyChanged)) {
+            engineWindow.setRestoreOnClose(true);
+            return;
+          }
+          engineWindow.setRestoreOnClose(false);
+          recordProcessTransactionFailure(
+              ProcessTransactionError::processingNotReady);
+        };
+        if (!engine_.rebuild(current, runtimePlugins_, &error)) {
+          restoreRuntimeImage();
+          return bridgeResult(false, error);
         }
-        // No processed signal can exist any more, so the not-ready gate is the
-        // honest state and the deferred diagnostic is what tells the user.
-        engineWindow.setRestoreOnClose(false);
-        recordProcessTransactionFailure(
-            ProcessTransactionError::processingNotReady);
-      };
-      if (!engine_.rebuild(current, runtimePlugins_, &error)) {
-        restoreRuntimeImage();
-        return bridgeResult(false, error);
+        if (!synchronizeLatencyLocked(latencyChanged)) {
+          restoreRuntimeImage();
+          return bridgeResult(false, "Unable to prepare the master-bypass delay");
+        }
+        parameterMailbox_.discardPending();
+        discardPendingDescriptorLocked();
+        runtimeParameterDirty_.fill(false);
+        runtimeFullImageDirty_.fill(false);
+        engineWindow.setRestoreOnClose(true);
+        rebuildAssets = true;
       }
-      if (!synchronizeLatencyLocked(latencyChanged)) {
-        restoreRuntimeImage();
-        return bridgeResult(false, "Unable to prepare the master-bypass delay");
-      }
-      // Only a rebuild that succeeded may drop the pending hand-offs: until
-      // then they are the only record of what the restored image still owes.
-      parameterMailbox_.discardPending();
-      discardPendingDescriptorLocked();
-      runtimeParameterDirty_.fill(false);
-      runtimeFullImageDirty_.fill(false);
-      engineWindow.setRestoreOnClose(true);
+      // Publish the matching logical image before releasing the context/runtime
+      // transaction. A host reconfiguration takes this lock before it reads
+      // state, so it can now observe either the complete old generation or the
+      // complete updated one, never the new runtime against the old channel
+      // selection.
+      commitPluginUpdate();
+      captureUpdateGenerationLocked();
     }
     if (latencyChanged) {
       queueLatencyNotification(true);
     }
-    commitPluginUpdate();
-    return updateAccepted(true);
+    if (topologyChanged) {
+      synchronizeAutomationBindings(true);
+    }
+    return updateAccepted(rebuildAssets, /*imageAlreadyStale=*/false);
   }
 
   return bridgeResult(false, "Bridge message was not handled");

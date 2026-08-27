@@ -11,6 +11,10 @@
 #include <stdexcept>
 #include <utility>
 
+#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
+#include <xmmintrin.h>
+#endif
+
 namespace effetune::vst {
 
 struct EngineHost::TelemetryStorage {
@@ -29,6 +33,63 @@ struct EngineHost::TelemetryStorage {
 };
 
 namespace {
+
+template <typename IsContextuallyBypassed>
+[[nodiscard]] PipelineState pipelineForNativeChannelContext(
+    const PipelineState &pipeline, const std::uint32_t outputChannelCount,
+    IsContextuallyBypassed &&isContextuallyBypassed) {
+  auto routed = pipeline;
+  for (auto &plugin : routed.plugins) {
+    // The upstream null selection is mono for a mono destination, whereas the
+    // packed native -1 channel spec always means a two-channel pair.
+    if ((!plugin.channel.has_value() || plugin.channel->empty()) &&
+        outputChannelCount == 1u) {
+      plugin.channel = "1";
+      continue;
+    }
+    if (!isContextuallyBypassed(plugin.id) || !plugin.channel.has_value()) {
+      continue;
+    }
+
+    std::uint32_t firstChannel = 0;
+    if (*plugin.channel == "34") {
+      firstChannel = 2u;
+    } else if (*plugin.channel == "56") {
+      firstChannel = 4u;
+    } else if (*plugin.channel == "78") {
+      firstChannel = 6u;
+    } else {
+      continue;
+    }
+    // workletRoutingSelection() narrows an execution-bypassed pair to the
+    // one remaining channel. With none remaining it skips the node, which the
+    // unchanged pair spec already makes the native engine do as well.
+    if (outputChannelCount == firstChannel + 1u) {
+      plugin.channel = std::to_string(firstChannel + 1u);
+    }
+  }
+  return routed;
+}
+
+#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
+class ScopedMxcsrDenormalFlush final {
+public:
+  ScopedMxcsrDenormalFlush() noexcept : previous_(_mm_getcsr()) {
+    _mm_setcsr(previous_ | kFlushToZero | kDenormalsAreZero);
+  }
+
+  ~ScopedMxcsrDenormalFlush() noexcept { _mm_setcsr(previous_); }
+
+  ScopedMxcsrDenormalFlush(const ScopedMxcsrDenormalFlush &) = delete;
+  ScopedMxcsrDenormalFlush &operator=(const ScopedMxcsrDenormalFlush &) = delete;
+
+private:
+  static constexpr unsigned int kFlushToZero = 1u << 15u;
+  static constexpr unsigned int kDenormalsAreZero = 1u << 6u;
+
+  unsigned int previous_ = 0;
+};
+#endif
 
 [[nodiscard]] std::uint32_t countTelemetryFrames(const std::uint8_t *bytes,
                                                  const std::uint32_t byteCount) noexcept {
@@ -260,23 +321,40 @@ bool EngineHost::rebuild(const PipelineState &pipeline,
       return false;
     }
 
-    const auto instance = engine_->createInstance(runtime.type.c_str());
+    const auto instanceKernel = runtime.contextuallyBypassed
+                                    ? kernels_.find("VolumePlugin")
+                                    : kernel;
+    if (instanceKernel == kernels_.end()) {
+      clearInstancesUnlocked();
+      setError(error, "Contextual bypass DSP is unavailable");
+      return false;
+    }
+    const auto *instanceType = runtime.contextuallyBypassed
+                                   ? "VolumePlugin"
+                                   : runtime.type.c_str();
+    const auto instance = engine_->createInstance(instanceType);
     if (instance == 0) {
       clearInstancesUnlocked();
       setError(error, "Unable to create DSP instance for " + runtime.type);
       return false;
     }
-    const auto *packed = runtime.packedParameters.empty() ? nullptr : runtime.packedParameters.data();
+    constexpr std::array<float, 1> unityVolume{0.0f};
+    const auto packed = runtime.contextuallyBypassed
+                            ? std::span<const float>(unityVolume)
+                            : std::span<const float>(runtime.packedParameters);
+    const auto instanceParamsHash = runtime.contextuallyBypassed
+                                        ? instanceKernel->second.paramsHash
+                                        : runtime.paramsHash;
     const auto paramStatus = engine_->setInstanceParams(
-        instance, packed, static_cast<std::uint32_t>(runtime.packedParameters.size()),
-        runtime.paramsHash, 0);
+        instance, packed.empty() ? nullptr : packed.data(),
+        static_cast<std::uint32_t>(packed.size()), instanceParamsHash, 0);
     if (paramStatus != ET_OK) {
       engine_->destroyInstance(instance);
       clearInstancesUnlocked();
       setError(error, "Unable to initialize DSP parameters for " + runtime.type);
       return false;
     }
-    if (!runtime.parameterBytes.empty() &&
+    if (!runtime.contextuallyBypassed && !runtime.parameterBytes.empty() &&
         engine_->setInstanceParamBytes(instance, runtime.parameterBytes.data(),
                                        static_cast<std::uint32_t>(runtime.parameterBytes.size()),
                                        runtime.paramsHash, 0) != ET_OK) {
@@ -286,7 +364,7 @@ bool EngineHost::rebuild(const PipelineState &pipeline,
       return false;
     }
     const auto tap = runtime.tapId == 0 ? runtime.logicalId : runtime.tapId;
-    if (engine_->setInstanceTap(instance, tap) != ET_OK) {
+    if (!runtime.contextuallyBypassed && engine_->setInstanceTap(instance, tap) != ET_OK) {
       engine_->destroyInstance(instance);
       clearInstancesUnlocked();
       setError(error, "Unable to set DSP telemetry tap for " + runtime.type);
@@ -296,7 +374,8 @@ bool EngineHost::rebuild(const PipelineState &pipeline,
       const auto inserted = instances_
                                 .emplace(runtime.logicalId,
                                          InstanceEntry{instance, runtime.paramsHash,
-                                                       kernel->second.index})
+                                                       kernel->second.index,
+                                                       runtime.contextuallyBypassed})
                                 .second;
       if (!inserted) {
         engine_->destroyInstance(instance);
@@ -319,8 +398,15 @@ bool EngineHost::rebuild(const PipelineState &pipeline,
   }
 
   try {
+    const auto routedPipeline = pipelineForNativeChannelContext(
+        pipeline, channels_, [this](const std::uint32_t logicalId) {
+          const auto instance = instances_.find(logicalId);
+          return instance != instances_.end() &&
+                 instance->second.contextuallyBypassed;
+        });
     const auto descriptor = encodePipelineDescriptor(
-        pipeline, [this](const std::uint32_t logicalId) { return resolveInstance(logicalId); });
+        routedPipeline,
+        [this](const std::uint32_t logicalId) { return resolveInstance(logicalId); });
     const auto status =
         engine_->configurePipeline(descriptor.data(), static_cast<std::uint32_t>(descriptor.size()));
     if (status != ET_OK) {
@@ -349,8 +435,15 @@ bool EngineHost::updateDescriptor(const PipelineState &pipeline, std::string *er
     return false;
   }
   try {
+    const auto routedPipeline = pipelineForNativeChannelContext(
+        pipeline, channels_, [this](const std::uint32_t logicalId) {
+          const auto instance = instances_.find(logicalId);
+          return instance != instances_.end() &&
+                 instance->second.contextuallyBypassed;
+        });
     const auto descriptor = encodePipelineDescriptor(
-        pipeline, [this](const std::uint32_t logicalId) { return resolveInstance(logicalId); });
+        routedPipeline,
+        [this](const std::uint32_t logicalId) { return resolveInstance(logicalId); });
     const auto status =
         engine_->configurePipeline(descriptor.data(), static_cast<std::uint32_t>(descriptor.size()));
     if (status != ET_OK) {
@@ -371,8 +464,14 @@ bool EngineHost::makeDescriptorCommand(
     const PipelineState &pipeline, const std::span<const RuntimePlugin> runtimePlugins,
     AudioCommand &command, std::string *error) const {
   try {
+    const auto routedPipeline = pipelineForNativeChannelContext(
+        pipeline, channels_, [this](const std::uint32_t logicalId) {
+          const auto instance = instances_.find(logicalId);
+          return instance != instances_.end() &&
+                 instance->second.contextuallyBypassed;
+        });
     const auto descriptor = encodePipelineDescriptor(
-        pipeline, [this, runtimePlugins](const std::uint32_t logicalId) {
+        routedPipeline, [this, runtimePlugins](const std::uint32_t logicalId) {
           const auto runtime = std::find_if(
               runtimePlugins.begin(), runtimePlugins.end(),
               [logicalId](const RuntimePlugin &candidate) {
@@ -443,6 +542,9 @@ bool EngineHost::updateParametersUnlocked(const std::uint32_t logicalId,
       parameterBytes.size() > std::numeric_limits<std::uint32_t>::max()) {
     return false;
   }
+  if (found->second.contextuallyBypassed) {
+    return true;
+  }
   if (engine_->setInstanceParams(found->second.instance,
                                  packed.empty() ? nullptr : packed.data(),
                                  static_cast<std::uint32_t>(packed.size()), paramsHash, 0) != ET_OK) {
@@ -490,6 +592,9 @@ bool EngineHost::stageAssetUnlocked(const RuntimeAsset &asset, std::string *erro
     setError(error, "DSP asset exceeds the plug-in capacity");
     return false;
   }
+  if (found->second.contextuallyBypassed) {
+    return true;
+  }
   const AssetBeginInfo beginInfo{asset.channels,
                                  asset.frames,
                                  asset.topology,
@@ -521,7 +626,8 @@ bool EngineHost::refreshAssetStatesUnlocked() noexcept {
   for (auto &[key, entry] : assets_) {
     (void)key;
     const auto instance = instances_.find(entry.asset.logicalId);
-    const auto state = instance == instances_.end()
+    const auto state = instance == instances_.end() ||
+                               instance->second.contextuallyBypassed
                            ? static_cast<std::uint32_t>(ET_ASSET_STATE_NONE)
                            : engine_->instanceAssetState(instance->second.instance,
                                                          entry.asset.slot);
@@ -550,12 +656,17 @@ bool EngineHost::setAsset(RuntimeAsset asset, std::string *error) {
   const auto instance = instances_.find(asset.logicalId);
   if (cached != assets_.end() && instance != instances_.end() &&
       sameAsset(cached->second.asset, asset)) {
+    if (instance->second.contextuallyBypassed) {
+      return true;
+    }
     const auto state = engine_->instanceAssetState(instance->second.instance, asset.slot) & 0xffu;
     if (state >= ET_ASSET_STATE_STAGED && state <= ET_ASSET_STATE_ACTIVE) {
       (void)refreshAssetStatesUnlocked();
       return true;
     }
   }
+  const auto previousLatency =
+      instance == instances_.end() ? 0u : engine_->instanceLatency(instance->second.instance);
   if (!stageAssetUnlocked(asset, error)) {
     return false;
   }
@@ -565,12 +676,24 @@ bool EngineHost::setAsset(RuntimeAsset asset, std::string *error) {
     assets_[key].asset = std::move(asset);
   } catch (const std::bad_alloc &) {
     const auto found = instances_.find(logicalId);
-    if (found != instances_.end()) {
+    if (found != instances_.end() && !found->second.contextuallyBypassed) {
       engine_->abortInstanceAsset(found->second.instance, slot);
     }
     assetPreparationLatencyPolling_ = refreshAssetStatesUnlocked();
     setError(error, "DSP asset cache could not be allocated");
     return false;
+  }
+  // Asset commit changes the resident convolution, and therefore its latency,
+  // inside this already non-real-time mutation window. Publish that change now:
+  // a stopped host may not render another block, so leaving discovery to block
+  // housekeeping would strand both the compensation refresh and the UI delay
+  // display until an unrelated topology edit.
+  const auto instanceLatencyChanged =
+      instance != instances_.end() &&
+      engine_->instanceLatency(instance->second.instance) != previousLatency;
+  (void)refreshLatencyUnlocked();
+  if (instanceLatencyChanged) {
+    pipelinePlanRevision_.fetch_add(1, std::memory_order_acq_rel);
   }
   // Staging leaves the latency polling flag set on purpose: the state the
   // block-end scan will observe is published here so the UI can follow the
@@ -584,7 +707,7 @@ bool EngineHost::clearAsset(const std::uint32_t logicalId, const std::uint32_t s
   const auto found = instances_.find(logicalId);
   const auto previousLatency =
       found == instances_.end() ? 0u : engine_->instanceLatency(found->second.instance);
-  if (found != instances_.end()) {
+  if (found != instances_.end() && !found->second.contextuallyBypassed) {
     engine_->abortInstanceAsset(found->second.instance, slot);
   }
   const auto key = (static_cast<std::uint64_t>(logicalId) << 32u) | slot;
@@ -716,7 +839,8 @@ bool EngineHost::ProcessBatch::resolveParameterTarget(
     failed_ = true;
     return false;
   }
-  target = {logicalId, found->second.instance, paramsHash};
+  target = {logicalId, found->second.instance, paramsHash,
+            found->second.contextuallyBypassed};
   return true;
 }
 
@@ -733,6 +857,9 @@ bool EngineHost::ProcessBatch::stageParameters(
     }
     failed_ = true;
     return false;
+  }
+  if (target.contextuallyBypassed) {
+    return true;
   }
   const auto previousLatency = host_->engine_->instanceLatency(target.instance);
   const auto parametersStaged =
@@ -785,8 +912,14 @@ bool EngineHost::ProcessBatch::processChunk(float *const *channels,
     std::memcpy(host_->combined_ + static_cast<std::size_t>(channel) * frameCount,
                 channels[channel], sizeof(float) * frameCount);
   }
-  const auto status = host_->engine_->processPipeline(
-      channelCount, frameCount, timeSeconds, masterBypass ? 1u : 0u);
+  et_status status = ET_ERR_STATE;
+  {
+#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
+    const ScopedMxcsrDenormalFlush mxcsrDenormalFlush;
+#endif
+    status = host_->engine_->processPipeline(channelCount, frameCount, timeSeconds,
+                                             masterBypass ? 1u : 0u);
+  }
   if (status != ET_OK) {
     host_->processCounterAtoms_.processFailures.fetch_add(1,
                                                           std::memory_order_relaxed);

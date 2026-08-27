@@ -9,11 +9,9 @@
 #include <string>
 #include <string_view>
 
-namespace choc::ui {
-class WebView;
-}
-
 namespace effetune::vst {
+
+struct WebViewHostState;
 
 /// How long the asynchronous WebView2 construction is allowed to take before the
 /// editor gives up waiting silently and puts native diagnostics in front of the
@@ -53,6 +51,10 @@ public:
   WebViewHost(const WebViewHost &) = delete;
   WebViewHost &operator=(const WebViewHost &) = delete;
 
+  /// Stops callbacks and retires the current platform generation. Safe to call
+  /// repeatedly and before outstanding shared leases release the host object.
+  void shutdown() noexcept;
+
   [[nodiscard]] bool attach(void *owner, void *parent, std::int32_t width,
                             std::int32_t height);
   void resize(void *owner, std::int32_t width, std::int32_t height) noexcept;
@@ -60,7 +62,7 @@ public:
   [[nodiscard]] bool loaded() const noexcept;
   [[nodiscard]] bool evaluate(std::string script, EvaluationHandler handler);
 
-  [[nodiscard]] WebViewStatus status() const noexcept { return status_; }
+  [[nodiscard]] WebViewStatus status() const noexcept;
 
   /// Converts a WebView2 construction that never completes into visible
   /// diagnostics, and hands the window back to the WebView if it does eventually
@@ -78,42 +80,7 @@ public:
   [[nodiscard]] static std::string diagnosticText(WebViewStatus status);
 
 private:
-  struct ResourceData {
-    std::string mimeType;
-    std::string bytes;
-  };
-
-  [[nodiscard]] static std::filesystem::path locateResourceRoot();
-  [[nodiscard]] std::optional<ResourceData> fetchResource(std::string path) const;
-  void createWebView();
-  void replaceWebView() noexcept;
-  [[nodiscard]] bool webViewIsUsable() const noexcept;
-  [[nodiscard]] bool callerOwnsEditorWindows() const noexcept;
-  [[nodiscard]] bool ensureWebView();
-  void configure(choc::ui::WebView &view);
-  void beginInitialisationWatch() noexcept;
-  void endInitialisationWatch() noexcept;
-  void presentNativeView() noexcept;
-  [[nodiscard]] bool showDiagnosticView() noexcept;
-  void destroyDiagnosticView() noexcept;
-
-  MessageHandler handler_;
-  std::filesystem::path resourceRoot_;
-  bool resourceBundleAvailable_ = false;
-  std::unique_ptr<choc::ui::WebView> webView_;
-  void *owner_ = nullptr;
-  void *parent_ = nullptr;
-  std::int32_t lastWidth_ = 1;
-  std::int32_t lastHeight_ = 1;
-  WebViewStatus status_ = WebViewStatus::initialising;
-  std::chrono::steady_clock::time_point attachedAt_{};
-  bool diagnosticVisible_ = false;
-#if defined(_WIN32)
-  void *diagnosticView_ = nullptr;
-  void *diagnosticFont_ = nullptr;
-  std::uint32_t attachedThread_ = 0;
-  std::uintptr_t watchdogTimer_ = 0;
-#endif
+  std::shared_ptr<WebViewHostState> state_;
 };
 
 } // namespace effetune::vst

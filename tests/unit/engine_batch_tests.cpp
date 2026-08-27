@@ -8,6 +8,10 @@
 #include <string>
 #include <utility>
 
+#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
+#include <xmmintrin.h>
+#endif
+
 #include "../support/crt_dialog_suppression.h"
 
 using namespace effetune::vst;
@@ -50,6 +54,49 @@ PluginState makeNode(const std::uint32_t logicalId, std::string type,
   plugin.channel = channel;
   return plugin;
 }
+
+#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
+class MxcsrStateRestorer final {
+public:
+  explicit MxcsrStateRestorer(const unsigned int value) noexcept : value_(value) {}
+  ~MxcsrStateRestorer() noexcept { _mm_setcsr(value_); }
+
+  MxcsrStateRestorer(const MxcsrStateRestorer &) = delete;
+  MxcsrStateRestorer &operator=(const MxcsrStateRestorer &) = delete;
+
+private:
+  unsigned int value_ = 0;
+};
+
+void testProcessChunkRestoresMxcsr() {
+  EngineHost engine;
+  std::string error;
+  expect(engine.prepare(48000.0, 1, EngineHost::kDefaultTelemetryBytes, &error),
+         "MXCSR engine prepare: " + error);
+  const auto kernel = engine.kernels().find("TestGainPlugin");
+  expect(kernel != engine.kernels().end(), "MXCSR test kernel registration");
+  PipelineState pipeline;
+  pipeline.plugins = {PluginState{1, "TestGainPlugin", true}};
+  const auto runtime = makeGain(1, kernel->second.paramsHash);
+  expect(engine.rebuild(pipeline, {runtime}, &error), "MXCSR engine rebuild: " + error);
+
+  const auto originalMxcsr = _mm_getcsr();
+  const MxcsrStateRestorer restoreOriginalMxcsr(originalMxcsr);
+  constexpr unsigned int flushMask = (1u << 15u) | (1u << 6u);
+  const auto expectedMxcsr = originalMxcsr ^ flushMask;
+  _mm_setcsr(expectedMxcsr);
+
+  std::array<float, 4> samples{};
+  samples.fill(1.0f);
+  float *channels[] = {samples.data()};
+  EngineHost::ProcessBatch batch;
+  expect(engine.beginProcessBatch(batch), "begin MXCSR transaction");
+  expect(batch.processChunk(channels, 1, 4, 0.0, false), "process MXCSR transaction");
+  expect(batch.finish(), "finish MXCSR transaction");
+  expect(_mm_getcsr() == expectedMxcsr,
+         "pipeline processing restores the caller MXCSR state");
+}
+#endif
 
 void testSingleTransactionAndBoundaryStaging() {
   EngineHost engine;
@@ -253,6 +300,9 @@ void testChannelAwarePipelineLatencyRouting() {
 int main() {
   effetune::vst::testing::suppressCrtModalDialogs();
   try {
+#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
+    testProcessChunkRestoresMxcsr();
+#endif
     testSingleTransactionAndBoundaryStaging();
     testFailureCounters();
     testChannelAwarePipelineLatencyRouting();

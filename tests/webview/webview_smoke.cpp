@@ -9,6 +9,8 @@
 #include <exception>
 #include <filesystem>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -206,9 +208,139 @@ private:
   bool processScanFailed_ = false;
 };
 
-LRESULT CALLBACK parentWindowProcedure(HWND window, const UINT message, const WPARAM wParam,
+struct ParentWindowContention {
+  std::mutex *editorMutex = nullptr;
+  std::atomic_bool *childDestroyed = nullptr;
+};
+
+LRESULT CALLBACK parentWindowProcedure(HWND window, const UINT message,
+                                       const WPARAM wParam,
                                        const LPARAM lParam) {
+  if (message == WM_PARENTNOTIFY && LOWORD(wParam) == WM_DESTROY) {
+    auto *contention = reinterpret_cast<ParentWindowContention *>(
+        GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (contention != nullptr && contention->editorMutex != nullptr &&
+        contention->childDestroyed != nullptr) {
+      const std::scoped_lock lock(*contention->editorMutex);
+      contention->childDestroyed->store(true, std::memory_order_release);
+    }
+  }
   return DefWindowProcW(window, message, wParam, lParam);
+}
+
+[[nodiscard]] std::unordered_set<HWND> messageOnlyStaticWindows() {
+  std::unordered_set<HWND> windows;
+  auto window = static_cast<HWND>(nullptr);
+  while ((window = FindWindowExW(HWND_MESSAGE, window, L"STATIC", nullptr)) !=
+         nullptr) {
+    windows.insert(window);
+  }
+  return windows;
+}
+
+[[nodiscard]] int runNonPumpingOwnerChild() {
+  constexpr wchar_t browserFolderVariable[] =
+      L"WEBVIEW2_BROWSER_EXECUTABLE_FOLDER";
+  (void)SetEnvironmentVariableW(browserFolderVariable,
+                                L"C:\\effetune-nonexistent-webview2-runtime");
+  const auto published = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  const auto resumeOwner = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (published == nullptr || resumeOwner == nullptr) {
+    if (published != nullptr) CloseHandle(published);
+    if (resumeOwner != nullptr) CloseHandle(resumeOwner);
+    return 1;
+  }
+  std::mutex hostMutex;
+  std::shared_ptr<effetune::vst::WebViewHost> host;
+  std::atomic_bool constructed{false};
+  std::thread owner([&] {
+    if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
+      SetEvent(published);
+      return;
+    }
+    auto local = std::make_shared<effetune::vst::WebViewHost>(
+        [](const std::string_view) { return R"({"ok":true})"; },
+        std::filesystem::path(EFFETUNE_WEBVIEW_ASSET_DIR), true);
+    {
+      const std::scoped_lock lock(hostMutex);
+      host = local;
+    }
+    constructed.store(true, std::memory_order_release);
+    local.reset();
+    SetEvent(published);
+    (void)WaitForSingleObject(resumeOwner, 10000);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline) {
+      MSG message{};
+      bool dispatched = false;
+      while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE) != 0) {
+        dispatched = true;
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+      }
+      if (!dispatched) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      }
+    }
+    CoUninitialize();
+  });
+  if (WaitForSingleObject(published, 5000) != WAIT_OBJECT_0) {
+    SetEvent(resumeOwner);
+    owner.join();
+    CloseHandle(resumeOwner);
+    CloseHandle(published);
+    return 1;
+  }
+  std::shared_ptr<effetune::vst::WebViewHost> retired;
+  {
+    const std::scoped_lock lock(hostMutex);
+    retired = std::move(host);
+  }
+  const auto started = std::chrono::steady_clock::now();
+  retired.reset();
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  SetEvent(resumeOwner);
+  owner.join();
+  CloseHandle(resumeOwner);
+  CloseHandle(published);
+  (void)SetEnvironmentVariableW(browserFolderVariable, nullptr);
+  return constructed.load(std::memory_order_acquire) &&
+                 elapsed < std::chrono::seconds(3)
+             ? 0
+             : 1;
+}
+
+[[nodiscard]] bool runNonPumpingOwnerWatchdog() {
+  std::wstring executable(32768, L'\0');
+  const auto length = GetModuleFileNameW(
+      nullptr, executable.data(), static_cast<DWORD>(executable.size()));
+  if (length == 0 || length >= executable.size()) {
+    return false;
+  }
+  executable.resize(length);
+  auto commandLine = L"\"" + executable +
+                     L"\" --non-pumping-owner-child";
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  PROCESS_INFORMATION process{};
+  if (CreateProcessW(nullptr, commandLine.data(), nullptr, nullptr, FALSE,
+                     CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process) ==
+      FALSE) {
+    return false;
+  }
+  const auto wait = WaitForSingleObject(process.hProcess, 8000);
+  if (wait != WAIT_OBJECT_0) {
+    (void)TerminateProcess(process.hProcess, 1);
+    (void)WaitForSingleObject(process.hProcess, 2000);
+  }
+  DWORD exitCode = 1;
+  const auto exited = wait == WAIT_OBJECT_0 &&
+                      GetExitCodeProcess(process.hProcess, &exitCode) != FALSE &&
+                      exitCode == 0;
+  CloseHandle(process.hThread);
+  CloseHandle(process.hProcess);
+  return exited;
 }
 
 struct SmokeState {
@@ -238,8 +370,12 @@ struct SmokeState {
     return "{\"ok\":true,\"sampleRate\":48000,\"engineSampleRate\":" +
            std::to_string(state.engineSampleRate.load(std::memory_order_relaxed)) +
            ",\"channels\":" + std::to_string(state.channels.load(std::memory_order_relaxed)) +
-           ",\"oversamplingFactor\":1,\"latencySamples\":0,\"masterBypass\":false,"
+           ",\"oversamplingFactor\":1,\"latencySamples\":128,"
+           "\"processingLatencySamples\":384,\"latencyCompensated\":false,"
+           "\"pipelineCpuAverage\":12.5,\"masterBypass\":false,"
            "\"dspReady\":true,"
+           "\"executionStates\":[{\"pluginId\":4243,"
+           "\"pluginType\":\"AMRadioSimulatorPlugin\",\"state\":\"active\"}],"
            "\"contextGeneration\":" +
            std::to_string(state.contextGeneration.load(std::memory_order_relaxed)) +
            ",\"version\":\"test\"}";
@@ -253,7 +389,7 @@ struct SmokeState {
   if (request.find("storage/readFile") != std::string_view::npos) {
     if (request.find("pipeline-state.json") != std::string_view::npos) {
       state.pipelineStateRead.store(true, std::memory_order_release);
-      return R"({"ok":true,"success":true,"content":"{\"pipelineA\":[],\"pipelineB\":[{\"name\":\"UnavailableFutureEffect\",\"enabled\":true,\"parameters\":{\"future\":1}}],\"currentPipeline\":\"A\"}"})";
+      return R"({"ok":true,"success":true,"content":"{\"pipelineA\":[{\"id\":4243,\"name\":\"AM Radio Simulator\",\"enabled\":true,\"parameters\":{}}],\"pipelineB\":[{\"name\":\"UnavailableFutureEffect\",\"enabled\":true,\"parameters\":{\"future\":1}}],\"currentPipeline\":\"A\"}"})";
     }
     return R"({"ok":true,"success":false,"content":"{}"})";
   }
@@ -269,6 +405,8 @@ struct SmokeState {
            ",\"engineSampleRate\":" +
            std::to_string(state.engineSampleRate.load(std::memory_order_relaxed)) +
            ",\"channels\":" + std::to_string(state.channels.load(std::memory_order_relaxed)) +
+           ",\"latencySamples\":128,\"processingLatencySamples\":384,"
+           "\"latencyCompensated\":false,\"pipelineCpuAverage\":12.5"
            "}";
   }
   if (request.find("telemetry/discard") != std::string_view::npos) {
@@ -329,10 +467,18 @@ struct SmokeState {
 
 } // namespace
 
-int main() {
+int main(const int argc, char **argv) {
   effetune::vst::testing::suppressCrtModalDialogs();
   const auto errorMode = SetErrorMode(0);
   SetErrorMode(errorMode | SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+  if (argc == 2 && std::string_view(argv[1]) ==
+                       "--non-pumping-owner-child") {
+    return runNonPumpingOwnerChild();
+  }
+  if (!runNonPumpingOwnerWatchdog()) {
+    std::cerr << "WebView teardown blocked on a non-pumping owner STA\n";
+    return 1;
+  }
   ScopedWebViewProfile webViewProfile;
   if (!webViewProfile.configured()) {
     std::cerr << "Unable to create an isolated WebView2 user-data profile\n";
@@ -353,6 +499,202 @@ int main() {
                            WS_OVERLAPPEDWINDOW, -30000, -30000, 900, 650,
                            nullptr, nullptr, instance, nullptr);
   };
+
+  // A processor may already have handed an editor a shared lease when
+  // terminate retires its owning reference. Explicit shutdown must stop that
+  // lease before the processor itself can be destroyed, even when the lease's
+  // owner STA is paused and cannot service the release synchronously.
+  bool stoppedLeaseRejectedAttach = false;
+  {
+    const auto leasePublished = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    const auto resumeLease = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    std::mutex leaseMutex;
+    std::shared_ptr<effetune::vst::WebViewHost> processorWebView;
+    std::atomic_bool attachReturned{true};
+    std::atomic_uint32_t bridgeCalls{0};
+    std::thread editorLease([&] {
+      if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
+        SetEvent(leasePublished);
+        return;
+      }
+      auto lease = std::make_shared<effetune::vst::WebViewHost>(
+          [&bridgeCalls](const std::string_view) {
+            bridgeCalls.fetch_add(1, std::memory_order_relaxed);
+            return R"({"ok":true})";
+          },
+          std::filesystem::path(EFFETUNE_WEBVIEW_ASSET_DIR), true);
+      {
+        const std::scoped_lock lock(leaseMutex);
+        processorWebView = lease;
+      }
+      SetEvent(leasePublished);
+      (void)WaitForSingleObject(resumeLease, 10000);
+      const auto leaseParent = createParent();
+      int leaseOwner = 0;
+      attachReturned.store(
+          leaseParent != nullptr &&
+              lease->attach(&leaseOwner, leaseParent, 240, 160),
+          std::memory_order_release);
+      lease.reset();
+      const auto releaseDeadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      while (std::chrono::steady_clock::now() < releaseDeadline) {
+        MSG message{};
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE) != 0) {
+          TranslateMessage(&message);
+          DispatchMessageW(&message);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      }
+      if (leaseParent != nullptr) {
+        DestroyWindow(leaseParent);
+      }
+      CoUninitialize();
+    });
+    const auto publishedWait = WaitForSingleObject(leasePublished, 5000);
+    std::shared_ptr<effetune::vst::WebViewHost> retiredWebView;
+    {
+      const std::scoped_lock lock(leaseMutex);
+      retiredWebView = std::move(processorWebView);
+    }
+    const auto shutdownStarted = std::chrono::steady_clock::now();
+    if (retiredWebView != nullptr) {
+      retiredWebView->shutdown();
+    }
+    retiredWebView.reset();
+    const auto shutdownElapsed =
+        std::chrono::steady_clock::now() - shutdownStarted;
+    SetEvent(resumeLease);
+    editorLease.join();
+    stoppedLeaseRejectedAttach =
+        publishedWait == WAIT_OBJECT_0 &&
+        shutdownElapsed < std::chrono::seconds(3) &&
+        !attachReturned.load(std::memory_order_acquire) &&
+        bridgeCalls.load(std::memory_order_acquire) == 0;
+    CloseHandle(resumeLease);
+    CloseHandle(leasePublished);
+  }
+  if (!stoppedLeaseRejectedAttach) {
+    std::cerr << "A stopped WebView lease accepted a late editor attach\n";
+    return 1;
+  }
+
+  // VST initialize and editor attach are allowed to use different STAs. A
+  // pending generation from initialize must be retired without touching it on
+  // the editor STA; every later operation must run on the editor's pumping STA.
+  bool splitStaOperationsMarshalled = false;
+  {
+    const auto created = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    const auto releaseCreator = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    const auto attached = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    const auto resized = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    const auto stopEditor = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    std::mutex splitMutex;
+    std::shared_ptr<effetune::vst::WebViewHost> splitHost;
+    int splitOwner = 0;
+    std::atomic_bool splitAttached{false};
+    std::thread creator([&] {
+      if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
+        SetEvent(created);
+        return;
+      }
+      auto local = std::make_shared<effetune::vst::WebViewHost>(
+          [](const std::string_view) { return R"({"ok":true})"; },
+          std::filesystem::path(EFFETUNE_WEBVIEW_ASSET_DIR), true);
+      {
+        const std::scoped_lock lock(splitMutex);
+        splitHost = local;
+      }
+      local.reset();
+      SetEvent(created);
+      (void)WaitForSingleObject(releaseCreator, 10000);
+      MSG message{};
+      while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE) != 0) {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+      }
+      CoUninitialize();
+    });
+    (void)WaitForSingleObject(created, 5000);
+    std::shared_ptr<effetune::vst::WebViewHost> mainSplitHost;
+    {
+      const std::scoped_lock lock(splitMutex);
+      mainSplitHost = splitHost;
+      splitHost.reset();
+    }
+    std::thread editor([&] {
+      if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
+        SetEvent(attached);
+        return;
+      }
+      const auto splitParent = createParent();
+      std::shared_ptr<effetune::vst::WebViewHost> local;
+      {
+        const std::scoped_lock lock(splitMutex);
+        local = mainSplitHost;
+      }
+      splitAttached.store(
+          local != nullptr && splitParent != nullptr &&
+              local->attach(&splitOwner, splitParent, 240, 160),
+          std::memory_order_release);
+      local.reset();
+      SetEvent(attached);
+      while (WaitForSingleObject(stopEditor, 0) == WAIT_TIMEOUT) {
+        MSG message{};
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE) != 0) {
+          TranslateMessage(&message);
+          DispatchMessageW(&message);
+        }
+        if (splitParent != nullptr) {
+          for (auto child = GetWindow(splitParent, GW_CHILD); child != nullptr;
+               child = GetWindow(child, GW_HWNDNEXT)) {
+            RECT bounds{};
+            if (GetWindowRect(child, &bounds) != FALSE &&
+                bounds.right - bounds.left == 321 &&
+                bounds.bottom - bounds.top == 213) {
+              SetEvent(resized);
+              break;
+            }
+          }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      }
+      if (splitParent != nullptr) {
+        DestroyWindow(splitParent);
+      }
+      CoUninitialize();
+    });
+    const auto attachedWait = WaitForSingleObject(attached, 7000);
+    bool evaluateReturnedBoundedly = false;
+    if (attachedWait == WAIT_OBJECT_0 && mainSplitHost != nullptr &&
+        splitAttached.load(std::memory_order_acquire)) {
+      mainSplitHost->resize(&splitOwner, 321, 213);
+      const auto evaluateStarted = std::chrono::steady_clock::now();
+      (void)mainSplitHost->evaluate("true", {});
+      evaluateReturnedBoundedly =
+          std::chrono::steady_clock::now() - evaluateStarted <
+          std::chrono::seconds(2);
+    }
+    const auto resizeWait = WaitForSingleObject(resized, 3000);
+    SetEvent(releaseCreator);
+    creator.join();
+    mainSplitHost.reset();
+    SetEvent(stopEditor);
+    editor.join();
+    splitStaOperationsMarshalled =
+        attachedWait == WAIT_OBJECT_0 &&
+        splitAttached.load(std::memory_order_acquire) &&
+        resizeWait == WAIT_OBJECT_0 && evaluateReturnedBoundedly;
+    CloseHandle(stopEditor);
+    CloseHandle(resized);
+    CloseHandle(attached);
+    CloseHandle(releaseCreator);
+    CloseHandle(created);
+  }
+  if (!splitStaOperationsMarshalled) {
+    std::cerr << "Split-STA WebView operations did not marshal to the editor owner\n";
+    return 1;
+  }
   auto parent = createParent();
   if (parent == nullptr) {
     std::cerr << "Unable to create the WebView smoke parent window\n";
@@ -367,22 +709,29 @@ int main() {
   std::string evaluationResult;
   std::string readinessDiagnostics;
   bool telemetryDelivered = false;
+  bool amRadioHudDisplayed = false;
+  std::string amRadioHudDiagnostics;
   bool dynamicLatencyServiced = false;
+  bool nativePerformanceStatusVisible = false;
   bool historyUsedSingleNativeRestore = false;
   bool updatePluginRoutedByOwnership = false;
   bool unsupportedStateWarningShown = false;
   bool hiddenContextSynchronized = false;
   bool hiddenTelemetryDiscarded = false;
   bool contextMenuDisabled = false;
+  bool homeKeyReservedForHost = false;
   bool clipboardReachable = false;
   bool libraryEntriesDisabled = false;
   bool headerControlsAreVstSpecific = false;
   bool configDialogIsLanguageOnly = false;
   bool languageChangedImmediately = false;
   bool measurementImportAvailable = false;
+  std::string measurementImportDiagnostics;
   bool aboutNoticesReachable = false;
   bool externalLinksRouted = false;
   bool isolatedWebOrigin = false;
+  bool offThreadUiTeardownCompleted = false;
+  bool dispatcherIdentityProtected = false;
   bool masterToggleReachedNative = false;
   bool defaultViewportFits = false;
   bool reattachedWithFreshWebView = false;
@@ -489,6 +838,10 @@ int main() {
             "title:document.title,loadError:document.documentElement.dataset.effetuneLoadError||'',"
             "body:(document.body?.innerText||'').slice(0,240)})",
             readinessDiagnostics);
+        if (readinessDiagnostics.empty()) {
+          readinessDiagnostics =
+              effetune::vst::WebViewHost::diagnosticText(webView.status());
+        }
       }
 
       if (uiReady.load(std::memory_order_acquire)) {
@@ -505,6 +858,39 @@ int main() {
             "document.getElementById('errorDisplay')?.textContent === "
             "'Some effects are unavailable and were bypassed.'",
             std::chrono::seconds(10));
+        nativePerformanceStatusVisible = waitForJavascript(
+            "window.audioManager?.dspPipelineLatencySamples === 384 && "
+            "window.audioManager?.pipelineCpuAveragePercent === 12.5 && "
+            "document.getElementById('pipelineLatency')?.textContent.includes('384') && "
+            "document.getElementById('pipelineCpuValue')?.textContent.includes('12.5') && "
+            "document.getElementById('pipelineCpuMeterFill')?.style.width === '12.5%'",
+            std::chrono::seconds(5));
+        amRadioHudDisplayed = waitForJavascript(
+            "(() => { const am = window.audioManager?.pipelineA?.find(plugin => "
+            "plugin?.constructor?.name === 'AMRadioSimulatorPlugin'); "
+            "const canvas = am?.hudCanvas; if (!canvas || canvas.width < 1 || "
+            "canvas.height < 1 || am.executionState?.state !== 'active') return false; "
+            "const labels = []; const prototype = CanvasRenderingContext2D.prototype; "
+            "const fillText = prototype.fillText; const canRunAnimation = am.canRunAnimation; "
+            "try { prototype.fillText = function(text, ...args) { labels.push(String(text)); "
+            "return fillText.call(this, text, ...args); }; am.canRunAnimation = () => true; "
+            "am.drawHud(); } finally { prototype.fillText = fillText; "
+            "am.canRunAnimation = canRunAnimation; } "
+            "return labels.includes('S METER') && labels.includes('AGC GAIN'); })()",
+            std::chrono::seconds(5));
+        if (!amRadioHudDisplayed) {
+          (void)evaluate(
+              "(() => { const audio = window.audioManager; const am = "
+              "audio?.pipelineA?.find(plugin => plugin?.constructor?.name === "
+              "'AMRadioSimulatorPlugin'); return JSON.stringify({ initialized: "
+              "window.app?.initialized, pipelineA: audio?.pipelineA?.map(plugin => ({ id: "
+              "plugin.id, type: plugin?.constructor?.name })), pending: "
+              "audio?.pendingNativeExecutionStates, snapshot: "
+              "audio?.getDspExecutionStateSnapshot?.(), amState: am?.executionState, "
+              "hasCanvas: !!am?.hudCanvas, canvasWidth: am?.hudCanvas?.width, "
+              "canvasHeight: am?.hudCanvas?.height }); })()",
+              amRadioHudDiagnostics);
+        }
         const auto latencyServiceStarted = std::chrono::steady_clock::now();
         const auto latencyServiceScheduled = evaluate(
             "(() => { const hostCall = window.__effetuneHostCall; "
@@ -640,7 +1026,9 @@ int main() {
         hiddenContextSynchronized = hiddenInstalled && hiddenPollStarted && waitForJavascript(
             "window.audioManager?.nativeContextGeneration === 2 && "
             "window.audioManager?.audioContext?.sampleRate === 96000 && "
-            "window.audioManager?.audioContext?.destination?.channelCount === 4",
+            "window.audioManager?.audioContext?.destination?.channelCount === 4 && "
+            "window.audioManager?.outputChannelCount === 4 && "
+            "window.workletNode?.channelCount === 4",
             std::chrono::seconds(5)) &&
             smokeState.pipelineRebuildCalls.load(std::memory_order_relaxed) > rebuildCallsBefore;
 
@@ -665,6 +1053,32 @@ int main() {
             "(() => { const event = new MouseEvent('contextmenu', "
             "{ bubbles: true, cancelable: true }); document.body.dispatchEvent(event); "
             "return event.defaultPrevented; })()",
+            ignored) && ignored == "true";
+
+        homeKeyReservedForHost = evaluate(
+            R"JS((() => {
+              let downstreamCalls = 0;
+              const downstream = () => { downstreamCalls += 1; };
+              window.addEventListener('keydown', downstream, true);
+              const input = document.createElement('input');
+              document.body.appendChild(input);
+              let correct = true;
+              for (let modifiers = 0; modifiers < 16; ++modifiers) {
+                const options = { key: 'Home', bubbles: true, cancelable: true,
+                  ctrlKey: !!(modifiers & 1), shiftKey: !!(modifiers & 2),
+                  altKey: !!(modifiers & 4), metaKey: !!(modifiers & 8) };
+                input.blur();
+                const outside = new KeyboardEvent('keydown', options);
+                document.body.dispatchEvent(outside);
+                input.focus();
+                const editing = new KeyboardEvent('keydown', options);
+                input.dispatchEvent(editing);
+                correct &&= outside.defaultPrevented && !editing.defaultPrevented;
+              }
+              input.remove();
+              window.removeEventListener('keydown', downstream, true);
+              return correct && downstreamCalls === 16;
+            })())JS",
             ignored) && ignored == "true";
 
         clipboardReachable = evaluate(
@@ -728,6 +1142,7 @@ int main() {
                 const importer = window.__effetuneMeasurementImport;
                 if (!importer || importer.maximumBytes !== 134217728) return;
                 const plugin = window.pluginManager.createPlugin('Room EQ');
+                plugin.channel = 'A';
                 window.audioManager.pipeline.push(plugin);
                 window.uiManager.pipelineManager.updatePipelineUI(true);
                 let invalidRejected = false;
@@ -762,8 +1177,28 @@ int main() {
                 for (let attempt = 0; deleteButton?.disabled && attempt < 50; ++attempt) {
                   await new Promise(resolve => setTimeout(resolve, 10));
                 }
+                plugin.setParameters({
+                  ms0: measurementId,
+                  mn0: 'Imported WebView Measurement',
+                  ms3: measurementId,
+                  mn3: 'Imported WebView Measurement'
+                });
+                await plugin._renderMeasurement();
+                const channelOnlyPlugin = window.pluginManager.createPlugin('Room EQ');
+                channelOnlyPlugin.channel = 'A';
+                channelOnlyPlugin.setParameters({
+                  ms1: measurementId,
+                  mn1: 'Imported WebView Measurement'
+                });
+                window.audioManager.pipeline.push(channelOnlyPlugin);
                 const importedUiReady = invalidRejected &&
                   plugin.measurementId === measurementId &&
+                  plugin._outputChannelCount === 4 &&
+                  plugin.channelMeasurementIds[0] === measurementId &&
+                  plugin.channelMeasurementIds[3] === measurementId &&
+                  channelOnlyPlugin.measurementId === '' &&
+                  channelOnlyPlugin.channelMeasurementIds[1] === measurementId &&
+                  document.querySelectorAll('.room-eq-channel-measurement-row').length === 4 &&
                   option?.textContent.includes('Imported WebView Measurement') &&
                   importButton?.textContent === 'Import\u2026' &&
                   deleteButton?.textContent === 'Delete' &&
@@ -784,7 +1219,13 @@ int main() {
                   await new Promise(resolve => setTimeout(resolve, 10));
                   const store = await plugin._getMeasurementStore(true);
                   if (!await store?.getMeasurement(measurementId) &&
-                      deleteButton.disabled && plugin.measurementId === '') {
+                      deleteButton.disabled && plugin.measurementId === '' &&
+                      plugin.channelMeasurementIds.every(id => id !== measurementId) &&
+                      plugin.channelMeasurementNames[0] === '' &&
+                      plugin.channelMeasurementNames[3] === '' &&
+                      channelOnlyPlugin.channelMeasurementIds.every(
+                        id => id !== measurementId) &&
+                      channelOnlyPlugin.channelMeasurementNames[1] === '') {
                     measurementDeleted = true;
                     break;
                   }
@@ -797,6 +1238,20 @@ int main() {
                 );
                 window.__vstMeasurementImportReady = importedUiReady && confirmationReady &&
                   measurementDeleted && measurementSelect?.value === '' && !deletedOption;
+                window.__vstMeasurementImportDiagnostics = {
+                  importedUiReady,
+                  confirmationReady,
+                  measurementDeleted,
+                  measurementId: plugin.measurementId,
+                  outputChannelCount: plugin._outputChannelCount,
+                  channelMeasurementIds: [...plugin.channelMeasurementIds],
+                  channelMeasurementNames: [...plugin.channelMeasurementNames],
+                  channelRows: document.querySelectorAll(
+                    '.room-eq-channel-measurement-row').length,
+                  deleteDisabled: deleteButton?.disabled,
+                  selectValue: measurementSelect?.value,
+                  deletedOptionPresent: !!deletedOption
+                };
               })().catch(error => {
                 window.__vstMeasurementImportError = String(error?.stack || error);
               });
@@ -806,6 +1261,11 @@ int main() {
         measurementImportAvailable = measurementImportStarted && waitForJavascript(
             "window.__vstMeasurementImportReady === true",
             std::chrono::seconds(10));
+        if (!measurementImportAvailable) {
+          evaluate("JSON.stringify({ error: window.__vstMeasurementImportError, "
+                   "details: window.__vstMeasurementImportDiagnostics })",
+                   measurementImportDiagnostics);
+        }
         const auto configDialogOpened = languageFixtureReady && evaluate(
             "(() => { document.getElementById('configSettingsButton')?.click(); return true; })()",
             ignored) && ignored == "true" && waitForJavascript(
@@ -1243,6 +1703,93 @@ int main() {
   });
   apartmentProbe.join();
 
+  // Some hosts terminate the component away from the thread that owns the
+  // editor. Destruction must marshal the watchdog/diagnostic HWNDs and CHOC
+  // WebView back to their creating STA without holding the processor-like lock,
+  // with no timer callback left able to enter freed WebViewHost storage.
+  std::mutex processorLikeEditorMutex;
+  std::shared_ptr<effetune::vst::WebViewHost> offThreadHost;
+  std::vector<HWND> offThreadDispatchers;
+  std::atomic<bool> offThreadHostPublished{false};
+  std::atomic<bool> offThreadHostDestroyed{false};
+  std::atomic_bool parentObservedChildDestruction{false};
+  ParentWindowContention parentContention{
+      &processorLikeEditorMutex, &parentObservedChildDestruction};
+  std::thread offThreadUiOwner([&] {
+    if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) {
+      offThreadHostPublished.store(true, std::memory_order_release);
+      return;
+    }
+    const auto teardownParent = createParent();
+    int teardownOwner = 0;
+    if (teardownParent != nullptr) {
+      SetWindowLongPtrW(teardownParent, GWLP_USERDATA,
+                        reinterpret_cast<LONG_PTR>(&parentContention));
+    }
+    const auto dispatcherWindowsBefore = messageOnlyStaticWindows();
+    auto teardownHost = std::make_shared<effetune::vst::WebViewHost>(
+        [](const std::string_view) { return R"({"ok":true})"; },
+        std::filesystem::path(EFFETUNE_WEBVIEW_ASSET_DIR), false);
+    const auto teardownAttached =
+        teardownParent != nullptr &&
+        teardownHost->attach(&teardownOwner, teardownParent,
+                             effetune::vst::plugin::kDefaultEditorWidth,
+                             effetune::vst::plugin::kDefaultEditorHeight);
+    const auto nativeChild =
+        teardownParent == nullptr ? nullptr : GetWindow(teardownParent, GW_CHILD);
+    for (const auto dispatcher : messageOnlyStaticWindows()) {
+      if (!dispatcherWindowsBefore.contains(dispatcher)) {
+        offThreadDispatchers.push_back(dispatcher);
+      }
+    }
+    {
+      const std::scoped_lock lock(processorLikeEditorMutex);
+      offThreadHost = teardownHost;
+    }
+    teardownHost.reset();
+    offThreadHostPublished.store(true, std::memory_order_release);
+    while (!offThreadHostDestroyed.load(std::memory_order_acquire)) {
+      MSG message{};
+      while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE) != 0) {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    offThreadUiTeardownCompleted =
+        teardownAttached &&
+        parentObservedChildDestruction.load(std::memory_order_acquire) &&
+        (nativeChild == nullptr || IsWindow(nativeChild) == FALSE) &&
+        (teardownParent == nullptr || GetWindow(teardownParent, GW_CHILD) == nullptr);
+    if (teardownParent != nullptr) {
+      SetWindowLongPtrW(teardownParent, GWLP_USERDATA, 0);
+      DestroyWindow(teardownParent);
+    }
+    CoUninitialize();
+  });
+  while (!offThreadHostPublished.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+  // A recycled HWND can point at a different dispatcher. Its identity must be
+  // part of the command, so a stale release cannot destroy that new owner.
+  constexpr UINT dispatcherMessage = WM_APP + 0x45f;
+  constexpr WPARAM releaseCommand = 1;
+  dispatcherIdentityProtected = offThreadDispatchers.size() == 1;
+  for (const auto dispatcher : offThreadDispatchers) {
+    dispatcherIdentityProtected =
+        dispatcherIdentityProtected &&
+        SendMessageW(dispatcher, dispatcherMessage, releaseCommand, 0) == 0 &&
+        IsWindow(dispatcher) != FALSE;
+  }
+  std::shared_ptr<effetune::vst::WebViewHost> retiredWebView;
+  {
+    const std::scoped_lock lock(processorLikeEditorMutex);
+    retiredWebView = std::move(offThreadHost);
+  }
+  retiredWebView.reset();
+  offThreadHostDestroyed.store(true, std::memory_order_release);
+  offThreadUiOwner.join();
+
   if (parent != nullptr) {
     DestroyWindow(parent);
   }
@@ -1254,6 +1801,14 @@ int main() {
     return 1;
   }
 
+  if (!offThreadUiTeardownCompleted) {
+    std::cerr << "Off-thread WebView destruction did not finish on its owning UI thread\n";
+    return 1;
+  }
+  if (!dispatcherIdentityProtected) {
+    std::cerr << "A dispatcher accepted a release command with the wrong identity\n";
+    return 1;
+  }
   if (!attached) {
     std::cerr << "WebView2 could not be attached\n";
     return 1;
@@ -1282,8 +1837,17 @@ int main() {
     std::cerr << "A non-empty native telemetry packet did not reach a TelemetryHub subscriber\n";
     return 1;
   }
+  if (!amRadioHudDisplayed) {
+    std::cerr << "AM Radio Simulator did not receive active DSP state or draw its HUD cards: "
+              << amRadioHudDiagnostics << '\n';
+    return 1;
+  }
   if (!dynamicLatencyServiced) {
     std::cerr << "Dynamic latency servicing was not independently debounced\n";
+    return 1;
+  }
+  if (!nativePerformanceStatusVisible) {
+    std::cerr << "Native latency and CPU status did not reach the upstream UI\n";
     return 1;
   }
   if (!historyUsedSingleNativeRestore) {
@@ -1310,6 +1874,10 @@ int main() {
     std::cerr << "The browser context menu remains enabled\n";
     return 1;
   }
+  if (!homeKeyReservedForHost) {
+    std::cerr << "Home remains reachable outside editable VST WebView controls\n";
+    return 1;
+  }
   if (!clipboardReachable) {
     std::cerr << "Normal pipeline clipboard paste is not reachable\n";
     return 1;
@@ -1331,7 +1899,8 @@ int main() {
     return 1;
   }
   if (!measurementImportAvailable) {
-    std::cerr << "Room EQ did not import, delete, and clear an exported measurement JSON file\n";
+    std::cerr << "Room EQ did not import, delete, and clear an exported measurement JSON file: "
+              << measurementImportDiagnostics << '\n';
     return 1;
   }
   if (!aboutNoticesReachable) {
@@ -1395,8 +1964,10 @@ int main() {
     std::cerr << "A recreated WebView cleared the native pipeline before restoring its state\n";
     return 1;
   }
-  std::cout << "EffeTune WebView exercised telemetry resume, history restore, A/B routing, "
-               "unavailable-state warning, clipboard, excluded library, context, language, "
+  std::cout << "EffeTune WebView exercised AM Radio HUD state, telemetry resume, history "
+            "restore, A/B routing, "
+               "unavailable-state warning, host Home shortcut, clipboard, excluded library, "
+               "context, language, "
                "Room EQ measurement import, About notices, external links, bypass, and editor "
                "reattachment\n";
   return 0;

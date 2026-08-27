@@ -4,6 +4,20 @@
   window.__EFFETUNE_VST__ = true;
   window.pipelineStateLoaded = true;
   window.addEventListener('contextmenu', event => event.preventDefault(), true);
+  const needsHomeKeyForEditing = target => {
+    const tagName = String(target?.tagName || '').toLowerCase();
+    return tagName === 'input' || tagName === 'textarea' || tagName === 'select' ||
+      target?.isContentEditable === true;
+  };
+  // Home is a common DAW transport shortcut. Keep every modifier combination
+  // outside editable controls from acquiring a second action inside the UI.
+  window.addEventListener('keydown', event => {
+    if (event.key !== 'Home' || needsHomeKeyForEditing(event.target)) {
+      return;
+    }
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  }, true);
 
   const style = document.createElement('style');
   style.textContent = `
@@ -445,13 +459,22 @@
   });
   const clearDeletedMeasurementReferences = async measurementId => {
     const plugins = roomEqPlugins();
-    const referencingPlugins = plugins.filter(plugin => plugin.measurementId === measurementId);
-    for (const plugin of referencingPlugins) {
-      plugin.setParameters({
-        ms: '',
-        mn: '',
-        rp: 0
-      });
+    const referencingPlugins = [];
+    for (const plugin of plugins) {
+      const parameters = {};
+      if (plugin.measurementId === measurementId) {
+        parameters.ms = '';
+        parameters.mn = '';
+        parameters.rp = 0;
+      }
+      for (let index = 0; index < 8; index += 1) {
+        if (plugin.channelMeasurementIds?.[index] !== measurementId) continue;
+        parameters[`ms${index}`] = '';
+        parameters[`mn${index}`] = '';
+      }
+      if (Object.keys(parameters).length === 0) continue;
+      plugin.setParameters(parameters);
+      referencingPlugins.push(plugin);
     }
     await Promise.all(referencingPlugins.map(plugin => plugin._renderMeasurement()));
     return plugins;

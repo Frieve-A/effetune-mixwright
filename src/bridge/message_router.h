@@ -15,6 +15,7 @@ enum class UiAction {
   restoreHistory,
   updatePlugin,
   editAutomationParameter,
+  beginAutomationGesture,
   endAutomationGesture,
   beginPluginAsset,
   appendPluginAsset,
@@ -74,8 +75,8 @@ struct RoutedUiMessage {
   std::vector<RoutedPlugin> pipelineB;
   // Empty for every message type that carries no explicit automation intent,
   // including plug-in updates and bulk messages sent by an older UI. An
-  // endAutomationGesture message fills the identity of every entry and nothing
-  // else: ending a touch names no value.
+  // beginAutomationGesture and endAutomationGesture messages fill the identity
+  // of every entry and nothing else: touch boundaries name no value.
   std::vector<RoutedAutomationEdit> automationEdits;
   RuntimeAsset asset;
   std::uint64_t operationRevision = 0;

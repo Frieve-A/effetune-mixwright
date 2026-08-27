@@ -34,6 +34,8 @@ struct RuntimePlugin {
   std::uint32_t paramsHash = 0;
   std::vector<std::uint8_t> parameterBytes;
   std::uint32_t tapId = 0;
+  RuntimeExecutionCapabilities executionCapabilities;
+  bool contextuallyBypassed = false;
 };
 
 struct RuntimeAsset {
@@ -89,6 +91,7 @@ public:
     std::uint32_t logicalId = 0;
     et_instance instance = 0;
     std::uint32_t paramsHash = 0;
+    bool contextuallyBypassed = false;
 
     [[nodiscard]] explicit operator bool() const noexcept {
       return logicalId != 0 && instance != 0;
@@ -205,6 +208,7 @@ private:
     et_instance instance = 0;
     std::uint32_t paramsHash = 0;
     std::uint32_t kernelIndex = 0;
+    bool contextuallyBypassed = false;
   };
 
   void discoverKernels();

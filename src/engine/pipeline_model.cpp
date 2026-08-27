@@ -1,7 +1,10 @@
 #include "engine/pipeline_model.h"
 
+#include <algorithm>
 #include <array>
+#include <span>
 #include <stdexcept>
+#include <string_view>
 #include <unordered_set>
 
 namespace effetune::vst {
@@ -27,6 +30,78 @@ struct EncodedNode {
 
 bool isSectionPlugin(const PluginState &plugin) noexcept {
   return plugin.name == "Section" || plugin.name == "SectionPlugin";
+}
+
+ExecutionContextSupport executionContextSupport(
+    const RuntimeExecutionCapabilities &capabilities,
+    const std::optional<std::string> &channel, const double sampleRate,
+    const std::uint32_t outputChannelCount) noexcept {
+  if (capabilities.constrainsSampleRate) {
+    if (capabilities.supportedSampleRateCount >
+        capabilities.supportedSampleRates.size()) {
+      return ExecutionContextSupport::unsupportedSampleRate;
+    }
+    const auto rates = std::span(capabilities.supportedSampleRates)
+                           .first(capabilities.supportedSampleRateCount);
+    if (std::find(rates.begin(), rates.end(), sampleRate) == rates.end()) {
+      return ExecutionContextSupport::unsupportedSampleRate;
+    }
+  }
+  if (!capabilities.constrainsChannelMode) {
+    return ExecutionContextSupport::supported;
+  }
+
+  auto mode = ExecutionChannelMode::stereoPair;
+  std::uint32_t firstChannel = 0;
+  std::uint32_t requiredChannels = 2;
+  const std::string_view selection = channel.has_value()
+                                         ? std::string_view(channel->data(), channel->size())
+                                         : std::string_view{};
+  if (selection == "A") {
+    mode = ExecutionChannelMode::all;
+    requiredChannels = outputChannelCount;
+  } else if (selection == "L" || selection == "1") {
+    mode = ExecutionChannelMode::single;
+    requiredChannels = 1;
+  } else if (selection == "R" || selection == "2") {
+    mode = ExecutionChannelMode::single;
+    firstChannel = 1;
+    requiredChannels = 1;
+  } else if (selection.empty()) {
+    mode = outputChannelCount == 1 ? ExecutionChannelMode::mono
+                                   : ExecutionChannelMode::stereoPair;
+    requiredChannels = outputChannelCount == 1 ? 1u : 2u;
+  } else if (selection == "34" || selection == "56" || selection == "78") {
+    mode = ExecutionChannelMode::stereoPair;
+    firstChannel = selection == "34" ? 2u : selection == "56" ? 4u : 6u;
+    requiredChannels = 2;
+  } else if (selection.size() == 1 && selection.front() >= '1' &&
+             selection.front() <= '8') {
+    mode = ExecutionChannelMode::single;
+    firstChannel = static_cast<std::uint32_t>(selection.front() - '1');
+    requiredChannels = 1;
+  } else {
+    return ExecutionContextSupport::unsupportedChannelMode;
+  }
+
+  const auto modeBit = static_cast<std::uint8_t>(mode);
+  const auto remainingChannels = outputChannelCount > firstChannel
+                                     ? outputChannelCount - firstChannel
+                                     : 0u;
+  const auto availableChannels = std::min(remainingChannels, requiredChannels);
+  return (capabilities.supportedChannelModes & modeBit) != 0u &&
+                 availableChannels == requiredChannels
+             ? ExecutionContextSupport::supported
+             : ExecutionContextSupport::unsupportedChannelMode;
+}
+
+bool supportsExecutionContext(
+    const RuntimeExecutionCapabilities &capabilities,
+    const std::optional<std::string> &channel, const double sampleRate,
+    const std::uint32_t outputChannelCount) noexcept {
+  return executionContextSupport(capabilities, channel, sampleRate,
+                                 outputChannelCount) ==
+         ExecutionContextSupport::supported;
 }
 
 std::int8_t encodeChannelSpec(const std::optional<std::string> &channel) {

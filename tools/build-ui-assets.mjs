@@ -79,6 +79,8 @@ html = applyProductBranding(html)
     `<meta http-equiv="Content-Security-Policy" content="default-src 'self' blob: data:; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:; connect-src 'self' blob:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline' blob:;">`)
   .replace(/\s*<script>\s*\(function\(\) \{\s*var measurementId =[\s\S]*?<\/script>/, '')
   .replace(/\s*<button class="pipeline-menu-item" id="doubleBlindTestButton">[\s\S]*?<\/button>/, '')
+  .replace(/\s*<button class="header-button pipeline-analyzer-button" id="pipelineAnalyzerButton"[\s\S]*?<\/button>/, '')
+  .replace(/\s*<aside class="pipeline-analyzer-panel" id="pipelineAnalyzerPanel" hidden><\/aside>/, '')
   .replace(/\s*<script src="js\/vendor\/(?:jszip-3\.10\.1\.min\.js|jsmediatags-3\.9\.5\.min\.js)"><\/script>/g, '')
   .replace('</head>', '    <script src="vst-bootstrap.js"></script>\n</head>');
 await writeFile(path.join(output, 'effetune.html'), html, 'utf8');
@@ -184,6 +186,82 @@ app = app.replace(publishInitialConfig, `${publishInitialConfig}
             }`);
 await writeFile(appPath, app, 'utf8');
 
+const fifteenBandGeqPath = path.join(output, 'plugins', 'eq', 'fifteen_band_geq.js');
+let fifteenBandGeq = await readFile(fifteenBandGeqPath, 'utf8');
+const fifteenBandGeqRefresh = `            if (this.sliders && this.sliders[i]) {
+                this.sliders[i].value = this['b' + i];
+                window.uiManager?.refreshRangeFillStyling?.(this.sliders[i]);
+            }
+            if (this.valueDisplays && this.valueDisplays[i]) {
+                this.valueDisplays[i].textContent = this['b' + i].toFixed(1) + ' dB';
+            }`;
+if (fifteenBandGeq.split(fifteenBandGeqRefresh).length - 1 !== 1) {
+  throw new Error('Unable to locate the Fifteen Band GEQ refresh pair');
+}
+fifteenBandGeq = fifteenBandGeq.replace(fifteenBandGeqRefresh, `            const slider = this.sliders?.[i];
+            const valueDisplay = this.valueDisplays?.[i];
+            if (this.isHeldByUser(slider) || this.isHeldByUser(valueDisplay)) continue;
+            if (slider) {
+                slider.value = this['b' + i];
+                window.uiManager?.refreshRangeFillStyling?.(slider);
+            }
+            if (valueDisplay) {
+                valueDisplay.textContent = this['b' + i].toFixed(1) + ' dB';
+            }`);
+await writeFile(fifteenBandGeqPath, fifteenBandGeq, 'utf8');
+
+const narrowRangePath = path.join(output, 'plugins', 'eq', 'narrow_range.js');
+let narrowRange = await readFile(narrowRangePath, 'utf8');
+const narrowRangeFrequencyRefresh = `      hpfInputs.forEach(input => {
+        input.value = this.hf;
+        // Only the range of the pair carries a track fill to repaint.
+        if (input.type === "range") window.uiManager?.refreshRangeFillStyling?.(input);
+      });
+      lpfInputs.forEach(input => {
+        input.value = this.lf;
+        if (input.type === "range") window.uiManager?.refreshRangeFillStyling?.(input);
+      });`;
+if (narrowRange.split(narrowRangeFrequencyRefresh).length - 1 !== 1) {
+  throw new Error('Unable to locate the Narrow Range frequency refresh pairs');
+}
+narrowRange = narrowRange.replace(narrowRangeFrequencyRefresh, `      const hpfFrequencyHeld = [...hpfInputs].some(input => this.isHeldByUser(input));
+      if (!hpfFrequencyHeld) {
+        hpfInputs.forEach(input => {
+          input.value = this.hf;
+          // Only the range of the pair carries a track fill to repaint.
+          if (input.type === "range") window.uiManager?.refreshRangeFillStyling?.(input);
+        });
+      }
+      const lpfFrequencyHeld = [...lpfInputs].some(input => this.isHeldByUser(input));
+      if (!lpfFrequencyHeld) {
+        lpfInputs.forEach(input => {
+          input.value = this.lf;
+          if (input.type === "range") window.uiManager?.refreshRangeFillStyling?.(input);
+        });
+      }`);
+await writeFile(narrowRangePath, narrowRange, 'utf8');
+
+const tiltEqPath = path.join(output, 'plugins', 'eq', 'tilt_eq.js');
+let tiltEq = await readFile(tiltEqPath, 'utf8');
+const tiltEqPivotRefresh = `            pivotLogSlider.value = this.f0;
+            window.uiManager?.refreshRangeFillStyling?.(pivotLogSlider);
+            // The Hz box only commits on change/Enter, so a half-typed entry lives
+            // in the DOM and nowhere else; overwriting it mid-edit would discard it.
+            if (!this.isHeldByUser(pivotHzInput)) {
+                pivotHzInput.value = Math.round(Math.exp(this.f0));
+            }`;
+if (tiltEq.split(tiltEqPivotRefresh).length - 1 !== 1) {
+  throw new Error('Unable to locate the Tilt EQ pivot refresh pair');
+}
+tiltEq = tiltEq.replace(tiltEqPivotRefresh, `            const pivotFrequencyHeld =
+                this.isHeldByUser(pivotLogSlider) || this.isHeldByUser(pivotHzInput);
+            if (!pivotFrequencyHeld) {
+                pivotLogSlider.value = this.f0;
+                window.uiManager?.refreshRangeFillStyling?.(pivotLogSlider);
+                pivotHzInput.value = Math.round(Math.exp(this.f0));
+            }`);
+await writeFile(tiltEqPath, tiltEq, 'utf8');
+
 const historyPath = path.join(output, 'js', 'ui', 'pipeline', 'history-manager.js');
 let history = await readFile(historyPath, 'utf8');
 const historySerialization =
@@ -246,6 +324,36 @@ await writeFile(pipelineManagerPath, pipelineManager, 'utf8');
 
 const uiManagerPath = path.join(output, 'js', 'ui-manager.js');
 let uiManager = await readFile(uiManagerPath, 'utf8');
+const pipelinePerformanceRefresh = `        this.updatePipelineLatency(this.audioManager?.dspPipelineLatencySamples ?? 0);
+        this.updatePipelineCpuUsage(this.pipelineCpuAveragePercent);`;
+if (uiManager.split(pipelinePerformanceRefresh).length - 1 !== 1) {
+  throw new Error('Unable to locate the pipeline performance status refresh');
+}
+uiManager = uiManager.replace(pipelinePerformanceRefresh, `        this.updatePipelineLatency(this.audioManager?.dspPipelineLatencySamples ?? 0);
+        this.updatePipelineCpuUsage(
+            this.audioManager?.pipelineCpuAveragePercent ?? this.pipelineCpuAveragePercent
+        );`);
+const pipelineAnalyzerInitialization = `        this.pipelineAnalyzerUI = new PipelineAnalyzerUI({
+            onOpenChange: open => this.setPipelineAnalyzerOpen(open),
+            onConfigurationChange: (configuration, meta) =>
+                this.pipelineAnalyzerController?.setConfiguration(configuration, meta),
+            onRefreshMeasurements: () => this.pipelineAnalyzerController?.refreshMeasurements()
+        });
+        this.pipelineAnalyzerController = new PipelineAnalyzerController({
+            audioManager,
+            workletSync: this.pipelineManager.core.workletSync,
+            ui: this.pipelineAnalyzerUI
+        });
+        this.pipelineAnalyzerController.initialize();
+        this.initPipelineAnalyzerMenuIntegration();`;
+if (uiManager.split(pipelineAnalyzerInitialization).length - 1 !== 1) {
+  throw new Error('Unable to locate the Pipeline Analyzer initialization');
+}
+uiManager = uiManager.replace(pipelineAnalyzerInitialization, `        // Pipeline Analyzer replays the JavaScript DSP pipeline in a Web Worker.
+        // That is not the VST native DSP path, so the VST build must not expose it
+        // or restore a saved open state that starts analysis in the background.
+        this.pipelineAnalyzerUI = null;
+        this.pipelineAnalyzerController = null;`);
 const uiManagerLibraryConstantsImport =
   `import { normalizeMusicLibraryStartupView } from './library/constants.js';`;
 if (!uiManager.includes(uiManagerLibraryConstantsImport)) {
@@ -262,6 +370,8 @@ uiManager = uiManager.replace(urlReflectionGate, `        // The VST WebView has
         // would only re-encode the whole pipeline on every parameter change.
         this.urlReflectionEnabled = false;`);
 for (const excludedImport of [
+  `import { PipelineAnalyzerController } from './pipeline-analyzer/controller.js';\n`,
+  `import { PipelineAnalyzerUI } from './pipeline-analyzer/ui.js';\n`,
   `import { AudioPlayer } from './ui/audio-player.js';\n`,
   `import { LibraryManagerV2 } from './library/library-manager-v2.js';\n`,
   `import { createWebCatalogRecoveryController } from './library/repository/catalog-client-factory.js';\n`,

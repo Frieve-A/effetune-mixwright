@@ -68,6 +68,11 @@ public:
   Steinberg::uint32 PLUGIN_API getLatencySamples() SMTG_OVERRIDE;
   Steinberg::IPlugView *PLUGIN_API createView(Steinberg::FIDString name) SMTG_OVERRIDE;
   Steinberg::tresult PLUGIN_API setAutomationState(Steinberg::int32 state) SMTG_OVERRIDE;
+  // Observation-only pass-throughs for the opt-in automation trace.
+  Steinberg::tresult PLUGIN_API getParameterInfo(
+      Steinberg::int32 index, Steinberg::Vst::ParameterInfo &info) SMTG_OVERRIDE;
+  Steinberg::Vst::ParamValue PLUGIN_API getParamNormalized(
+      Steinberg::Vst::ParamID tag) SMTG_OVERRIDE;
   // Without these a host shows the raw 0..1 lane position next to the unit the
   // parameter published -- "0.5000 dB" where the control reads -6.000 dB. The
   // base class cannot do better: a Parameter holds only the normalized value,
@@ -169,6 +174,10 @@ private:
   void notifyLatencyChange(Steinberg::uint32 previousLatency);
   void armLatencyNotification();
   void queueLatencyNotification(bool restartDebounce);
+  // The UI reports the latency of the DSP image currently being rendered. This
+  // may lead getLatencySamples() briefly while the non-real-time compensation
+  // plan and the host PDC notification wait for a safe control window.
+  [[nodiscard]] std::uint32_t processingLatencySamples() const noexcept;
   // Resizing the dry delay swaps the buffer the audio thread reads, so every
   // caller runs it inside a window that proved the audio thread is out of
   // process() first.
@@ -216,7 +225,9 @@ private:
            (state & Steinberg::Vst::IAutomationState::kWriteState) != 0;
   }
   [[nodiscard]] std::optional<std::uint32_t>
-  bindAutomationSlot(const AutomationTargetIdentity &identity);
+  bindAutomationSlot(
+      const AutomationTargetIdentity &identity,
+      std::optional<std::uint64_t> expectedStateEpoch = std::nullopt);
   // A copy of the descriptor behind the automation slot a host parameter
   // identifier names, or nullopt for an identifier that is not an automation
   // slot and for a slot that holds no binding. The registry is guarded by
@@ -235,7 +246,9 @@ private:
   // same edit costs one lookup. Callers hold neither mutex.
   [[nodiscard]] std::optional<std::uint32_t>
   resolveAutomationSlot(const AutomationTargetIdentity &identity,
-                        double normalized, bool bindIfUnbound);
+                        double normalized, bool bindIfUnbound,
+                        std::optional<std::uint64_t> expectedStateEpoch =
+                            std::nullopt);
   // The whole of one explicit gesture: bind the target when it has none, tell
   // the host, then adopt the value natively. The adoption does not depend on
   // the host taking the edit transaction -- a host that refuses to record
@@ -248,19 +261,15 @@ private:
   [[nodiscard]] AutomationEditOutcome applyAutomationEdit(
       const AutomationTargetIdentity &identity, double normalized,
       AutomationEditIntent intent = {});
-  [[nodiscard]] AutomationReconcileResult
+  // Return the VST restart flags earned by the publication. Value changes and
+  // parameter-info changes are separate; callers notify only after unlocking.
+  [[nodiscard]] Steinberg::int32
   reconcileAutomationBindingsLocked(AutomationResourceLock &resources,
                                     bool forceCurrentInitialization = false);
-  // Reuses an eligible-target catalog the caller already built outside
-  // processingResourcesMutex_, so the unbounded catalog work never lengthens
-  // the window in which the other control threads are blocked.
-  [[nodiscard]] AutomationReconcileResult reconcileAutomationBindingsLocked(
-      AutomationResourceLock &resources,
-      std::span<const AutomationTargetDescriptor> eligibleTargets,
-      bool forceCurrentInitialization = false);
-  void finishAutomationReconcileLocked(AutomationResourceLock &resources,
-                                       AutomationReconcileResult &result,
-                                       bool forceCurrentInitialization);
+  [[nodiscard]] Steinberg::int32
+  finishAutomationReconcileLocked(AutomationResourceLock &resources,
+                                   const AutomationReconcileResult &result,
+                                   bool forceCurrentInitialization);
   // Retiring a slot has to end the touch that was open on it, and the lock is
   // what carries that touch out to where it can be ended: see
   // AutomationResourceLock below for why it may not be ended here.
@@ -335,6 +344,7 @@ private:
   void drainAutomationValues();
   void appendAutomationDeltas(choc::value::Value &result);
   void appendActiveAutomationSnapshot(choc::value::Value &result);
+  void appendExecutionStates(choc::value::Value &result);
   void appendDeferredDiagnostics(choc::value::Value &result);
   void recordProcessTransactionFailure(ProcessTransactionError error) noexcept;
   // Refreshing the compensation plan or the reported latency is recurring
@@ -360,6 +370,18 @@ private:
   [[nodiscard]] bool performHostEditTransaction(
       Steinberg::Vst::ParamID parameterId, double normalized,
       bool beginGesture = true, bool endGesture = true) noexcept;
+  // Opens one already-resolved host touch before a click-activated control has
+  // a changed value to report. Idempotent for a touch that is already open.
+  [[nodiscard]] bool openHostGesture(std::size_t index,
+                                     Steinberg::Vst::ParamID parameterId,
+                                     double previous) noexcept;
+  // Reports one stale value only when its old-generation touch is still open.
+  // It never opens a touch, changes the host Parameter, or adopts into the
+  // binding registry/scheduler, so it is safe after a state-replacement epoch
+  // has invalidated the plug-in image that carried the edit.
+  void reportHostEditToOpenGesture(Steinberg::Vst::ParamID parameterId,
+                                   double normalized,
+                                   bool endGesture) noexcept;
   // The gesture-state index of a host parameter, or kNoHostGestureIndex for an
   // identifier no gesture can hold open. Pure and total, so the audio thread
   // can resolve a queue's parameter without touching any shared state.
@@ -662,6 +684,21 @@ private:
   // scheduler and binding projection remain one coherent playable generation
   // until the UI supplies the replacement runtime image.
   std::atomic_bool stateReplacementPending_{false};
+  // Monotonically names the state generation across the pending true -> false
+  // cycle. Writes and commit checks are guarded by processingResourcesMutex_;
+  // the atomic publication lets a bulk bridge call capture its generation
+  // before decoding without making ordinary telemetry wait on control work.
+  std::atomic<std::uint64_t> stateReplacementEpoch_{0};
+  // A startup handshake is the only signal that a request belongs to the page
+  // reloaded by setState(). Bulk requests capture both values at entry and
+  // recheck them inside their resource transaction, so an old page cannot be
+  // mistaken for the replacement merely because it arrived while pending.
+  // Writes and commit checks are guarded by processingResourcesMutex_; bridge
+  // entry reads the published value without taking that control-side mutex.
+  std::atomic<std::uint64_t> uiPageGeneration_{0};
+  std::uint64_t replacementPageGeneration_ = 0;
+  std::uint64_t replacementPageStateEpoch_ = 0;
+  bool replacementPageAuthorized_ = false;
   // Odd while process() is executing. Lets a control thread observe that the
   // audio callback has left the block without the callback taking any lock.
   // It proves quiescence and nothing else: a flush-only block bumps it too, so
@@ -676,6 +713,11 @@ private:
   // that as idle would let an ordinary parameter drag take the engine away from
   // a callback that is still rendering.
   std::atomic<std::uint64_t> renderedBlockCount_{0};
+  // Accumulated only by the audio thread. The published fixed-point value is
+  // read by the WebView/control threads without touching the accumulator.
+  double pipelineCpuAudioSeconds_ = 0.0;
+  std::chrono::steady_clock::duration pipelineCpuElapsed_{};
+  std::atomic<std::uint32_t> pipelineCpuAverageHundredths_{0};
   // Number of control threads currently inside an EngineMutationWindow. A block
   // that finds the processing gate closed while this is set is not looking at an
   // unprepared DSP, so it stays out of the deferred diagnostics.
@@ -725,6 +767,17 @@ private:
   std::uint32_t pipelinePlanRefreshFailuresForTesting_ = 0;
   std::atomic_bool pauseControllerCommitBeforePublishForTesting_{false};
   std::atomic_bool controllerCommitPausedForTesting_{false};
+  std::atomic_bool pausePluginUpdateBeforeRuntimeTransactionForTesting_{false};
+  std::atomic_bool pluginUpdatePausedBeforeRuntimeTransactionForTesting_{false};
+  std::atomic_bool pausePluginUpdateBeforeAutomationEditsForTesting_{false};
+  std::atomic_bool pluginUpdatePausedBeforeAutomationEditsForTesting_{false};
+  std::atomic_bool pauseNextBulkRequestBeforeCommitForTesting_{false};
+  std::atomic_bool bulkRequestPausedBeforeCommitForTesting_{false};
+  std::atomic_bool releaseBulkRequestBeforeCommitForTesting_{false};
+  std::atomic_bool pauseAutomationCatalogBeforeProjectionForTesting_{false};
+  std::atomic_bool automationCatalogPausedBeforeProjectionForTesting_{false};
+  std::atomic_bool pauseAutomationDrainBeforeDescriptorForTesting_{false};
+  std::atomic_bool automationDrainPausedBeforeDescriptorForTesting_{false};
 #endif
   mutable std::mutex stateMutex_;
   // Serializes the control threads against one another: the host thread, the
@@ -738,7 +791,8 @@ private:
   std::mutex automationDeltaMutex_;
   std::mutex editorMutex_;
   std::mutex assetTransferMutex_;
-  std::unique_ptr<WebViewHost> webView_;
+  std::shared_ptr<WebViewHost> webView_;
+  bool editorTerminating_ = false;
   std::mutex presetExchangeMutex_;
   std::optional<std::string> readablePresetPath_;
   std::optional<std::string> writablePresetPath_;

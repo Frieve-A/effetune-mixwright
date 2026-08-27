@@ -203,6 +203,131 @@ public:
 #endif
   }
 
+  static void pausePluginUpdateBeforeRuntimeTransaction(
+      EffeTuneProcessor &processor, const bool pause) noexcept {
+#if defined(EFFETUNE_PROCESSOR_TEST_HOOKS)
+    processor.pausePluginUpdateBeforeRuntimeTransactionForTesting_.store(
+        pause, std::memory_order_release);
+#else
+    (void)processor;
+    (void)pause;
+#endif
+  }
+
+  [[nodiscard]] static bool pluginUpdatePausedBeforeRuntimeTransaction(
+      const EffeTuneProcessor &processor) noexcept {
+#if defined(EFFETUNE_PROCESSOR_TEST_HOOKS)
+    return processor.pluginUpdatePausedBeforeRuntimeTransactionForTesting_.load(
+        std::memory_order_acquire);
+#else
+    (void)processor;
+    return false;
+#endif
+  }
+
+  static void pausePluginUpdateBeforeAutomationEdits(
+      EffeTuneProcessor &processor, const bool pause) noexcept {
+#if defined(EFFETUNE_PROCESSOR_TEST_HOOKS)
+    processor.pausePluginUpdateBeforeAutomationEditsForTesting_.store(
+        pause, std::memory_order_release);
+#else
+    (void)processor;
+    (void)pause;
+#endif
+  }
+
+  [[nodiscard]] static bool pluginUpdatePausedBeforeAutomationEdits(
+      const EffeTuneProcessor &processor) noexcept {
+#if defined(EFFETUNE_PROCESSOR_TEST_HOOKS)
+    return processor.pluginUpdatePausedBeforeAutomationEditsForTesting_.load(
+        std::memory_order_acquire);
+#else
+    (void)processor;
+    return false;
+#endif
+  }
+
+  static void pauseNextBulkRequestBeforeCommit(
+      EffeTuneProcessor &processor) noexcept {
+#if defined(EFFETUNE_PROCESSOR_TEST_HOOKS)
+    processor.releaseBulkRequestBeforeCommitForTesting_.store(
+        false, std::memory_order_release);
+    processor.pauseNextBulkRequestBeforeCommitForTesting_.store(
+        true, std::memory_order_release);
+#else
+    (void)processor;
+#endif
+  }
+
+  [[nodiscard]] static bool bulkRequestPausedBeforeCommit(
+      const EffeTuneProcessor &processor) noexcept {
+#if defined(EFFETUNE_PROCESSOR_TEST_HOOKS)
+    return processor.bulkRequestPausedBeforeCommitForTesting_.load(
+        std::memory_order_acquire);
+#else
+    (void)processor;
+    return false;
+#endif
+  }
+
+  static void releaseBulkRequestBeforeCommit(
+      EffeTuneProcessor &processor) noexcept {
+#if defined(EFFETUNE_PROCESSOR_TEST_HOOKS)
+    processor.releaseBulkRequestBeforeCommitForTesting_.store(
+        true, std::memory_order_release);
+#else
+    (void)processor;
+#endif
+  }
+
+  static void pauseAutomationCatalogBeforeProjection(
+      EffeTuneProcessor &processor, const bool pause) noexcept {
+#if defined(EFFETUNE_PROCESSOR_TEST_HOOKS)
+    processor.pauseAutomationCatalogBeforeProjectionForTesting_.store(
+        pause, std::memory_order_release);
+#else
+    (void)processor;
+    (void)pause;
+#endif
+  }
+
+  [[nodiscard]] static bool automationCatalogPausedBeforeProjection(
+      const EffeTuneProcessor &processor) noexcept {
+#if defined(EFFETUNE_PROCESSOR_TEST_HOOKS)
+    return processor.automationCatalogPausedBeforeProjectionForTesting_.load(
+        std::memory_order_acquire);
+#else
+    (void)processor;
+    return false;
+#endif
+  }
+
+  static void synchronizeAutomationBindings(EffeTuneProcessor &processor) {
+    processor.synchronizeAutomationBindings(false);
+  }
+
+  static void pauseAutomationDrainBeforeDescriptor(
+      EffeTuneProcessor &processor, const bool pause) noexcept {
+#if defined(EFFETUNE_PROCESSOR_TEST_HOOKS)
+    processor.pauseAutomationDrainBeforeDescriptorForTesting_.store(
+        pause, std::memory_order_release);
+#else
+    (void)processor;
+    (void)pause;
+#endif
+  }
+
+  [[nodiscard]] static bool automationDrainPausedBeforeDescriptor(
+      const EffeTuneProcessor &processor) noexcept {
+#if defined(EFFETUNE_PROCESSOR_TEST_HOOKS)
+    return processor.automationDrainPausedBeforeDescriptorForTesting_.load(
+        std::memory_order_acquire);
+#else
+    (void)processor;
+    return false;
+#endif
+  }
+
   static void drainAutomationValues(EffeTuneProcessor &processor) {
     processor.drainAutomationValues();
   }
@@ -412,6 +537,36 @@ public:
       throw std::runtime_error("the runtime plug-in image is not available");
     }
     return runtime->packedParameters[offset];
+  }
+
+  [[nodiscard]] static std::size_t
+  runtimePluginCount(EffeTuneProcessor &processor,
+                     const std::uint32_t logicalId) {
+    std::scoped_lock resources(processor.processingResourcesMutex_);
+    return static_cast<std::size_t>(std::count_if(
+        processor.runtimePlugins_.begin(), processor.runtimePlugins_.end(),
+        [logicalId](const RuntimePlugin &plugin) {
+          return plugin.logicalId == logicalId;
+        }));
+  }
+
+  [[nodiscard]] static bool
+  runtimeContextuallyBypassed(EffeTuneProcessor &processor,
+                              const std::uint32_t logicalId) {
+    std::scoped_lock resources(processor.processingResourcesMutex_);
+    const auto runtime = std::find_if(
+        processor.runtimePlugins_.begin(), processor.runtimePlugins_.end(),
+        [logicalId](const RuntimePlugin &plugin) {
+          return plugin.logicalId == logicalId;
+        });
+    return runtime != processor.runtimePlugins_.end() &&
+           runtime->contextuallyBypassed;
+  }
+
+  [[nodiscard]] static std::uint32_t
+  enginePipelineLatency(EffeTuneProcessor &processor) {
+    std::scoped_lock resources(processor.processingResourcesMutex_);
+    return processor.engine_.pipelineLatency();
   }
 
   // Stands in for the control service holding the claim across a block without
@@ -782,6 +937,16 @@ boundAutomationParameterId(EffeTuneProcessor &processor,
   return {};
 }
 
+[[nodiscard]] choc::value::ValueView findExecutionState(
+    const choc::value::Value &result, const std::uint32_t pluginId) {
+  for (const auto state : result["executionStates"]) {
+    if (state["pluginId"].getWithDefault<std::int64_t>(-1) == pluginId) {
+      return state;
+    }
+  }
+  return {};
+}
+
 [[nodiscard]] std::string asciiString(const TChar *value) {
   std::array<char, 256> buffer{};
   Steinberg::UString(const_cast<TChar *>(value), 128)
@@ -828,6 +993,90 @@ void installGainPipeline(EffeTuneProcessor &processor) {
       R"("parameters":{"vl":-6},"wasmParams":[-6],)"
       R"("wasmParamsHash":1719233191}]}})"));
   expect(response["ok"].getWithDefault<bool>(false), "install the native gain pipeline");
+}
+
+// Eligible targets and the registry projection must describe the same state
+// generation. Both entry points used to build the catalog before taking the
+// control transaction lock, allowing a concurrent removal to land in between
+// and leaving the removed target active (and its never-reusable slot spent).
+void testAutomationCatalogProjectionIsOneControlTransaction() {
+  const auto runRace = [](const bool bindTarget) {
+    auto processor = std::make_unique<EffeTuneProcessor>();
+    expect(processor->initialize(nullptr) == kResultOk,
+           "initialize the automation catalog transaction test");
+    auto processSetup = setup(48000.0, 64);
+    expect(processor->setupProcessing(processSetup) == kResultOk,
+           "prepare the automation catalog transaction test");
+    const auto installed = choc::json::parse(processor->handleUiMessage(
+        R"({"type":"pipeline/rebuild","payload":{"pipeline":"A","plugins":[)"
+        R"({"id":601,"type":"DCOffsetPlugin","name":"DC Offset","enabled":true,)"
+        R"("parameters":{"of":0.25},"wasmParams":[0.25],)"
+        R"("wasmParamsHash":1104945464}]}})"));
+    expect(installed["ok"].getWithDefault<bool>(false),
+           "install the automation catalog transaction pipeline");
+    const effetune::vst::AutomationTargetIdentity identity{
+        'A', 601, "DCOffsetPlugin", "of", 0};
+    if (!bindTarget) {
+      (void)boundAutomationParameterId(*processor, identity);
+    }
+
+    PluginProcessorTestAccess::pauseAutomationCatalogBeforeProjection(
+        *processor, true);
+    std::optional<std::uint32_t> bound;
+    std::thread projector([&] {
+      if (bindTarget) {
+        bound = PluginProcessorTestAccess::bindAutomationSlot(*processor,
+                                                               identity);
+      } else {
+        PluginProcessorTestAccess::synchronizeAutomationBindings(*processor);
+      }
+    });
+    const auto paused = pumpMainThreadUntil(
+        [&] {
+          return PluginProcessorTestAccess::automationCatalogPausedBeforeProjection(
+              *processor);
+        },
+        std::chrono::milliseconds(500));
+
+    std::string removalResponse;
+    std::atomic_bool removalComplete{false};
+    std::thread remover([&] {
+      removalResponse = processor->handleUiMessage(
+          R"({"type":"pipeline/rebuild","payload":{"pipeline":"A","plugins":[]}})"
+      );
+      removalComplete.store(true, std::memory_order_release);
+    });
+    const auto probeDeadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(40);
+    while (!removalComplete.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < probeDeadline) {
+      std::this_thread::yield();
+    }
+    const auto removalCompletedBeforeProjection =
+        removalComplete.load(std::memory_order_acquire);
+    PluginProcessorTestAccess::pauseAutomationCatalogBeforeProjection(
+        *processor, false);
+    projector.join();
+    remover.join();
+
+    const auto removed = choc::json::parse(removalResponse);
+    expect(paused && !removalCompletedBeforeProjection &&
+               removed["ok"].getWithDefault<bool>(false),
+           "a topology replacement cannot cross the catalog projection");
+    expect(!PluginProcessorTestAccess::activeAutomationSlot(*processor,
+                                                            identity)
+                .has_value(),
+           "the removed target is not projected from a stale catalog");
+    if (bindTarget) {
+      expect(bound.has_value(),
+             "the binding transaction completed before the queued removal");
+    }
+    expect(processor->terminate() == kResultOk,
+           "terminate the automation catalog transaction test");
+  };
+
+  runRace(false);
+  runRace(true);
 }
 
 void installLimiterPipeline(EffeTuneProcessor &processor, const std::uint32_t id,
@@ -933,6 +1182,22 @@ void installIrReverbPipeline(EffeTuneProcessor &processor) {
   constexpr float impulse = 1.0f;
   std::memcpy(asset.payload.data() + 32u, &impulse, sizeof(impulse));
   asset.footprintBytes = 4u * 1024u * 1024u;
+  return asset;
+}
+
+void installGroupDelayEqPipeline(EffeTuneProcessor &processor) {
+  const auto response = choc::json::parse(processor.handleUiMessage(
+      R"({"type":"pipeline/rebuild","payload":{"pipeline":"A","plugins":[)"
+      R"({"id":92,"type":"GroupDelayEqPlugin","name":"Group Delay EQ","enabled":true,)"
+      R"("parameters":{"lt":"128","fd":8192,"tp":16384,"d0":0},)"
+      R"("wasmParams":[128,8192],"wasmParamsHash":2941825417}]}})"));
+  expect(response["ok"].getWithDefault<bool>(false),
+         "install the Group Delay EQ pipeline");
+}
+
+[[nodiscard]] effetune::vst::RuntimeAsset makeGroupDelayEqAsset() {
+  auto asset = makeIrReverbAsset();
+  asset.logicalId = 92;
   return asset;
 }
 
@@ -1478,6 +1743,17 @@ void testNodeEnableAutomationDrivesTopologyNotPackedParameters() {
   auto processor = std::make_unique<EffeTuneProcessor>();
   expect(processor->initialize(nullptr) == kResultOk,
          "initialize the node-enable automation test");
+  ParameterInfo unboundInfo{};
+  expect(processor->getParameterInfo(1, unboundInfo) == kResultOk &&
+             unboundInfo.id == kFirstAutomationParameterId &&
+             unboundInfo.stepCount == 0,
+         "the trace pass-through exposes the unchanged unbound metadata");
+  ParameterInfo invalidInfo{};
+  invalidInfo.id = 1234;
+  invalidInfo.stepCount = 7;
+  expect(processor->getParameterInfo(-1, invalidInfo) == kResultFalse &&
+             invalidInfo.id == 1234 && invalidInfo.stepCount == 7,
+         "a failed traced query preserves the SDK output contract");
   auto processSetup = setup(48000.0, 64);
   expect(processor->setupProcessing(processSetup) == kResultOk,
          "prepare the node-enable automation test");
@@ -1490,6 +1766,14 @@ void testNodeEnableAutomationDrivesTopologyNotPackedParameters() {
          "install the node-enable automation pipeline");
   const auto enableParameterId = boundAutomationParameterId(
       *processor, {'A', 77, "DCOffsetPlugin", "__enabled", 0});
+  ParameterInfo enableInfo{};
+  expect(processor->getParameterInfo(
+             static_cast<int32>(enableParameterId - kFirstAutomationParameterId + 1u),
+             enableInfo) == kResultOk &&
+             enableInfo.id == enableParameterId && enableInfo.stepCount == 1 &&
+             (enableInfo.flags & ParameterInfo::kCanAutomate) != 0 &&
+             enableInfo.defaultNormalizedValue == 1.0,
+         "the traced controller exports a bound enable target as a two-state parameter");
   expect(processor->getParamNormalized(enableParameterId) == 1.0,
          "the bound enable slot starts at the current enabled state");
   expect(processor->setActive(true) == kResultOk,
@@ -1560,10 +1844,294 @@ void testNodeEnableAutomationDrivesTopologyNotPackedParameters() {
     expect(std::abs(sample) < 1.0e-6f,
            "the disabled node leaves the graph and stops offsetting the signal");
   }
+
+  ParameterChanges enableChanges(1);
+  queueIndex = 0;
+  auto *enableQueue =
+      enableChanges.addParameterData(enableParameterId, queueIndex);
+  pointIndex = 0;
+  expect(enableQueue != nullptr &&
+             enableQueue->addPoint(0, 1.0, pointIndex) == kResultTrue,
+         "create the node re-enable automation point");
+  data.inputParameterChanges = &enableChanges;
+  outputLeft.fill(1.0f);
+  expect(processor->process(data) == kResultOk,
+         "process the node re-enable automation block");
+  for (const auto sample : outputLeft) {
+    expect(std::abs(sample) < 1.0e-6f,
+           "the old disabled graph renders until the re-enable value drains");
+  }
+
+  const auto enableDescriptorGenerationBefore =
+      PluginProcessorTestAccess::descriptorGeneration(*processor);
+  const auto enabledState = choc::json::parse(processor->handleUiMessage(
+      R"({"type":"storage/readFile","payload":{"path":"pipeline-state.json"}})"));
+  const auto enabledPersisted =
+      choc::json::parse(enabledState["content"].getWithDefault<std::string>({}));
+  expect(enabledPersisted["pipelineA"][0]["enabled"].getWithDefault<bool>(false),
+         "the control-thread drain restores the node-enabled state");
+  const auto enableDescriptorGeneration =
+      PluginProcessorTestAccess::descriptorGeneration(*processor);
+  expect(enableDescriptorGeneration > enableDescriptorGenerationBefore,
+         "the node re-enable change queues a descriptor update");
+
+  expect(pumpMainThreadUntil(
+             [&] {
+               return PluginProcessorTestAccess::servicedDescriptorGeneration(
+                          *processor) == enableDescriptorGeneration;
+             },
+             std::chrono::milliseconds(500)),
+         "the native control service adopts the node re-enable descriptor");
+  data.inputParameterChanges = nullptr;
+  outputLeft.fill(0.0f);
+  expect(processor->process(data) == kResultOk,
+         "process after the node re-enable descriptor is adopted");
+  for (const auto sample : outputLeft) {
+    expect(std::abs(sample - 0.5f) < 1.0e-6f,
+           "the re-enabled node returns to the graph and offsets the signal");
+  }
   expect(processor->setActive(false) == kResultOk,
          "deactivate the node-enable automation test");
   expect(processor->terminate() == kResultOk,
          "terminate the node-enable automation test");
+}
+
+void testBoundNodeEnableEditsDoNotInvalidateHostParameters() {
+  auto processor = std::make_unique<EffeTuneProcessor>();
+  expect(processor->initialize(nullptr) == kResultOk,
+         "initialize the node-enable notification test");
+  auto *handler = new TestComponentHandler();
+  expect(processor->setComponentHandler(handler) == kResultOk,
+         "install the node-enable notification handler");
+  auto processSetup = setup(48000.0, 64);
+  expect(processor->setupProcessing(processSetup) == kResultOk,
+         "prepare the node-enable notification test");
+  const auto installed = choc::json::parse(processor->handleUiMessage(
+      R"({"type":"pipeline/rebuild","payload":{"pipeline":"A","plugins":[)"
+      R"({"id":77,"type":"DCOffsetPlugin","name":"DC Offset","enabled":true,)"
+      R"("parameters":{"of":0.5},"wasmParams":[0.5],)"
+      R"("wasmParamsHash":1104945464}]}})"));
+  expect(installed["ok"].getWithDefault<bool>(false),
+         "install the node-enable notification pipeline");
+  const auto enableId = boundAutomationParameterId(
+      *processor, {'A', 77, "DCOffsetPlugin", "__enabled", 0});
+  const auto offsetId = boundAutomationParameterId(
+      *processor, {'A', 77, "DCOffsetPlugin", "of", 0});
+  expect((handler->restartFlags & RestartFlags::kParamTitlesChanged) != 0,
+         "new bindings still invalidate the placeholder parameter definitions");
+  expect(processor->setAutomationState(IAutomationState::kReadState |
+                                      IAutomationState::kWriteState) == kResultOk,
+         "enable Read and Write for the node-enable notification test");
+  expect(processor->setActive(true) == kResultOk,
+         "activate the node-enable notification test");
+
+  ParameterInfo before{};
+  expect(processor->getParameterInfo(1, before) == kResultOk,
+         "read the bound enable definition before the clicks");
+  std::array<float, 64> inputLeft{}, inputRight{}, outputLeft{}, outputRight{};
+  Sample32 *inputs[]{inputLeft.data(), inputRight.data()};
+  Sample32 *outputs[]{outputLeft.data(), outputRight.data()};
+  AudioBusBuffers input{}, output{};
+  input.numChannels = output.numChannels = 2;
+  input.channelBuffers32 = inputs;
+  output.channelBuffers32 = outputs;
+  ProcessContext context{};
+  context.sampleRate = 48000.0;
+  context.state = ProcessContext::kPlaying;
+  ProcessData data{};
+  data.symbolicSampleSize = kSample32;
+  data.numSamples = 64;
+  data.numInputs = data.numOutputs = 1;
+  data.inputs = &input;
+  data.outputs = &output;
+  data.processContext = &context;
+
+  const auto update = [&](const bool enabled, const double offset,
+                          const char *key, const double normalized,
+                          const char *name = "DC Offset",
+                          const bool splitGesture = false) {
+    handler->clearEditLog();
+    handler->restartFlags = 0;
+    const auto gestureTarget = std::string{
+        R"({"pipeline":"A","pluginId":77,"pluginType":"DCOffsetPlugin",)"
+        R"("parameterKey":")"} + key + R"(","elementIndex":0})";
+    if (splitGesture) {
+      const auto opened = choc::json::parse(processor->handleUiMessage(
+          std::string{R"({"type":"automation/beginGesture","payload":{"targets":[)"} +
+          gestureTarget + "]}}"));
+      expect(opened["ok"].getWithDefault<bool>(false),
+             "open the pointer gesture before its image update");
+    }
+    const auto message = std::string{
+        R"({"type":"pipeline/updatePlugin","payload":{"pipeline":"A","plugin":{)"
+        R"("id":77,"type":"DCOffsetPlugin","name":")"} + name +
+        R"(","enabled":)" + (enabled ? "true" : "false") +
+        R"(,"parameters":{"of":)" + std::to_string(offset) +
+        R"(},"wasmParams":[)" + std::to_string(offset) +
+        R"(],"wasmParamsHash":1104945464},"automationEdits":[{"pipeline":"A",)"
+        R"("pluginId":77,"pluginType":"DCOffsetPlugin","parameterKey":")" + key +
+        R"(","elementIndex":0,"normalized":)" + std::to_string(normalized) +
+        R"(,"endGesture":)" + (splitGesture ? "false" : "true") + "}]}}";
+    const auto result = choc::json::parse(processor->handleUiMessage(message));
+    expect(result["ok"].getWithDefault<bool>(false),
+         "accept the same bundled image and edit that a UI click sends");
+    if (splitGesture) {
+      expect(handler->stepCount(TestComponentHandler::EditStep::begin) == 1u &&
+                 handler->stepCount(TestComponentHandler::EditStep::end) == 0u,
+             "the image update neither reopens nor closes the pointer gesture");
+      const auto closed = choc::json::parse(processor->handleUiMessage(
+          std::string{R"({"type":"automation/endGesture","payload":{"targets":[)"} +
+          gestureTarget + "]}}"));
+      expect(closed["ok"].getWithDefault<bool>(false),
+             "close the pointer gesture after its image update");
+    }
+    expect(handler->stepCount(TestComponentHandler::EditStep::begin) == 1u &&
+               handler->stepCount(TestComponentHandler::EditStep::end) == 1u &&
+               handler->performedEditCount != 0,
+           "the click retains one balanced host gesture");
+    const auto last = handler->performedEdits[handler->performedEditCount - 1u];
+    expect(last.value == normalized &&
+               processor->getParamNormalized(last.id) == normalized,
+           "the host receives and can read back the user's absolute value");
+  };
+
+  for (const auto [enabled, splitGesture] :
+       {std::pair{false, false}, std::pair{true, false},
+        std::pair{false, true}, std::pair{true, true}}) {
+    update(enabled, 0.5, "__enabled", enabled ? 1.0 : 0.0,
+           "DC Offset", splitGesture);
+    ParameterInfo after{};
+    expect(processor->getParameterInfo(1, after) == kResultOk &&
+               after.id == before.id && after.stepCount == before.stepCount &&
+               after.flags == before.flags && after.unitId == before.unitId &&
+               after.defaultNormalizedValue == before.defaultNormalizedValue &&
+               std::equal(std::begin(before.title), std::end(before.title), after.title) &&
+               std::equal(std::begin(before.shortTitle), std::end(before.shortTitle),
+                          after.shortTitle) &&
+               std::equal(std::begin(before.units), std::end(before.units), after.units),
+           "a bound enable click changes no parameter metadata");
+    expect(handler->restartFlags == 0,
+           "a value-only enable click must not invalidate the host parameter bank");
+    expect(handler->performedEdits[handler->performedEditCount - 1u].id == enableId,
+           "the enable gesture stays on the original slot");
+    const auto descriptor = PluginProcessorTestAccess::descriptorGeneration(*processor);
+    expect(pumpMainThreadUntil([&] {
+             expect(processor->process(data) == kResultOk,
+                    "continue playback during the descriptor update");
+             context.projectTimeSamples += data.numSamples;
+             PluginProcessorTestAccess::serviceLatencyUpdates(*processor);
+             return PluginProcessorTestAccess::servicedDescriptorGeneration(*processor) ==
+                    descriptor;
+           }, std::chrono::milliseconds(500)),
+           "the click still reaches the native topology without a host echo");
+    expect(processor->process(data) == kResultOk,
+           "render the adopted enable state");
+    context.projectTimeSamples += data.numSamples;
+    for (const auto sample : outputLeft) {
+      expect(std::abs(sample - (enabled ? 0.5f : 0.0f)) < 1.0e-6f,
+             "the native output follows each OFF and ON click");
+    }
+    expect(handler->restartFlags == 0,
+           "deferred descriptor service also leaves unchanged metadata alone");
+  }
+
+  update(true, 0.25, "of", 0.625);
+  expect(handler->restartFlags == 0 &&
+             handler->performedEdits[handler->performedEditCount - 1u].id == offsetId,
+         "a packed parameter gesture also avoids a global parameter invalidation");
+  update(true, 0.25, "of", 0.625, "Renamed DC Offset");
+  expect((handler->restartFlags & RestartFlags::kParamTitlesChanged) != 0,
+         "a real name change still invalidates the host parameter definitions");
+  expect(processor->setActive(false) == kResultOk,
+         "deactivate the node-enable notification test");
+  expect(processor->terminate() == kResultOk,
+         "terminate the node-enable notification test");
+  handler->release();
+}
+
+// The node-enable drain releases processingResourcesMutex_ while it rewrites
+// JSON. A setState() that lands in that gap publishes a replacement document
+// which must never be encoded into a descriptor for the retained old runtime.
+void testStateRestoreCancelsAnInFlightNodeEnableDescriptor() {
+  auto processor = std::make_unique<EffeTuneProcessor>();
+  expect(processor->initialize(nullptr) == kResultOk,
+         "initialize the node-enable restore race test");
+  auto processSetup = setup(48000.0, 64);
+  expect(processor->setupProcessing(processSetup) == kResultOk,
+         "prepare the node-enable restore race test");
+  const auto installed = choc::json::parse(processor->handleUiMessage(
+      R"({"type":"pipeline/rebuild","payload":{"pipeline":"A","plugins":[)"
+      R"({"id":602,"type":"DCOffsetPlugin","name":"DC Offset","enabled":true,)"
+      R"("parameters":{"of":0.5},"wasmParams":[0.5],)"
+      R"("wasmParamsHash":1104945464}]}})"));
+  expect(installed["ok"].getWithDefault<bool>(false),
+         "install the node-enable restore race pipeline");
+  const auto enableParameterId = boundAutomationParameterId(
+      *processor, {'A', 602, "DCOffsetPlugin", "__enabled", 0});
+  expect(processor->setActive(true) == kResultOk,
+         "activate the node-enable restore race test");
+
+  ResizableMemoryIBStream restoredState;
+  expect(processor->getState(&restoredState) == kResultOk,
+         "save the enabled replacement document");
+  const auto descriptorBefore =
+      PluginProcessorTestAccess::descriptorGeneration(*processor);
+  PluginProcessorTestAccess::pauseAutomationDrainBeforeDescriptor(*processor,
+                                                                   true);
+
+  ParameterChanges changes(1);
+  int32 queueIndex = 0;
+  auto *queue = changes.addParameterData(enableParameterId, queueIndex);
+  int32 pointIndex = 0;
+  expect(queue != nullptr && queue->addPoint(0, 0.0, pointIndex) == kResultTrue,
+         "publish the disabling automation value");
+  std::array<float, 64> inputLeft{};
+  std::array<float, 64> inputRight{};
+  std::array<float, 64> outputLeft{};
+  std::array<float, 64> outputRight{};
+  Sample32 *inputChannels[]{inputLeft.data(), inputRight.data()};
+  Sample32 *outputChannels[]{outputLeft.data(), outputRight.data()};
+  AudioBusBuffers input{};
+  input.numChannels = 2;
+  input.channelBuffers32 = inputChannels;
+  AudioBusBuffers output{};
+  output.numChannels = 2;
+  output.channelBuffers32 = outputChannels;
+  ProcessData data{};
+  data.symbolicSampleSize = kSample32;
+  data.numSamples = 64;
+  data.numInputs = 1;
+  data.numOutputs = 1;
+  data.inputs = &input;
+  data.outputs = &output;
+  data.inputParameterChanges = &changes;
+  expect(processor->process(data) == kResultOk,
+         "render the disabling automation block");
+
+  std::thread drainer(
+      [&] { PluginProcessorTestAccess::drainAutomationValues(*processor); });
+  const auto paused = pumpMainThreadUntil(
+      [&] {
+        return PluginProcessorTestAccess::automationDrainPausedBeforeDescriptor(
+            *processor);
+      },
+      std::chrono::milliseconds(500));
+  tresult restored = kResultFalse;
+  if (paused) {
+    restoredState.rewind();
+    restored = processor->setState(&restoredState);
+  }
+  PluginProcessorTestAccess::pauseAutomationDrainBeforeDescriptor(*processor,
+                                                                   false);
+  drainer.join();
+
+  expect(paused && restored == kResultOk,
+         "publish the replacement while the old drain awaits its descriptor");
+  expect(PluginProcessorTestAccess::descriptorGeneration(*processor) ==
+             descriptorBefore,
+         "the old node-enable value queues no descriptor for the replacement state");
+  expect(processor->terminate() == kResultOk,
+         "terminate the node-enable restore race test");
 }
 
 // Hosts such as Cakewalk Sonar record a performEdit() without ever echoing it
@@ -2464,6 +3032,9 @@ void testStateRestoreForceSurvivesUiRebuildBeforeAudioResume() {
   auto processor = std::make_unique<EffeTuneProcessor>();
   expect(processor->initialize(nullptr) == kResultOk,
          "initialize sticky state-restore test");
+  auto *handler = new TestComponentHandler();
+  expect(processor->setComponentHandler(handler) == kResultOk,
+         "install the state-restore notification handler");
   auto processSetup = setup(48000.0, 64);
   expect(processor->setupProcessing(processSetup) == kResultOk,
          "prepare sticky state-restore test");
@@ -2609,6 +3180,12 @@ void testStateRestoreForceSurvivesUiRebuildBeforeAudioResume() {
   expect(!PluginProcessorTestAccess::processingReady(*processor),
          "the final layout still waits for one coherent replacement rebuild");
 
+  const auto replacementStartup = choc::json::parse(processor->handleUiMessage(
+      R"({"type":"host/getInfo","payload":{"startup":true}})"));
+  expect(replacementStartup["ok"].getWithDefault<bool>(false),
+         "announce the page that owns the restored runtime image");
+  handler->clearEditLog();
+  handler->restartFlags = 0;
   const auto rebuilt = choc::json::parse(processor->handleUiMessage(
       R"({"type":"pipeline/rebuild","payload":{"pipeline":"A","plugins":[)"
       R"({"id":9,"type":"DCOffsetPlugin","name":"DC Offset","enabled":true,)"
@@ -2616,6 +3193,11 @@ void testStateRestoreForceSurvivesUiRebuildBeforeAudioResume() {
       R"("wasmParamsHash":1104945464}]}})"));
   expect(rebuilt["ok"].getWithDefault<bool>(false),
          "coalesce UI rebuild before audio consumes restored state");
+  expect((handler->restartFlags & RestartFlags::kParamValuesChanged) != 0 &&
+             (handler->restartFlags & RestartFlags::kParamTitlesChanged) == 0,
+         "a value-only state restore refreshes values without invalidating definitions");
+  expect(processor->getParamNormalized(dcOffsetParameterId) == 0.75,
+         "the refreshed controller value belongs to the restored state");
 
   expect(processor->setActive(true) == kResultOk,
          "activate the replacement under its new host conditions");
@@ -2634,6 +3216,7 @@ void testStateRestoreForceSurvivesUiRebuildBeforeAudioResume() {
          "deactivate sticky state-restore test");
   expect(processor->terminate() == kResultOk,
          "terminate sticky state-restore test");
+  handler->release();
 }
 
 // Idleness is a safety decision, not a responsiveness timer. A host whose
@@ -3638,12 +4221,17 @@ void testNativeControlServiceHandlesAssetReadyAndClear() {
   expect(processor->setActive(true) == kResultOk,
          "activate native asset control-service test");
 
+  const auto revisionBeforeStage =
+      PluginProcessorTestAccess::pipelinePlanRevision(*processor);
   std::string error;
   expect(PluginProcessorTestAccess::setAsset(*processor, makeIrReverbAsset(), &error),
          "stage native IR asset without an editor: " + error);
   expect((PluginProcessorTestAccess::assetState(*processor, 91, 0) & 0xffu) ==
              ET_ASSET_STATE_PREPARING,
          "native IR asset enters preparing state");
+  expect(PluginProcessorTestAccess::pipelinePlanRevision(*processor) >
+             revisionBeforeStage,
+         "asset commit publishes its compensation revision without waiting for audio");
 
   std::array<float, 64> inputLeft{};
   std::array<float, 64> inputRight{};
@@ -3696,8 +4284,7 @@ void testNativeControlServiceHandlesAssetReadyAndClear() {
   const auto readyServicedRevision =
       PluginProcessorTestAccess::servicedPipelinePlanRevision(*processor);
   expect(readyState == ET_ASSET_STATE_ACTIVE && assetPlanWasServiced &&
-             readyPlanRevision >
-                 revisionBeforeReady &&
+             readyPlanRevision == revisionBeforeReady &&
              readyServicedRevision == readyPlanRevision &&
              processor->getLatencySamples() == 128u,
          "asset readiness is serviced without UI polling (state=" +
@@ -3729,6 +4316,52 @@ void testNativeControlServiceHandlesAssetReadyAndClear() {
          "deactivate native asset control-service test");
   expect(processor->terminate() == kResultOk,
          "terminate native asset control-service test");
+}
+
+// Group Delay EQ starts with no resident FIR and therefore zero latency. Its
+// first non-zero edit commits an asset whose delay becomes effective before the
+// host-facing PDC can safely be refreshed. The footer must follow that current
+// DSP image instead of remaining at zero until a later topology edit.
+void testGroupDelayAssetPublishesCurrentUiLatency() {
+  auto processor = std::make_unique<EffeTuneProcessor>();
+  expect(processor->initialize(nullptr) == kResultOk,
+         "initialize Group Delay EQ latency publication test");
+  auto processSetup = setup(48000.0, 64);
+  expect(processor->setupProcessing(processSetup) == kResultOk,
+         "prepare Group Delay EQ latency publication test");
+  installGroupDelayEqPipeline(*processor);
+  expect(processor->getLatencySamples() == 0u,
+         "flat Group Delay EQ starts with zero reported latency");
+  expect(processor->setActive(true) == kResultOk,
+         "activate Group Delay EQ latency publication test");
+
+  const auto revisionBeforeAsset =
+      PluginProcessorTestAccess::pipelinePlanRevision(*processor);
+  std::string error;
+  expect(PluginProcessorTestAccess::setAsset(
+             *processor, makeGroupDelayEqAsset(), &error),
+         "commit the first non-flat Group Delay EQ FIR: " + error);
+  expect(PluginProcessorTestAccess::pipelinePlanRevision(*processor) >
+             revisionBeforeAsset,
+         "Group Delay EQ asset commit immediately publishes a compensation revision");
+
+  // Keep the callback logically in flight while host/getInfo services its
+  // normal control work. That prevents the deliberately deferred host PDC from
+  // catching up and reproduces the state in which the footer used to stay at 0.
+  PluginProcessorTestAccess::beginSyntheticBlock(*processor);
+  const auto info = hostInfo(*processor);
+  PluginProcessorTestAccess::endSyntheticBlock(*processor);
+  constexpr std::int64_t expectedProcessingLatency = 128 + 8192;
+  expect(info["latencySamples"].getWithDefault<std::int64_t>(-1) == 0 &&
+             info["processingLatencySamples"].getWithDefault<std::int64_t>(-1) ==
+                 expectedProcessingLatency &&
+             !info["latencyCompensated"].getWithDefault<bool>(true),
+         "the UI sees current Group Delay EQ latency while host PDC is pending");
+
+  expect(processor->setActive(false) == kResultOk,
+         "deactivate Group Delay EQ latency publication test");
+  expect(processor->terminate() == kResultOk,
+         "terminate Group Delay EQ latency publication test");
 }
 
 // A pipeline that reports latency separates the three candidate timelines: the
@@ -3837,6 +4470,10 @@ void testProcessingSurvivesHostReconfiguration() {
          "the first host setup publishes context even at the default sample rate");
   expect(before["dspReady"].getWithDefault<bool>(false),
          "initial native pipeline is ready");
+  expect(before["latencySamples"].getWithDefault<std::int64_t>(-1) ==
+             static_cast<std::int64_t>(processor->getLatencySamples()) &&
+             before["pipelineCpuAverage"].getWithDefault<double>(-1.0) >= 0.0,
+         "host info publishes the VST latency and CPU status");
 
   expect(processor->setActive(false) == kResultOk, "deactivate before block-size change");
   auto blockSizeSetup = setup(44100.0, 256);
@@ -3862,6 +4499,18 @@ void testProcessingSurvivesHostReconfiguration() {
              generation + 1,
          "sample-rate reconfiguration requests one UI synchronization");
   expectGainProcessing(*processor, 256);
+  for (int block = 0; block < 375; ++block) {
+    expectGainProcessing(*processor, 256);
+  }
+  const auto measured = hostInfo(*processor);
+  expect(measured["pipelineCpuAverage"].getWithDefault<double>(0.0) > 0.0,
+         "one second of audio publishes a positive callback CPU average");
+  const auto telemetry = choc::json::parse(processor->handleUiMessage(
+      R"({"type":"telemetry/read","payload":{}})"));
+  expect(telemetry["latencySamples"].getWithDefault<std::int64_t>(-1) ==
+             static_cast<std::int64_t>(processor->getLatencySamples()) &&
+             telemetry["pipelineCpuAverage"].getWithDefault<double>(0.0) > 0.0,
+         "telemetry polling carries current latency and CPU status");
   expect(processor->setActive(false) == kResultOk, "deactivate final processing");
 }
 
@@ -4947,6 +5596,135 @@ void testFailedPluginRebuildKeepsProcessing() {
          "terminate the failed-rebuild rollback test");
 }
 
+// Full-image rebuilds and history restores are bulk UI transactions: when the
+// engine refuses their candidate runtime, the UI keeps showing the old image.
+// The engine, document, binding values and scheduler must therefore all keep
+// the same old playable generation too.
+void testFailedBulkRebuildsPreserveTheWholePlayableGeneration() {
+  auto processor = std::make_unique<EffeTuneProcessor>();
+  expect(processor->initialize(nullptr) == kResultOk,
+         "initialize the failed bulk transaction test");
+  auto processSetup = setup(48000.0, 64);
+  expect(processor->setupProcessing(processSetup) == kResultOk,
+         "prepare the failed bulk transaction test");
+  const auto installed = choc::json::parse(processor->handleUiMessage(
+      R"({"type":"pipeline/rebuild","payload":{"pipeline":"A","plugins":[)"
+      R"({"id":603,"type":"DCOffsetPlugin","name":"DC Offset","enabled":true,)"
+      R"("parameters":{"of":0.25},"wasmParams":[0.25],)"
+      R"("wasmParamsHash":1104945464}]}})"));
+  expect(installed["ok"].getWithDefault<bool>(false),
+         "install the failed bulk transaction pipeline");
+  const effetune::vst::AutomationTargetIdentity identity{
+      'A', 603, "DCOffsetPlugin", "of", 0};
+  const auto parameterId = boundAutomationParameterId(*processor, identity);
+  const auto slot =
+      PluginProcessorTestAccess::activeAutomationSlot(*processor, identity);
+  expect(slot.has_value(), "the bulk rollback target owns an automation lane");
+  expect(processor->setActive(true) == kResultOk,
+         "activate the failed bulk transaction test");
+
+  std::array<float, 64> inputLeft{};
+  std::array<float, 64> inputRight{};
+  std::array<float, 64> outputLeft{};
+  std::array<float, 64> outputRight{};
+  Sample32 *inputChannels[]{inputLeft.data(), inputRight.data()};
+  Sample32 *outputChannels[]{outputLeft.data(), outputRight.data()};
+  AudioBusBuffers input{};
+  input.numChannels = 2;
+  input.channelBuffers32 = inputChannels;
+  AudioBusBuffers output{};
+  output.numChannels = 2;
+  output.channelBuffers32 = outputChannels;
+  ProcessData data{};
+  data.symbolicSampleSize = kSample32;
+  data.numSamples = 64;
+  data.numInputs = 1;
+  data.numOutputs = 1;
+  data.inputs = &input;
+  data.outputs = &output;
+
+  ParameterChanges changes(1);
+  int32 queueIndex = 0;
+  auto *queue = changes.addParameterData(parameterId, queueIndex);
+  int32 pointIndex = 0;
+  constexpr double kPreviousNormalized = 0.625;
+  expect(queue != nullptr &&
+             queue->addPoint(0, kPreviousNormalized, pointIndex) == kResultTrue,
+         "publish the automation value the old generation must retain");
+  data.inputParameterChanges = &changes;
+  expect(processor->process(data) == kResultOk,
+         "render the old automated generation");
+  data.inputParameterChanges = nullptr;
+  PluginProcessorTestAccess::drainAutomationValues(*processor);
+
+  const auto savedBefore = choc::json::parse(processor->handleUiMessage(
+      R"({"type":"storage/readFile","payload":{"path":"pipeline-state.json"}})"))
+                               ["content"]
+                                   .getWithDefault<std::string>({});
+  const auto assertOldGeneration = [&](const std::string &operation) {
+    const auto savedAfter = choc::json::parse(processor->handleUiMessage(
+        R"({"type":"storage/readFile","payload":{"path":"pipeline-state.json"}})"))
+                                ["content"]
+                                    .getWithDefault<std::string>({});
+    const auto activeSlot =
+        PluginProcessorTestAccess::activeAutomationSlot(*processor, identity);
+    expect(savedAfter == savedBefore && activeSlot == slot &&
+               std::abs(PluginProcessorTestAccess::playedAutomationValue(
+                            *processor, *slot) -
+                        kPreviousNormalized) < 1.0e-9 &&
+               std::abs(processor->getParamNormalized(parameterId) -
+                        kPreviousNormalized) < 1.0e-9 &&
+               std::abs(PluginProcessorTestAccess::runtimePackedParameter(
+                            *processor, 603, 0) -
+                        0.25f) < 1.0e-6f &&
+               PluginProcessorTestAccess::processingReady(*processor),
+           operation +
+               " leaves the logical state, binding, scheduler and runtime unchanged");
+
+    outputLeft.fill(0.0f);
+    outputRight.fill(0.0f);
+    const auto countersBefore =
+        PluginProcessorTestAccess::processCounters(*processor);
+    expect(processor->process(data) == kResultOk,
+           "render after " + operation);
+    const auto countersAfter =
+        PluginProcessorTestAccess::processCounters(*processor);
+    expect(countersAfter.batchAttempts == countersBefore.batchAttempts + 1u &&
+               countersAfter.completedBatches ==
+                   countersBefore.completedBatches + 1u &&
+               std::abs(outputLeft[0] - 0.25f) < 1.0e-6f,
+           operation + " restores the old wet engine");
+  };
+
+  const auto refusedRebuild = choc::json::parse(processor->handleUiMessage(
+      R"({"type":"pipeline/rebuild","payload":{"pipeline":"A","plugins":[)"
+      R"({"id":603,"type":"DCOffsetPlugin","name":"DC Offset","enabled":true,)"
+      R"("parameters":{"of":-0.5},"wasmParams":[-0.5],"wasmParamsHash":12345}],)"
+      R"("automationEdits":[{"pipeline":"A","pluginId":603,)"
+      R"("pluginType":"DCOffsetPlugin","parameterKey":"of","elementIndex":0,)"
+      R"("normalized":0.25}]}})"));
+  expect(!refusedRebuild["ok"].getWithDefault<bool>(true),
+         "the engine refuses the invalid-hash full rebuild");
+  assertOldGeneration("a refused full rebuild");
+
+  const auto refusedHistory = choc::json::parse(processor->handleUiMessage(
+      R"({"type":"pipeline/restoreHistory","payload":{"pipelineA":[)"
+      R"({"id":603,"type":"DCOffsetPlugin","name":"DC Offset","enabled":true,)"
+      R"("parameters":{"of":0.75},"wasmParams":[0.75],"wasmParamsHash":12345}],)"
+      R"("pipelineB":null,"pipelineBInitialized":false,"currentPipeline":"A",)"
+      R"("automationEdits":[{"pipeline":"A","pluginId":603,)"
+      R"("pluginType":"DCOffsetPlugin","parameterKey":"of","elementIndex":0,)"
+      R"("normalized":0.875}]}})"));
+  expect(!refusedHistory["ok"].getWithDefault<bool>(true),
+         "the engine refuses the invalid-hash history restore");
+  assertOldGeneration("a refused history restore");
+
+  expect(processor->setActive(false) == kResultOk,
+         "deactivate the failed bulk transaction test");
+  expect(processor->terminate() == kResultOk,
+         "terminate the failed bulk transaction test");
+}
+
 namespace gate_ordering {
 
 // Everything the four tests below need to render one block of ones through a
@@ -4983,6 +5761,255 @@ struct AudioRig {
 };
 
 } // namespace gate_ordering
+
+void testContextualExecutionAdmissionSurvivesEngineContextChanges() {
+  constexpr std::uint32_t pluginId = 301;
+  auto processor = std::make_unique<EffeTuneProcessor>();
+  expect(processor->initialize(nullptr) == kResultOk,
+         "initialize contextual execution-admission test");
+  auto processSetup = setup(96000.0, 64);
+  expect(processor->setupProcessing(processSetup) == kResultOk,
+         "prepare contextual execution-admission test");
+
+  const auto installed = choc::json::parse(processor->handleUiMessage(
+      R"({"type":"pipeline/rebuild","payload":{"pipeline":"A","plugins":[)"
+      R"({"id":301,"type":"PitchShifterHQPlugin","name":"Constrained Pitch",)"
+      R"("enabled":true,"parameters":{"ps":0,"ft":0,)"
+      R"("futureParameter":{"nested":9}},"wasmParams":[0,0],)"
+      R"("wasmParamsHash":3982397611,"executionCapabilities":{)"
+      R"("requiresWasm":true,"supportedSampleRates":[44100,48000,88200,96000,176400,192000]},)"
+      R"("futurePayload":{"v":7}},)"
+      R"({"id":302,"type":"VolumePlugin","name":"Following Volume","enabled":true,)"
+      R"("parameters":{"vl":-6},"wasmParams":[-6],)"
+      R"("wasmParamsHash":1719233191}]}})"));
+  const auto admittedLatency =
+      PluginProcessorTestAccess::enginePipelineLatency(*processor);
+  const auto installedConstrainedState = findExecutionState(installed, pluginId);
+  const auto installedFollowingState = findExecutionState(installed, 302u);
+  expect(installed["ok"].getWithDefault<bool>(false) &&
+             installedConstrainedState["pluginType"].getWithDefault<std::string>({}) ==
+                 "PitchShifterHQPlugin" &&
+             installedConstrainedState["state"].getWithDefault<std::string>({}) ==
+                 "active" &&
+             installedFollowingState["state"].getWithDefault<std::string>({}) ==
+                 "active" &&
+             PluginProcessorTestAccess::runtimePluginCount(*processor, pluginId) == 1u &&
+             PluginProcessorTestAccess::runtimePluginCount(*processor, 302u) == 1u &&
+             !PluginProcessorTestAccess::runtimeContextuallyBypassed(*processor, pluginId) &&
+             admittedLatency > 0u,
+         "install one admitted constrained runtime with its latency");
+  expect(processor->setActive(true) == kResultOk,
+         "activate contextual execution-admission test");
+
+  gate_ordering::AudioRig rig(0.0f);
+  const auto renderSteady = [&] {
+    rig.inputLeft.fill(0.25f);
+    rig.inputRight.fill(-0.25f);
+    for (int block = 0; block < 180; ++block) {
+      rig.outputLeft.fill(0.0f);
+      rig.outputRight.fill(0.0f);
+      expect(processor->process(rig.data) == kResultOk,
+             "settle contextual execution-admission audio");
+    }
+    return std::array{rig.outputLeft.back(), rig.outputRight.back()};
+  };
+
+  constexpr auto volumeGain = 0.5011872336f;
+  const auto admitted = renderSteady();
+  expect(std::abs(admitted[0] - 0.25f * volumeGain) < 1.0e-4f &&
+             std::abs(admitted[1] + 0.25f * volumeGain) < 1.0e-4f,
+         "the admitted runtime produces the expected steady output");
+
+  const auto unsupported = choc::json::parse(processor->handleUiMessage(
+      R"({"type":"os/set","payload":{"factor":4,"phase":"linear","quality":"medium"}})"));
+  const auto unsupportedContext = hostInfo(*processor);
+  const auto bypassedMutationState = findExecutionState(unsupported, pluginId);
+  const auto bypassedHostState = findExecutionState(unsupportedContext, pluginId);
+  expect(unsupported["ok"].getWithDefault<bool>(false) &&
+             unsupported["skippedUnsupported"].getWithDefault<bool>(false) &&
+             bypassedMutationState["state"].getWithDefault<std::string>({}) ==
+                 "bypassed" &&
+             bypassedMutationState["reason"].getWithDefault<std::string>({}) ==
+                 "unsupportedSampleRate" &&
+             bypassedHostState["state"].getWithDefault<std::string>({}) ==
+                 "bypassed" &&
+             bypassedHostState["reason"].getWithDefault<std::string>({}) ==
+                 "unsupportedSampleRate" &&
+             PluginProcessorTestAccess::runtimePluginCount(*processor, pluginId) == 1u &&
+             PluginProcessorTestAccess::runtimeContextuallyBypassed(*processor, pluginId) &&
+             PluginProcessorTestAccess::enginePipelineLatency(*processor) == 0u &&
+             unsupportedContext["engineSampleRate"].getWithDefault<double>(0.0) == 384000.0 &&
+             unsupportedContext["oversamplingFactor"].getWithDefault<std::int64_t>(0) == 4 &&
+             PluginProcessorTestAccess::processingReady(*processor),
+         "96 kHz to 4x succeeds and publishes a ready contextual bypass");
+
+  const auto bypassed = renderSteady();
+  expect(std::abs(bypassed[0] - 0.25f * volumeGain) < 1.0e-4f &&
+             std::abs(bypassed[1] + 0.25f * volumeGain) < 1.0e-4f &&
+             PluginProcessorTestAccess::runtimePluginCount(*processor, 302u) == 1u,
+         "the contextual bypass keeps output flowing through the following runtime");
+
+  const auto storedWhileUnsupported = choc::json::parse(processor->handleUiMessage(
+      R"({"type":"storage/readFile","payload":{"path":"pipeline-state.json"}})"));
+  const auto unsupportedState = choc::json::parse(
+      storedWhileUnsupported["content"].getWithDefault<std::string>({}));
+  const auto unsupportedPlugin = unsupportedState["pipelineA"][0];
+  expect(unsupportedPlugin["futurePayload"]["v"].getWithDefault<std::int64_t>(0) == 7 &&
+             unsupportedPlugin["parameters"]["futureParameter"]["nested"]
+                     .getWithDefault<std::int64_t>(0) == 9 &&
+             !unsupportedPlugin.hasObjectMember("executionCapabilities"),
+         "contextual bypass preserves opaque logical state without serializing admission");
+
+  const auto readmitted = choc::json::parse(processor->handleUiMessage(
+      R"({"type":"os/set","payload":{"factor":1,"phase":"linear","quality":"medium"}})"));
+  const auto readmittedState = findExecutionState(readmitted, pluginId);
+  expect(readmitted["ok"].getWithDefault<bool>(false) &&
+             !readmitted["skippedUnsupported"].getWithDefault<bool>(false) &&
+             readmittedState["state"].getWithDefault<std::string>({}) == "active" &&
+             !readmittedState.hasObjectMember("reason") &&
+             PluginProcessorTestAccess::runtimePluginCount(*processor, pluginId) == 1u &&
+             PluginProcessorTestAccess::runtimePluginCount(*processor, 302u) == 1u &&
+             !PluginProcessorTestAccess::runtimeContextuallyBypassed(*processor, pluginId) &&
+             PluginProcessorTestAccess::enginePipelineLatency(*processor) == admittedLatency &&
+             PluginProcessorTestAccess::processingReady(*processor),
+         "the supported context restores exactly one original runtime and its latency");
+
+  const auto recovered = renderSteady();
+  expect(std::abs(recovered[0] - 0.25f * volumeGain) < 1.0e-4f &&
+             std::abs(recovered[1] + 0.25f * volumeGain) < 1.0e-4f,
+         "the re-admitted runtime returns to processed output");
+  const auto storedAfterRecovery = choc::json::parse(processor->handleUiMessage(
+      R"({"type":"storage/readFile","payload":{"path":"pipeline-state.json"}})"));
+  const auto recoveredState = choc::json::parse(
+      storedAfterRecovery["content"].getWithDefault<std::string>({}));
+  expect(recoveredState["pipelineA"][0]["futurePayload"]["v"]
+                     .getWithDefault<std::int64_t>(0) == 7 &&
+             recoveredState["pipelineA"][0]["parameters"]["futureParameter"]["nested"]
+                     .getWithDefault<std::int64_t>(0) == 9 &&
+             hostInfo(*processor)["diagnostics"].size() == 0,
+         "re-admission keeps opaque state and raises no processing diagnostic");
+
+  expect(processor->setActive(false) == kResultOk,
+         "deactivate contextual execution-admission test");
+  expect(processor->terminate() == kResultOk,
+         "terminate contextual execution-admission test");
+}
+
+void testConcurrentHostContextChangeWinsPluginUpdateAdmission() {
+  constexpr std::uint32_t pluginId = 321;
+  auto processor = std::make_unique<EffeTuneProcessor>();
+  expect(processor->initialize(nullptr) == kResultOk,
+         "initialize concurrent execution-admission test");
+  SpeakerArrangement fourChannelInput = SpeakerArr::k40Cine;
+  SpeakerArrangement fourChannelOutput = SpeakerArr::k40Cine;
+  expect(processor->setBusArrangements(&fourChannelInput, 1,
+                                       &fourChannelOutput, 1) == kResultTrue,
+         "select the initially supported four-channel arrangement");
+  auto processSetup = setup(48000.0, 64);
+  expect(processor->setupProcessing(processSetup) == kResultOk,
+         "prepare concurrent execution-admission test");
+
+  const auto installed = choc::json::parse(processor->handleUiMessage(
+      R"({"type":"pipeline/rebuild","payload":{"pipeline":"A","plugins":[)"
+      R"({"id":321,"type":"VolumePlugin","name":"Pair Send","enabled":true,)"
+      R"("inputBus":0,"outputBus":1,"channel":"34",)"
+      R"("parameters":{"vl":-6},"wasmParams":[-6],)"
+      R"("wasmParamsHash":1719233191,"executionCapabilities":{)"
+      R"("supportedChannelModes":["stereo-pair"]}}]}})"));
+  expect(installed["ok"].getWithDefault<bool>(false) &&
+             !PluginProcessorTestAccess::runtimeContextuallyBypassed(
+                 *processor, pluginId),
+         "install channel 34 while both selected channels exist");
+
+  PluginProcessorTestAccess::pausePluginUpdateBeforeRuntimeTransaction(
+      *processor, true);
+  std::string updateResponse;
+  std::atomic_bool updateCompleted{false};
+  std::thread updater([&] {
+    updateResponse = processor->handleUiMessage(
+        R"({"type":"pipeline/updatePlugin","payload":{"pipeline":"A","plugin":)"
+        R"({"id":321,"type":"VolumePlugin","name":"Pair Send","enabled":true,)"
+        R"("inputBus":0,"outputBus":1,"channel":"34",)"
+        R"("parameters":{"vl":-12},"wasmParams":[-12],)"
+        R"("wasmParamsHash":1719233191,"executionCapabilities":{)"
+        R"("supportedChannelModes":["stereo-pair"]}}}})");
+    updateCompleted.store(true, std::memory_order_release);
+  });
+  const auto pauseDeadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!PluginProcessorTestAccess::pluginUpdatePausedBeforeRuntimeTransaction(
+             *processor) &&
+         !updateCompleted.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < pauseDeadline) {
+    std::this_thread::yield();
+  }
+  const auto reachedRuntimeBoundary =
+      PluginProcessorTestAccess::pluginUpdatePausedBeforeRuntimeTransaction(
+          *processor);
+
+  SpeakerArrangement threeChannelInput = SpeakerArr::k30Cine;
+  SpeakerArrangement threeChannelOutput = SpeakerArr::k30Cine;
+  const auto arrangementResult = processor->setBusArrangements(
+      &threeChannelInput, 1, &threeChannelOutput, 1);
+  const auto bypassedBeforeUpdateResumes =
+      PluginProcessorTestAccess::runtimeContextuallyBypassed(*processor,
+                                                             pluginId);
+  PluginProcessorTestAccess::pausePluginUpdateBeforeRuntimeTransaction(
+      *processor, false);
+  updater.join();
+
+  const auto updated = choc::json::parse(updateResponse);
+  const auto finalContext = hostInfo(*processor);
+  expect(reachedRuntimeBoundary && arrangementResult == kResultTrue &&
+             bypassedBeforeUpdateResumes,
+         "the three-channel rebuild lands while the UI update is paused");
+  expect(updated["ok"].getWithDefault<bool>(false) &&
+             updated["skippedUnsupported"].getWithDefault<bool>(false) &&
+             !updated.hasObjectMember("rebuildAssets") &&
+             finalContext["channels"].getWithDefault<std::int64_t>(0) == 3 &&
+             PluginProcessorTestAccess::runtimePluginCount(*processor,
+                                                           pluginId) == 1u &&
+             PluginProcessorTestAccess::runtimeContextuallyBypassed(
+                 *processor, pluginId) &&
+             PluginProcessorTestAccess::processingReady(*processor),
+         "the resumed update uses the fresh context and keeps the bypassed "
+         "runtime generation ready");
+
+  expect(processor->terminate() == kResultOk,
+         "terminate concurrent execution-admission test");
+}
+
+void testOversamplingFailureRestoresPreviousPlayableGeneration() {
+  auto processor = std::make_unique<EffeTuneProcessor>();
+  expect(processor->initialize(nullptr) == kResultOk,
+         "initialize oversampling rollback test");
+  auto processSetup = setup(96000.0, 64);
+  expect(processor->setupProcessing(processSetup) == kResultOk,
+         "prepare oversampling rollback test");
+  const auto installed = choc::json::parse(processor->handleUiMessage(
+      R"({"type":"pipeline/rebuild","payload":{"pipeline":"A","plugins":[)"
+      R"({"id":311,"type":"PitchShifterHQPlugin","name":"Legacy Pitch",)"
+      R"("enabled":true,"parameters":{"ps":0,"ft":0},"wasmParams":[0,0],)"
+      R"("wasmParamsHash":3982397611}]}})"));
+  const auto previousLatency =
+      PluginProcessorTestAccess::enginePipelineLatency(*processor);
+  expect(installed["ok"].getWithDefault<bool>(false) && previousLatency > 0u,
+         "install legacy runtime without contextual metadata");
+
+  const auto refused = choc::json::parse(processor->handleUiMessage(
+      R"({"type":"os/set","payload":{"factor":4,"phase":"linear","quality":"medium"}})"));
+  const auto restoredContext = hostInfo(*processor);
+  expect(!refused["ok"].getWithDefault<bool>(true) &&
+             PluginProcessorTestAccess::processingReady(*processor) &&
+             PluginProcessorTestAccess::enginePipelineLatency(*processor) ==
+                 previousLatency &&
+             restoredContext["engineSampleRate"].getWithDefault<double>(0.0) == 96000.0 &&
+             restoredContext["oversamplingFactor"].getWithDefault<std::int64_t>(0) == 1,
+         "a refused oversampling change restores the old runtime, context, and ready gate");
+
+  expect(processor->terminate() == kResultOk,
+         "terminate oversampling rollback test");
+}
 
 // Closing the processing gate and proving the audio thread out of the engine
 // belong inside processingResourcesMutex_. A path that closes the gate before
@@ -7186,6 +8213,78 @@ void testStateRestoreClosesATouchReopenedBeforeTheReload() {
   handler.release();
 }
 
+// An effect power button changes its value from DOM click, after pointerup.
+// Its pointerdown therefore has to open the already-bound node-enable touch by
+// identity alone; otherwise the later value is emitted as begin/perform/end in
+// one call and Read automation can reclaim the old value immediately.
+void testClickActivatedControlOpensItsTouchBeforeItsValue() {
+  auto fixture = openTouchFixture("the click-activated touch test", 72);
+  auto &processor = *fixture.processor;
+  auto &handler = *fixture.handler;
+
+  // Return the fixture to a bound but untouched state, which is what exists
+  // before the next physical press on an already-automated control.
+  const auto initialClose = choc::json::parse(processor.handleUiMessage(
+      std::string{R"({"type":"automation/endGesture","payload":{"targets":[)"
+                  R"({"pipeline":"A","pluginId":)"} +
+      std::to_string(fixture.identity.pluginId) +
+      R"(,"pluginType":"DCOffsetPlugin","parameterKey":"of","elementIndex":0}]}})"));
+  expect(initialClose["ok"].getWithDefault<bool>(false),
+         "close the fixture touch before the click-activated test");
+  handler.clearEditLog();
+
+  const auto pressed = choc::json::parse(processor.handleUiMessage(
+      std::string{R"({"type":"automation/beginGesture","payload":{"targets":[)"
+                  R"({"pipeline":"A","pluginId":)"} +
+      std::to_string(fixture.identity.pluginId) +
+      R"(,"pluginType":"DCOffsetPlugin","parameterKey":"of","elementIndex":0}]}})"));
+  expect(pressed["ok"].getWithDefault<bool>(false),
+         "accept the pointerdown boundary without a value");
+  expect(PluginProcessorTestAccess::hostGestureOpen(processor,
+                                                     fixture.parameterId) &&
+             handler.stepCount(TestComponentHandler::EditStep::begin) == 1u &&
+             handler.stepCount(TestComponentHandler::EditStep::perform) == 1u &&
+             handler.stepCount(TestComponentHandler::EditStep::end) == 0u,
+         "pointerdown opens the touch and anchors its previous value");
+
+  const auto beforeClick = processor.getParamNormalized(fixture.parameterId);
+  expect(processor.setParamNormalized(fixture.parameterId, 0.0) == kResultTrue &&
+             std::abs(processor.getParamNormalized(fixture.parameterId) -
+                      beforeClick) < 1.0e-9,
+         "Read automation cannot replace the control while its pointer is down");
+
+  constexpr double kClickedValue = 0.25;
+  expect(PluginProcessorTestAccess::applyAutomationEdit(
+             processor, fixture.identity, kClickedValue,
+             {/*bindIfUnbound=*/true, /*beginGesture=*/true,
+              /*endGesture=*/false}),
+         "apply the click value inside the pointerdown touch");
+  expect(PluginProcessorTestAccess::hostGestureOpen(processor,
+                                                     fixture.parameterId) &&
+             handler.stepCount(TestComponentHandler::EditStep::begin) == 1u &&
+             handler.stepCount(TestComponentHandler::EditStep::perform) == 2u &&
+             handler.stepCount(TestComponentHandler::EditStep::end) == 0u &&
+             std::abs(handler.performedEdits[1].value - kClickedValue) < 1.0e-9,
+         "the click value is performed inside the existing touch");
+
+  const auto released = choc::json::parse(processor.handleUiMessage(
+      std::string{R"({"type":"automation/endGesture","payload":{"targets":[)"
+                  R"({"pipeline":"A","pluginId":)"} +
+      std::to_string(fixture.identity.pluginId) +
+      R"(,"pluginType":"DCOffsetPlugin","parameterKey":"of","elementIndex":0}]}})"));
+  expect(released["ok"].getWithDefault<bool>(false) &&
+             !PluginProcessorTestAccess::hostGestureOpen(processor,
+                                                          fixture.parameterId) &&
+             handler.stepCount(TestComponentHandler::EditStep::begin) == 1u &&
+             handler.stepCount(TestComponentHandler::EditStep::perform) == 2u &&
+             handler.stepCount(TestComponentHandler::EditStep::end) == 1u,
+         "the deferred pointerup closes the one complete touch after click");
+
+  expect(processor.terminate() == kResultOk,
+         "terminate the click-activated touch test");
+  handler.release();
+}
+
 // The editor stamps every value of a drag with beginGesture, not only the first
 // one. The open is idempotent, so the drag is still the single touch a host
 // keys its automation writer on -- and asking every time is what lets a close
@@ -7800,6 +8899,669 @@ void testDisplayStringsCarryTheStepsOwnDecimalCount() {
       .getWithDefault<double>(-1000.0);
 }
 
+[[nodiscard]] std::string savedPluginStringParameter(
+    EffeTuneProcessor &processor, const std::int64_t logicalId,
+    const std::string &key) {
+  ResizableMemoryIBStream savedState;
+  expect(processor.getState(&savedState) == kResultOk, "save the state document");
+  effetune::vst::PluginStateDocument saved;
+  std::string decodeError;
+  expect(effetune::vst::StateCodec::decode(
+             std::string(static_cast<const char *>(savedState.getData()),
+                         savedState.getCursor()),
+             saved, &decodeError),
+         "decode the saved document: " + decodeError);
+  const auto savedPlugin =
+      std::find_if(saved.pipelineA.plugins.begin(), saved.pipelineA.plugins.end(),
+                   [logicalId](const effetune::vst::PluginState &plugin) {
+                     return plugin.id == logicalId;
+                   });
+  expect(savedPlugin != saved.pipelineA.plugins.end(),
+         "the saved document still carries the plug-in");
+  return choc::json::parse(savedPlugin->parametersJson)[key.c_str()]
+      .getWithDefault<std::string>({});
+}
+
+// State chunks become the save/UI authority before the WebView replacement is
+// available. A pipeline the bridge can never rebuild must therefore be
+// rejected by the codec, leaving the complete previous authority playable and
+// never entering replacement-pending state.
+void testInvalidStatePipelineNeverReplacesTheAuthority() {
+  auto processor = std::make_unique<EffeTuneProcessor>();
+  expect(processor->initialize(nullptr) == kResultOk,
+         "initialize the invalid state-pipeline test");
+  auto processSetup = setup(48000.0, 64);
+  expect(processor->setupProcessing(processSetup) == kResultOk,
+         "prepare the invalid state-pipeline test");
+  const auto installed = choc::json::parse(processor->handleUiMessage(
+      R"({"type":"pipeline/rebuild","payload":{"pipeline":"A","plugins":[)"
+      R"({"id":901,"type":"DCOffsetPlugin","name":"Authoritative Offset",)"
+      R"("enabled":true,"parameters":{"of":-0.25},"wasmParams":[-0.25],)"
+      R"("wasmParamsHash":1104945464}]}})"));
+  expect(installed["ok"].getWithDefault<bool>(false),
+         "install the authority the invalid chunks must preserve");
+
+  ResizableMemoryIBStream savedBefore;
+  expect(processor->getState(&savedBefore) == kResultOk,
+         "save the authority before invalid chunks");
+  const std::string serializedBefore{
+      static_cast<const char *>(savedBefore.getData()), savedBefore.getCursor()};
+  const auto applyStateJson = [&](const std::string &json) {
+    ResizableMemoryIBStream stream(json.size());
+    int32 bytesWritten = 0;
+    expect(stream.write(const_cast<char *>(json.data()),
+                        static_cast<int32>(json.size()), &bytesWritten) ==
+                   kResultOk &&
+               bytesWritten == static_cast<int32>(json.size()),
+           "write an invalid state chunk");
+    stream.rewind();
+    return processor->setState(&stream);
+  };
+
+  const std::string duplicateIds =
+      R"({"pipelineA":[{"id":7,"name":"First"},{"id":7,"name":"Second","unknown":true}]})";
+  expect(applyStateJson(duplicateIds) == kResultFalse,
+         "reject a state chunk with duplicate positive IDs");
+
+  std::string excessivePipeline{R"({"pipelineA":[)"};
+  for (std::uint32_t id = 1; id <= 129u; ++id) {
+    if (id != 1u) {
+      excessivePipeline += ',';
+    }
+    excessivePipeline += R"({"id":)" + std::to_string(id) +
+                         R"(,"name":"Future","unknown":true})";
+  }
+  excessivePipeline += "]}";
+  expect(applyStateJson(excessivePipeline) == kResultFalse,
+         "reject a state chunk with 129 nodes");
+
+  std::string excessiveNativePipeline{R"({"pipelineA":[)"};
+  for (std::uint32_t id = 1; id <= 97u; ++id) {
+    if (id != 1u) {
+      excessiveNativePipeline += ',';
+    }
+    excessiveNativePipeline += R"({"id":)" + std::to_string(id) +
+                               R"(,"type":"DCOffsetPlugin","name":"Offset"})";
+  }
+  excessiveNativePipeline += "]}";
+  expect(applyStateJson(excessiveNativePipeline) == kResultFalse,
+         "reject a state chunk above the native instance capacity");
+
+  ResizableMemoryIBStream savedAfter;
+  expect(processor->getState(&savedAfter) == kResultOk,
+         "save the authority after invalid chunks");
+  const std::string serializedAfter{
+      static_cast<const char *>(savedAfter.getData()), savedAfter.getCursor()};
+  const auto info = hostInfo(*processor);
+  expect(serializedAfter == serializedBefore &&
+             std::abs(PluginProcessorTestAccess::runtimePackedParameter(
+                          *processor, 901, 0) +
+                      0.25f) < 1.0e-6f &&
+             info["dspReady"].getWithDefault<bool>(false) &&
+             !info["stateReplacementPending"].getWithDefault<bool>(true),
+         "invalid chunks leave the old document, runtime and ready state authoritative");
+
+  expect(processor->setActive(true) == kResultOk,
+         "activate after the invalid chunks");
+  gate_ordering::AudioRig rig(0.0f);
+  expect(processor->process(rig.data) == kResultOk &&
+             std::abs(rig.outputLeft[0] + 0.25f) < 1.0e-6f,
+         "the rejected chunks leave the old wet DSP playable");
+  expect(processor->setActive(false) == kResultOk,
+         "deactivate the invalid state-pipeline test");
+
+  std::string forwardCompatiblePipeline{R"({"pipelineA":[)"};
+  for (std::uint32_t id = 1; id <= 128u; ++id) {
+    if (id != 1u) {
+      forwardCompatiblePipeline += ',';
+    }
+    if (id <= 96u) {
+      forwardCompatiblePipeline += R"({"id":)" + std::to_string(id) +
+                                   R"(,"type":"DCOffsetPlugin","name":"Offset"})";
+    } else if (id <= 112u) {
+      forwardCompatiblePipeline += R"({"id":)" + std::to_string(id) +
+                                   R"(,"type":"FuturePlugin","name":"Future","unknown":true})";
+    } else {
+      forwardCompatiblePipeline += R"({"id":)" + std::to_string(id) +
+                                   R"(,"type":"SectionPlugin","name":"Section"})";
+    }
+  }
+  forwardCompatiblePipeline += "]}";
+  expect(applyStateJson(forwardCompatiblePipeline) == kResultOk,
+         "unknown and Section nodes do not consume native state capacity");
+  ResizableMemoryIBStream forwardCompatibleState;
+  expect(processor->getState(&forwardCompatibleState) == kResultOk,
+         "save the admitted forward-compatible state");
+  const auto admitted = choc::json::parse(std::string{
+      static_cast<const char *>(forwardCompatibleState.getData()),
+      forwardCompatibleState.getCursor()});
+  expect(admitted["pipelineA"].size() == 128u,
+         "the full forward-compatible pipeline becomes the state authority");
+  expect(processor->terminate() == kResultOk,
+         "terminate the invalid state-pipeline test");
+}
+
+// Structured parameter commands are adopted only when their byte shape
+// matches the runtime shadow. A Matrix route-count edit changes that shape, so
+// treating it as an in-place update would commit "mx" to state while the audio
+// thread silently kept the old routes.
+void testStructuredParameterShapeChangeRebuildsTheRuntime() {
+  auto processor = std::make_unique<EffeTuneProcessor>();
+  expect(processor->initialize(nullptr) == kResultOk,
+         "initialize the structured parameter-shape test");
+  auto processSetup = setup(48000.0, 64);
+  expect(processor->setupProcessing(processSetup) == kResultOk,
+         "prepare the structured parameter-shape test");
+  const auto installed = choc::json::parse(processor->handleUiMessage(
+      R"({"type":"pipeline/rebuild","payload":{"pipeline":"A","plugins":[)"
+      R"({"id":701,"type":"MatrixPlugin","name":"Matrix","enabled":true,)"
+      R"("parameters":{"mx":"0011"},"wasmParams":[],)"
+      R"("wasmParamsHash":117968709,"wasmParamBytes":[1,0,2,0,0,0,0,1,1,0]}]}})"));
+  expect(installed["ok"].getWithDefault<bool>(false),
+         "install the two-route Matrix runtime");
+  expect(processor->setActive(true) == kResultOk,
+         "activate the structured parameter-shape test");
+
+  gate_ordering::AudioRig rig(0.0f);
+  rig.inputLeft.fill(0.25f);
+  rig.inputRight.fill(-0.5f);
+  expect(processor->process(rig.data) == kResultOk &&
+             std::abs(rig.outputLeft[0] - 0.25f) < 1.0e-6f &&
+             std::abs(rig.outputRight[0] + 0.5f) < 1.0e-6f,
+         "the initial Matrix image routes both channels diagonally");
+
+  const auto updated = choc::json::parse(processor->handleUiMessage(
+      R"({"type":"pipeline/updatePlugin","payload":{"pipeline":"A","plugin":)"
+      R"({"id":701,"type":"MatrixPlugin","name":"Matrix","enabled":true,)"
+      R"("parameters":{"mx":"01"},"wasmParams":[],)"
+      R"("wasmParamsHash":117968709,"wasmParamBytes":[1,0,1,0,0,1,0]}}})"));
+  expect(updated["ok"].getWithDefault<bool>(false) &&
+             updated["rebuildAssets"].getWithDefault<bool>(false),
+         "a structured byte-shape change takes the non-RT rebuild path");
+
+  rig.outputLeft.fill(0.0f);
+  rig.outputRight.fill(0.0f);
+  expect(processor->process(rig.data) == kResultOk &&
+             std::abs(rig.outputLeft[0]) < 1.0e-6f &&
+             std::abs(rig.outputRight[0] - 0.25f) < 1.0e-6f,
+         "the rebuilt Matrix DSP plays the single replacement route");
+  expect(savedPluginStringParameter(*processor, 701, "mx") == "01",
+         "the saved Matrix state names the same route the DSP plays");
+
+  expect(processor->setActive(false) == kResultOk,
+         "deactivate the structured parameter-shape test");
+  expect(processor->terminate() == kResultOk,
+         "terminate the structured parameter-shape test");
+}
+
+// A bulk request owns the state/page generation in which it entered the
+// bridge. Both routes decode before their control transaction, so setState()
+// and a complete replacement page can otherwise pass them while they wait and
+// the old request can overwrite the restored generation after pending is false
+// again. History also must not become valid merely because a replacement that
+// was pending when it started completes first.
+void testStaleBulkRequestsCannotCrossStateReplacement() {
+  auto processor = std::make_unique<EffeTuneProcessor>();
+  expect(processor->initialize(nullptr) == kResultOk,
+         "initialize the stale bulk-request test");
+  auto processSetup = setup(48000.0, 64);
+  expect(processor->setupProcessing(processSetup) == kResultOk,
+         "prepare the stale bulk-request test");
+  const auto installed = choc::json::parse(processor->handleUiMessage(
+      R"({"type":"pipeline/rebuild","payload":{"pipeline":"A","plugins":[)"
+      R"({"id":801,"type":"DCOffsetPlugin","name":"Restored Offset",)"
+      R"("enabled":true,"parameters":{"of":-0.5},"wasmParams":[-0.5],)"
+      R"("wasmParamsHash":1104945464}]}})"));
+  expect(installed["ok"].getWithDefault<bool>(false),
+         "install the state that every restore must preserve");
+  const effetune::vst::AutomationTargetIdentity restoredIdentity{
+      'A', 801, "DCOffsetPlugin", "of", 0};
+  const auto restoredParameterId =
+      boundAutomationParameterId(*processor, restoredIdentity);
+  const auto restoredSlot =
+      PluginProcessorTestAccess::activeAutomationSlot(*processor,
+                                                       restoredIdentity);
+  expect(restoredSlot.has_value(),
+         "the restored target owns an automation lane");
+
+  ResizableMemoryIBStream stateA;
+  expect(processor->getState(&stateA) == kResultOk,
+         "save the authoritative replacement document");
+  const auto changed = choc::json::parse(processor->handleUiMessage(
+      R"({"type":"pipeline/updatePlugin","payload":{"pipeline":"A","plugin":)"
+      R"({"id":801,"type":"DCOffsetPlugin","name":"Restored Offset",)"
+      R"("enabled":true,"parameters":{"of":0.5},"wasmParams":[0.5],)"
+      R"("wasmParamsHash":1104945464},"automationEdits":[{"pipeline":"A",)"
+      R"("pluginId":801,"pluginType":"DCOffsetPlugin","parameterKey":"of",)"
+      R"("elementIndex":0,"normalized":0.75}]}})"));
+  expect(changed["ok"].getWithDefault<bool>(false) &&
+             std::abs(savedPluginParameter(*processor, 801, "of") - 0.5) <
+                 1.0e-9,
+         "move the old page away from the saved replacement state");
+
+  const auto announceReplacementPage = [&] {
+    const auto startup = choc::json::parse(processor->handleUiMessage(
+        R"({"type":"host/getInfo","payload":{"startup":true}})"));
+    expect(startup["ok"].getWithDefault<bool>(false) &&
+               startup["dspReady"].getWithDefault<bool>(false) &&
+               startup["stateReplacementPending"].getWithDefault<bool>(false),
+           "announce that the ready old DSP still requires a replacement image");
+  };
+  const auto installReplacementRuntime = [&] {
+    const auto replacement = choc::json::parse(processor->handleUiMessage(
+        R"({"type":"pipeline/rebuild","payload":{"pipeline":"A","plugins":[)"
+        R"({"id":801,"type":"DCOffsetPlugin","name":"Restored Offset",)"
+        R"("enabled":true,"parameters":{"of":-0.5},"wasmParams":[-0.5],)"
+        R"("wasmParamsHash":1104945464}]}})"));
+    expect(replacement["ok"].getWithDefault<bool>(false),
+           "accept the authorized replacement runtime");
+    const auto completed = hostInfo(*processor);
+    expect(!completed["stateReplacementPending"].getWithDefault<bool>(true),
+           "publish completion after the authorized replacement succeeds");
+  };
+  const auto restoreAndRebuild = [&] {
+    stateA.rewind();
+    expect(processor->setState(&stateA) == kResultOk,
+           "publish the saved replacement document");
+    announceReplacementPage();
+    installReplacementRuntime();
+  };
+  const auto waitForBulkPause = [&] {
+    return pumpMainThreadUntil(
+        [&] {
+          return PluginProcessorTestAccess::bulkRequestPausedBeforeCommit(
+              *processor);
+        },
+        std::chrono::milliseconds(500));
+  };
+  struct ReplacementSnapshot {
+    std::optional<std::uint32_t> slot;
+    double saved = 0.0;
+    float runtime = 0.0f;
+    double parameter = 0.0;
+    double scheduler = 0.0;
+  };
+  const auto captureReplacement = [&] {
+    return ReplacementSnapshot{
+        PluginProcessorTestAccess::activeAutomationSlot(*processor,
+                                                         restoredIdentity),
+        savedPluginParameter(*processor, 801, "of"),
+        PluginProcessorTestAccess::runtimePackedParameter(*processor, 801, 0),
+        processor->getParamNormalized(restoredParameterId),
+        PluginProcessorTestAccess::playedAutomationValue(*processor,
+                                                          *restoredSlot)};
+  };
+  const auto assertReplacementUnchanged =
+      [&](const ReplacementSnapshot &before, const std::string &operation) {
+    const auto after = captureReplacement();
+    expect(before.slot == restoredSlot && after.slot == before.slot &&
+               std::abs(before.saved + 0.5) < 1.0e-9 &&
+               std::abs(before.runtime + 0.5f) < 1.0e-6f &&
+               std::abs(after.saved - before.saved) < 1.0e-9 &&
+               std::abs(after.runtime - before.runtime) < 1.0e-6f &&
+               std::abs(after.parameter - before.parameter) < 1.0e-9 &&
+               std::abs(after.scheduler - before.scheduler) < 1.0e-9,
+           operation +
+               " leaves the restored document, runtime, binding and scheduler unchanged");
+  };
+
+  PluginProcessorTestAccess::pauseNextBulkRequestBeforeCommit(*processor);
+  std::string staleRebuildResponse;
+  std::thread staleRebuilder([&] {
+    staleRebuildResponse = processor->handleUiMessage(
+        R"({"type":"pipeline/rebuild","payload":{"pipeline":"A","plugins":[)"
+        R"({"id":802,"type":"DCOffsetPlugin","name":"Stale Rebuild",)"
+        R"("enabled":true,"parameters":{"of":0.25},"wasmParams":[0.25],)"
+        R"("wasmParamsHash":1104945464}]}})");
+  });
+  const auto rebuildPaused = waitForBulkPause();
+  restoreAndRebuild();
+  const auto beforeStaleRebuild = captureReplacement();
+  PluginProcessorTestAccess::releaseBulkRequestBeforeCommit(*processor);
+  staleRebuilder.join();
+  const auto staleRebuild = choc::json::parse(staleRebuildResponse);
+  expect(rebuildPaused && staleRebuild["ok"].getWithDefault<bool>(false) &&
+             staleRebuild["success"].getWithDefault<bool>(false),
+         "acknowledge the old rebuild as a successful generation no-op");
+  assertReplacementUnchanged(beforeStaleRebuild, "the old rebuild");
+
+  PluginProcessorTestAccess::pauseNextBulkRequestBeforeCommit(*processor);
+  std::string staleHistoryResponse;
+  std::thread staleHistory([&] {
+    staleHistoryResponse = processor->handleUiMessage(
+        R"({"type":"pipeline/restoreHistory","payload":{"pipelineA":[)"
+        R"({"id":803,"type":"DCOffsetPlugin","name":"Stale History",)"
+        R"("enabled":true,"parameters":{"of":0.75},"wasmParams":[0.75],)"
+        R"("wasmParamsHash":1104945464}],"pipelineB":null,)"
+        R"("pipelineBInitialized":false,"currentPipeline":"A"}})");
+  });
+  const auto historyPaused = waitForBulkPause();
+  restoreAndRebuild();
+  const auto beforeStaleHistory = captureReplacement();
+  PluginProcessorTestAccess::releaseBulkRequestBeforeCommit(*processor);
+  staleHistory.join();
+  const auto staleHistoryResult = choc::json::parse(staleHistoryResponse);
+  expect(historyPaused &&
+             staleHistoryResult["ok"].getWithDefault<bool>(false) &&
+             staleHistoryResult["success"].getWithDefault<bool>(false),
+         "acknowledge the old history restore as a successful generation no-op");
+  assertReplacementUnchanged(beforeStaleHistory, "the old history restore");
+
+  // This request belongs to the authorized new page, but starts while state
+  // replacement is still pending. Completing the rebuild before it acquires
+  // the transaction must not turn that history operation into a valid commit.
+  stateA.rewind();
+  expect(processor->setState(&stateA) == kResultOk,
+         "publish one more replacement for the pending-history case");
+  announceReplacementPage();
+  PluginProcessorTestAccess::pauseNextBulkRequestBeforeCommit(*processor);
+  std::string pendingHistoryResponse;
+  std::thread pendingHistory([&] {
+    pendingHistoryResponse = processor->handleUiMessage(
+        R"({"type":"pipeline/restoreHistory","payload":{"pipelineA":[)"
+        R"({"id":804,"type":"DCOffsetPlugin","name":"Pending History",)"
+        R"("enabled":true,"parameters":{"of":1.0},"wasmParams":[1.0],)"
+        R"("wasmParamsHash":1104945464}],"pipelineB":null,)"
+        R"("pipelineBInitialized":false,"currentPipeline":"A"}})");
+  });
+  const auto pendingHistoryPaused = waitForBulkPause();
+  installReplacementRuntime();
+  const auto beforePendingHistory = captureReplacement();
+  PluginProcessorTestAccess::releaseBulkRequestBeforeCommit(*processor);
+  pendingHistory.join();
+  const auto pendingHistoryResult = choc::json::parse(pendingHistoryResponse);
+  expect(pendingHistoryPaused &&
+             pendingHistoryResult["ok"].getWithDefault<bool>(false) &&
+             pendingHistoryResult["success"].getWithDefault<bool>(false),
+         "a history request that began pending remains a no-op after rebuild");
+  assertReplacementUnchanged(beforePendingHistory,
+                             "the pending history restore");
+
+  expect(processor->setActive(true) == kResultOk,
+         "activate the final restored generation");
+  gate_ordering::AudioRig rig(0.0f);
+  expect(processor->process(rig.data) == kResultOk &&
+             std::abs(rig.outputLeft[0] + 0.5f) < 1.0e-6f,
+         "the final wet engine still plays the restored state");
+  expect(processor->setActive(false) == kResultOk,
+         "deactivate the stale bulk-request test");
+  expect(processor->terminate() == kResultOk,
+         "terminate the stale bulk-request test");
+}
+
+// setState() publishes the restored document before the reloaded page supplies
+// its native replacement. The old page remains alive long enough to flush one
+// final animation frame, so its plug-in image and any not-yet-open touch are
+// stale even though they were created against the retained old runtime. The
+// image must not put B back over restored A or open a touch into the new state.
+void testStalePluginUpdateCannotOverwritePendingStateReplacement() {
+  auto processor = std::make_unique<EffeTuneProcessor>();
+  expect(processor->initialize(nullptr) == kResultOk,
+         "initialize the stale replacement-update test");
+  auto *handler = new TestComponentHandler();
+  expect(processor->setComponentHandler(handler) == kResultOk,
+         "install the stale replacement-update handler");
+  auto processSetup = setup(48000.0, 64);
+  expect(processor->setupProcessing(processSetup) == kResultOk,
+         "prepare the stale replacement-update test");
+
+  constexpr std::uint32_t kPluginId = 109;
+  constexpr double kStateA = -0.5;
+  constexpr double kStateB = 0.5;
+  const effetune::vst::AutomationTargetIdentity identity{
+      'A', kPluginId, "DCOffsetPlugin", "of", 0};
+  const auto installed = choc::json::parse(processor->handleUiMessage(
+      R"({"type":"pipeline/rebuild","payload":{"pipeline":"A","plugins":[)"
+      R"({"id":109,"type":"DCOffsetPlugin","name":"DC Offset","enabled":true,)"
+      R"("parameters":{"of":-0.5},"wasmParams":[-0.5],)"
+      R"("wasmParamsHash":1104945464}]}})"));
+  expect(installed["ok"].getWithDefault<bool>(false),
+         "install state A for the stale replacement-update test");
+  const auto parameterId = boundAutomationParameterId(*processor, identity);
+
+  ResizableMemoryIBStream stateA;
+  expect(processor->getState(&stateA) == kResultOk,
+         "save state A before the old page moves to B");
+
+  const auto changedToB = choc::json::parse(processor->handleUiMessage(
+      R"({"type":"pipeline/rebuild","payload":{"pipeline":"A","plugins":[)"
+      R"({"id":109,"type":"DCOffsetPlugin","name":"DC Offset","enabled":true,)"
+      R"("parameters":{"of":0.5},"wasmParams":[0.5],)"
+      R"("wasmParamsHash":1104945464}],"automationEdits":[{"pipeline":"A",)"
+      R"("pluginId":109,"pluginType":"DCOffsetPlugin","parameterKey":"of",)"
+      R"("elementIndex":0,"normalized":0.75}]}})"));
+  expect(changedToB["ok"].getWithDefault<bool>(false) &&
+             std::abs(savedPluginParameter(*processor, kPluginId, "of") - kStateB) <
+                 1.0e-9 &&
+             std::abs(PluginProcessorTestAccess::runtimePackedParameter(
+                          *processor, kPluginId, 0) -
+                      static_cast<float>(kStateB)) < 1.0e-6f,
+         "the old page and old playable generation both reach state B");
+
+  // Stop the old page after its unlocked pending check and state snapshot, but
+  // before it enters the runtime transaction. This is the precise interval in
+  // which setState() used to publish A and the resumed update could still put B
+  // back into the document, mailbox and runtime shadow.
+  PluginProcessorTestAccess::pausePluginUpdateBeforeRuntimeTransaction(
+      *processor, true);
+  std::string staleResponse;
+  std::atomic_bool staleUpdateCompleted{false};
+  std::thread staleUpdater([&] {
+    staleResponse = processor->handleUiMessage(
+        R"({"type":"pipeline/updatePlugin","payload":{"pipeline":"A",)"
+        R"("plugin":{"id":109,"type":"DCOffsetPlugin","name":"DC Offset",)"
+        R"("enabled":true,"parameters":{"of":0.25},"wasmParams":[0.25],)"
+        R"("wasmParamsHash":1104945464},"automationEdits":[{"pipeline":"A",)"
+        R"("pluginId":109,"pluginType":"DCOffsetPlugin","parameterKey":"of",)"
+        R"("elementIndex":0,"normalized":0.75,"beginGesture":true,)"
+        R"("endGesture":false}]}})");
+    staleUpdateCompleted.store(true, std::memory_order_release);
+  });
+  const auto pauseDeadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!PluginProcessorTestAccess::pluginUpdatePausedBeforeRuntimeTransaction(
+             *processor) &&
+         !staleUpdateCompleted.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < pauseDeadline) {
+    std::this_thread::yield();
+  }
+  const auto reachedRuntimeBoundary =
+      PluginProcessorTestAccess::pluginUpdatePausedBeforeRuntimeTransaction(
+          *processor);
+
+  stateA.rewind();
+  const auto restored = processor->setState(&stateA);
+  handler->clearEditLog();
+  PluginProcessorTestAccess::pausePluginUpdateBeforeRuntimeTransaction(
+      *processor, false);
+  staleUpdater.join();
+
+  const auto stale = choc::json::parse(staleResponse);
+  expect(reachedRuntimeBoundary && restored == kResultOk,
+         "publish restored state A while the stale B update is paused before "
+         "its runtime transaction");
+  expect(stale["ok"].getWithDefault<bool>(false) &&
+             stale["success"].getWithDefault<bool>(false),
+         "accept the dying page's final frame as a successful image no-op");
+  expect(std::abs(savedPluginParameter(*processor, kPluginId, "of") - kStateA) <
+                 1.0e-9 &&
+             std::abs(PluginProcessorTestAccess::runtimePackedParameter(
+                          *processor, kPluginId, 0) -
+                      static_cast<float>(kStateB)) < 1.0e-6f,
+         "the stale image cannot overwrite restored state A or the retained "
+         "old playable runtime");
+  expect(handler->stepCount(TestComponentHandler::EditStep::begin) == 0u &&
+             handler->stepCount(TestComponentHandler::EditStep::end) == 0u &&
+             !PluginProcessorTestAccess::hostGestureOpen(*processor, parameterId),
+         "the stale frame cannot open a touch after setState closed the old page");
+
+  // A pending stale frame may report only into a touch that is already open; it
+  // may not reserve a lane from the restored binding state. That reservation is
+  // permanent, even after the target is retired, so one dying-page frame used
+  // to consume host automation capacity forever.
+  const effetune::vst::AutomationTargetIdentity unboundIdentity{
+      'A', 110, "DCOffsetPlugin", "of", 0};
+  const auto beginCountBeforeUnbound =
+      handler->stepCount(TestComponentHandler::EditStep::begin);
+  const auto performedCountBeforeUnbound = handler->performedEditCount;
+  const auto staleUnbound = choc::json::parse(processor->handleUiMessage(
+      R"({"type":"pipeline/updatePlugin","payload":{"pipeline":"A",)"
+      R"("plugin":{"id":110,"type":"DCOffsetPlugin","name":"Stale Unbound",)"
+      R"("enabled":true,"parameters":{"of":0.5},"wasmParams":[0.5],)"
+      R"("wasmParamsHash":1104945464},"automationEdits":[{"pipeline":"A",)"
+      R"("pluginId":110,"pluginType":"DCOffsetPlugin","parameterKey":"of",)"
+      R"("elementIndex":0,"normalized":0.75,"beginGesture":true,)"
+      R"("endGesture":false,"bindIfUnbound":true}]}})"));
+  expect(staleUnbound["ok"].getWithDefault<bool>(false) &&
+             !PluginProcessorTestAccess::activeAutomationSlot(
+                  *processor, unboundIdentity)
+                  .has_value() &&
+             handler->stepCount(TestComponentHandler::EditStep::begin) ==
+                 beginCountBeforeUnbound &&
+             handler->performedEditCount == performedCountBeforeUnbound,
+         "a pending stale edit cannot claim a new lane or reach the host");
+
+  const auto startup = choc::json::parse(processor->handleUiMessage(
+      R"({"type":"host/getInfo","payload":{"startup":true}})"));
+  expect(startup["ok"].getWithDefault<bool>(false) &&
+             !PluginProcessorTestAccess::hostGestureOpen(*processor, parameterId) &&
+             handler->stepCount(TestComponentHandler::EditStep::end) == 0u,
+         "the replacement page finds no touch for the stale frame to leak");
+
+  const auto replacement = choc::json::parse(processor->handleUiMessage(
+      R"({"type":"pipeline/rebuild","payload":{"pipeline":"A","plugins":[)"
+      R"({"id":109,"type":"DCOffsetPlugin","name":"DC Offset","enabled":true,)"
+      R"("parameters":{"of":-0.5},"wasmParams":[-0.5],)"
+      R"("wasmParamsHash":1104945464}]}})"));
+  expect(replacement["ok"].getWithDefault<bool>(false),
+         "install the replacement runtime supplied by the reloaded page");
+  expect(std::abs(savedPluginParameter(*processor, kPluginId, "of") - kStateA) <
+                 1.0e-9 &&
+             std::abs(PluginProcessorTestAccess::runtimePackedParameter(
+                          *processor, kPluginId, 0) -
+                      static_cast<float>(kStateA)) < 1.0e-6f,
+         "the final serialized document and runtime both remain state A");
+
+  // Exercise the ABA window: this old update commits while no replacement is
+  // pending, then stops after dropping processingResourcesMutex_ but before it
+  // applies its automation edits. A complete setState -> replacement rebuild
+  // makes pending true and false again while it sleeps. The monotonic restore
+  // epoch, rather than that bool's final value, must still reject its edits.
+  handler->clearEditLog();
+  expect(PluginProcessorTestAccess::applyAutomationEdit(
+             *processor, identity, 0.25,
+             {/*bindIfUnbound=*/true, /*beginGesture=*/true,
+              /*endGesture=*/false}),
+         "open one old-generation touch before the ABA restore");
+  expect(PluginProcessorTestAccess::hostGestureOpen(*processor, parameterId),
+         "the ABA fixture starts with its old touch open");
+
+  PluginProcessorTestAccess::pausePluginUpdateBeforeAutomationEdits(
+      *processor, true);
+  std::string crossedEpochResponse;
+  std::atomic_bool crossedEpochUpdateCompleted{false};
+  std::thread crossedEpochUpdater([&] {
+    crossedEpochResponse = processor->handleUiMessage(
+        R"({"type":"pipeline/updatePlugin","payload":{"pipeline":"A",)"
+        R"("plugin":{"id":109,"type":"DCOffsetPlugin","name":"DC Offset",)"
+        R"("enabled":true,"parameters":{"of":0.5},"wasmParams":[0.5],)"
+        R"("wasmParamsHash":1104945464},"automationEdits":[{"pipeline":"A",)"
+        R"("pluginId":109,"pluginType":"DCOffsetPlugin","parameterKey":"of",)"
+        R"("elementIndex":0,"normalized":0.875,"beginGesture":false,)"
+        R"("endGesture":true},{"pipeline":"A","pluginId":110,)"
+        R"("pluginType":"DCOffsetPlugin","parameterKey":"of","elementIndex":0,)"
+        R"("normalized":0.875,"beginGesture":true,"endGesture":false,)"
+        R"("bindIfUnbound":true}]}})");
+    crossedEpochUpdateCompleted.store(true, std::memory_order_release);
+  });
+  const auto automationPauseDeadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!PluginProcessorTestAccess::pluginUpdatePausedBeforeAutomationEdits(
+             *processor) &&
+         !crossedEpochUpdateCompleted.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < automationPauseDeadline) {
+    std::this_thread::yield();
+  }
+  const auto reachedAutomationBoundary =
+      PluginProcessorTestAccess::pluginUpdatePausedBeforeAutomationEdits(
+          *processor);
+
+  stateA.rewind();
+  const auto restoredAcrossEpoch = processor->setState(&stateA);
+  const auto replacementStartup = choc::json::parse(processor->handleUiMessage(
+      R"({"type":"host/getInfo","payload":{"startup":true}})"));
+  const auto rebuiltAcrossEpoch = choc::json::parse(processor->handleUiMessage(
+      R"({"type":"pipeline/rebuild","payload":{"pipeline":"A","plugins":[)"
+      R"({"id":109,"type":"DCOffsetPlugin","name":"DC Offset","enabled":true,)"
+      R"("parameters":{"of":-0.5},"wasmParams":[-0.5],)"
+      R"("wasmParamsHash":1104945464}]}})"));
+  const auto beginsAfterReplacement =
+      handler->stepCount(TestComponentHandler::EditStep::begin);
+  const auto performsAfterReplacement = handler->performedEditCount;
+  const auto endsAfterReplacement =
+      handler->stepCount(TestComponentHandler::EditStep::end);
+  const auto slotAfterReplacement =
+      PluginProcessorTestAccess::activeAutomationSlot(*processor, identity);
+  const auto parameterAfterReplacement =
+      processor->getParamNormalized(parameterId);
+  const auto schedulerAfterReplacement =
+      slotAfterReplacement.has_value()
+          ? PluginProcessorTestAccess::playedAutomationValue(
+                *processor, *slotAfterReplacement)
+          : -1.0;
+  PluginProcessorTestAccess::pausePluginUpdateBeforeAutomationEdits(
+      *processor, false);
+  crossedEpochUpdater.join();
+
+  const auto crossedEpoch = choc::json::parse(crossedEpochResponse);
+  const auto restoredSlot =
+      PluginProcessorTestAccess::activeAutomationSlot(*processor, identity);
+  expect(reachedAutomationBoundary && restoredAcrossEpoch == kResultOk &&
+             replacementStartup["ok"].getWithDefault<bool>(false) &&
+             rebuiltAcrossEpoch["ok"].getWithDefault<bool>(false),
+         "complete setState and replacement rebuild while the old update waits "
+         "before its automation edits");
+  expect(crossedEpoch["ok"].getWithDefault<bool>(false) &&
+             crossedEpoch["success"].getWithDefault<bool>(false),
+         "the crossed-generation image remains an acknowledged no-op");
+  expect(slotAfterReplacement.has_value() && restoredSlot == slotAfterReplacement &&
+             *restoredSlot == static_cast<std::uint32_t>(
+                                  parameterId - kFirstAutomationParameterId) &&
+             !PluginProcessorTestAccess::activeAutomationSlot(
+                  *processor, unboundIdentity)
+                  .has_value(),
+         "the crossed edit neither replaces the restored binding nor consumes "
+         "an unbound slot");
+  const auto restoredParameter = processor->getParamNormalized(parameterId);
+  const auto restoredScheduler = PluginProcessorTestAccess::playedAutomationValue(
+      *processor, *restoredSlot);
+  expect(std::abs(restoredParameter - parameterAfterReplacement) < 1.0e-9 &&
+             std::abs(restoredScheduler - schedulerAfterReplacement) < 1.0e-9,
+         "the crossed edit leaves the restored Parameter and scheduler "
+         "unchanged after replacement");
+  expect(std::abs(savedPluginParameter(*processor, kPluginId, "of") - kStateA) <
+                 1.0e-9 &&
+             std::abs(PluginProcessorTestAccess::runtimePackedParameter(
+                          *processor, kPluginId, 0) -
+                      static_cast<float>(kStateA)) < 1.0e-6f,
+         "the crossed edit leaves the restored document and runtime unchanged");
+  expect(!PluginProcessorTestAccess::hostGestureOpen(*processor, parameterId) &&
+             beginsAfterReplacement == 1u && endsAfterReplacement == 1u &&
+             handler->stepCount(TestComponentHandler::EditStep::begin) ==
+                 beginsAfterReplacement &&
+             handler->performedEditCount == performsAfterReplacement &&
+             handler->stepCount(TestComponentHandler::EditStep::end) ==
+                 endsAfterReplacement,
+         "setState closes the old touch once and the crossed edit neither "
+         "reopens nor reports into the replacement generation");
+
+  expect(processor->setComponentHandler(nullptr) == kResultOk,
+         "remove the stale replacement-update handler");
+  handler->release();
+  expect(processor->terminate() == kResultOk,
+         "terminate the stale replacement-update test");
+}
+
 // A host can write a parameter through IEditController::setParamNormalized and
 // through nothing else: a generic-editor field, an automation lane scrubbed
 // with the transport stopped, a preset applied from the host's own parameter
@@ -8146,6 +9908,100 @@ void testSetParamNormalizedAloneReachesTheSavedState() {
          "terminate the setParamNormalized persistence test");
 }
 
+// A stopped host can update a bound node-enable parameter through
+// IEditController alone. The registry must not adopt that value before the
+// active topology has been told about it, or the later drain sees no toggle and
+// leaves the old engine descriptor playing.
+void testStoppedControllerNodeEnableWritesReachTheActiveTopology() {
+  auto processor = std::make_unique<EffeTuneProcessor>();
+  expect(processor->initialize(nullptr) == kResultOk,
+         "initialize the stopped controller node-enable test");
+  auto processSetup = setup(48000.0, 64);
+  expect(processor->setupProcessing(processSetup) == kResultOk,
+         "prepare the stopped controller node-enable test");
+  const auto installedB = choc::json::parse(processor->handleUiMessage(
+      R"({"type":"pipeline/rebuild","payload":{"pipeline":"B","plugins":[)"
+      R"({"id":95,"type":"DCOffsetPlugin","name":"Idle DC Offset","enabled":true,)"
+      R"("parameters":{"of":0.5},"wasmParams":[0.5],)"
+      R"("wasmParamsHash":1104945464}]}})"));
+  const auto installedA = choc::json::parse(processor->handleUiMessage(
+      R"({"type":"pipeline/rebuild","payload":{"pipeline":"A","plugins":[)"
+      R"({"id":95,"type":"DCOffsetPlugin","name":"DC Offset","enabled":true,)"
+      R"("parameters":{"of":0.5},"wasmParams":[0.5],)"
+      R"("wasmParamsHash":1104945464}]}})"));
+  expect(installedB["ok"].getWithDefault<bool>(false) &&
+             installedA["ok"].getWithDefault<bool>(false),
+         "install active and inactive node-enable targets");
+  const auto activeEnableId = boundAutomationParameterId(
+      *processor, {'A', 95, "DCOffsetPlugin", "__enabled", 0});
+  const auto idleEnableId = boundAutomationParameterId(
+      *processor, {'B', 95, "DCOffsetPlugin", "__enabled", 0});
+  expect(processor->setActive(true) == kResultOk,
+         "activate the stopped controller node-enable test");
+
+  gate_ordering::AudioRig rig(0.0f);
+  const auto render = [&](const float expected, const std::string &message) {
+    expect(processor->process(rig.data) == kResultOk, "render " + message);
+    for (const auto sample : rig.outputLeft) {
+      expect(std::abs(sample - expected) < 1.0e-6f, message);
+    }
+  };
+  render(0.5f, "the initial active node offsets silence");
+
+  expect(processor->setActive(false) == kResultOk,
+         "deactivate before the controller-only enable writes");
+  const auto beforeIdleWrite =
+      PluginProcessorTestAccess::descriptorGeneration(*processor);
+  expect(processor->setParamNormalized(idleEnableId, 0.0) == kResultTrue,
+         "disable the node on the inactive pipeline through the controller");
+  expect(PluginProcessorTestAccess::descriptorGeneration(*processor) ==
+             beforeIdleWrite,
+         "an inactive-pipeline enable write does not queue the active descriptor");
+
+  const auto disableGeneration =
+      PluginProcessorTestAccess::descriptorGeneration(*processor);
+  expect(processor->setParamNormalized(activeEnableId, 0.0) == kResultTrue,
+         "disable the active node through the stopped controller");
+  const auto disabledDescriptor =
+      PluginProcessorTestAccess::descriptorGeneration(*processor);
+  expect(disabledDescriptor == disableGeneration + 1u,
+         "the stopped disable queues exactly one active descriptor");
+  expect(processor->setActive(true) == kResultOk,
+         "reactivate after the stopped disable");
+  PluginProcessorTestAccess::serviceLatencyUpdates(*processor);
+  expect(PluginProcessorTestAccess::servicedDescriptorGeneration(*processor) ==
+             disabledDescriptor,
+         "service the stopped disable descriptor");
+  render(0.0f, "the stopped controller disable reaches the active engine");
+  expect(PluginProcessorTestAccess::descriptorGeneration(*processor) ==
+             disabledDescriptor,
+         "draining the adopted disable does not queue a second descriptor");
+
+  expect(processor->setActive(false) == kResultOk,
+         "deactivate before the stopped controller re-enable");
+  expect(processor->setParamNormalized(activeEnableId, 1.0) == kResultTrue,
+         "re-enable the active node through the stopped controller");
+  const auto enabledDescriptor =
+      PluginProcessorTestAccess::descriptorGeneration(*processor);
+  expect(enabledDescriptor == disabledDescriptor + 1u,
+         "the stopped re-enable queues exactly one active descriptor");
+  expect(processor->setActive(true) == kResultOk,
+         "reactivate after the stopped re-enable");
+  PluginProcessorTestAccess::serviceLatencyUpdates(*processor);
+  expect(PluginProcessorTestAccess::servicedDescriptorGeneration(*processor) ==
+             enabledDescriptor,
+         "service the stopped re-enable descriptor");
+  render(0.5f, "the stopped controller re-enable reaches the active engine");
+  expect(PluginProcessorTestAccess::descriptorGeneration(*processor) ==
+             enabledDescriptor,
+         "draining the adopted re-enable does not queue a second descriptor");
+
+  expect(processor->setActive(false) == kResultOk,
+         "deactivate the stopped controller node-enable test");
+  expect(processor->terminate() == kResultOk,
+         "terminate the stopped controller node-enable test");
+}
+
 // Master bypass uses the same stopped controller-write fallback as a bound
 // slot, while an unbound slot remains only one of the placeholders the bank
 // publishes to keep its parameter count stable. Claiming a lane for a
@@ -8359,6 +10215,11 @@ void testAutomationTraceFollowsItsEnvironmentVariable() {
   expect(trace::enabled(),
          "a path in EFFETUNE_AUTOMATION_TRACE turns the trace on");
   runOneDrag("the traced drag");
+  // Reuse the real topology and latency fixtures, whose audio/state assertions
+  // also run with tracing off earlier in this suite. Recording may not alter
+  // either path, and synthetic emitter calls would not verify the call sites.
+  testNodeEnableAutomationDrivesTopologyNotPackedParameters();
+  testDeferredLatencyPlanRefreshAlignsParallelAndBypassPaths();
   trace::flush();
   setVariable("EFFETUNE_AUTOMATION_TRACE", "");
   trace::reinstallFromEnvironmentForTesting();
@@ -8369,6 +10230,9 @@ void testAutomationTraceFollowsItsEnvironmentVariable() {
   std::filesystem::remove(tracePath, fileError);
   expect(log.rfind("# EffeTune Mixwright automation trace", 0) == 0,
          "the log opens by naming the build the records came from");
+  expect(log.find("# trace-schema=3 latency-and-descriptor-transitions") !=
+             std::string::npos,
+         "the trace identifies the latency/descriptor schema");
   std::size_t position = 0;
   const auto expectNext = [&](const std::string &token) {
     const auto found = log.find(token, position);
@@ -8387,6 +10251,21 @@ void testAutomationTraceFollowsItsEnvironmentVariable() {
   expectNext("dspValue");
   expectNext("endEdit");
   expectNext("touchClosed");
+
+  for (const auto *event : {"latencyPrepared", "latencySynced", "getLatencySamples",
+                            "descriptorQueued", "descriptorNode", "descriptorApplied",
+                            "setActive"}) {
+    expect(log.find(event) != std::string::npos,
+           std::string{"the real processor path records "} + event);
+  }
+  expect(log.find("pluginId=77 enabled=0") != std::string::npos &&
+             log.find("pluginId=77 enabled=1") != std::string::npos,
+         "the queued topology trace distinguishes OFF from ON for the same node");
+  expect(log.find("previous=144 reported=480 pipeline=480 resampler=0 factor=1") !=
+             std::string::npos,
+         "the latency trace preserves the old/new report and its engine components");
+  expect(log.find("# dropped") == std::string::npos,
+         "the diagnostic fixtures retain a complete transition sequence");
 
   setVariable("EFFETUNE_AUTOMATION_TRACE", tracePath.string());
   setVariable("EFFETUNE_AUTOMATION_TRACE_PARAM",
@@ -8421,12 +10300,18 @@ int main() {
     testHostGateFixturePublishesThreeParameters();
 #endif
     testProcessingSurvivesHostReconfiguration();
+    testContextualExecutionAdmissionSurvivesEngineContextChanges();
+    testConcurrentHostContextChangeWinsPluginUpdateAdmission();
+    testOversamplingFailureRestoresPreviousPlayableGeneration();
     testStoppedTransportFallbackAndDiscontinuities();
+    testAutomationCatalogProjectionIsOneControlTransaction();
     testClosedEditorHostAutomationUpdatesStateAndAudio();
     testBoundTargetGestureReachesAudioWithoutHostEcho();
     testNamedBulkAutomationEditsReachAudioAndUnnamedOnesStayOverlaid();
     testProcessorPublishesAutomationStateInterface();
     testNodeEnableAutomationDrivesTopologyNotPackedParameters();
+    testBoundNodeEnableEditsDoNotInvalidateHostParameters();
+    testStateRestoreCancelsAnInFlightNodeEnableDescriptor();
     testAutomationWriteGateControlsOnDemandBinding();
     testBundledGesturesReachTheHostInCollectedOrder();
     testBundledGestureBindsOnDemandUnderTheWriteGate();
@@ -8450,6 +10335,7 @@ int main() {
     testPendingTopologyKeepsProcessedAudio();
     testPendingPlanConsumesNewUiGenerationAndTopologyRemoval();
     testNativeControlServiceHandlesAssetReadyAndClear();
+    testGroupDelayAssetPublishesCurrentUiLatency();
     testHeldControlGuardKeepsProcessedTimelineWithLatency();
     testUiPacedControlServiceKeepsEveryBlockWet();
     testOwnedRuntimeImageKeepsItsDirtyFlagsThroughAFailedBlock();
@@ -8463,6 +10349,7 @@ int main() {
     testFailedDescriptorBackoffClaimsNothing();
     testFlushOnlyBlocksLetTheControlServiceReachTheDsp();
     testFailedPluginRebuildKeepsProcessing();
+    testFailedBulkRebuildsPreserveTheWholePlayableGeneration();
     testGateClosesInsideTheControlLock();
     testTopologyEditsDuringPlaybackRaiseNoDiagnostic();
     testPendingWorkIsServicedWhenTheAudioCallbackQuiesces();
@@ -8489,6 +10376,7 @@ int main() {
     testNoLeakedTouch();
     testStateRestoreEndsAnOpenTouch();
     testStateRestoreClosesATouchReopenedBeforeTheReload();
+    testClickActivatedControlOpensItsTouchBeforeItsValue();
     testRepeatedBeginKeepsOneTouchAndReopensAfterANativeClose();
     testSlotRetirementEndsTheTouchOutsideTheResourceLock();
     testRefusedMasterBypassStillBypassesTheDsp();
@@ -8496,7 +10384,12 @@ int main() {
     testLinkedMultiParameterBatchIsOneHostGroupEdit();
     testBoundSlotsRenderDenormalizedDisplayStrings();
     testDisplayStringsCarryTheStepsOwnDecimalCount();
+    testInvalidStatePipelineNeverReplacesTheAuthority();
+    testStructuredParameterShapeChangeRebuildsTheRuntime();
+    testStaleBulkRequestsCannotCrossStateReplacement();
+    testStalePluginUpdateCannotOverwritePendingStateReplacement();
     testSetParamNormalizedAloneReachesTheSavedState();
+    testStoppedControllerNodeEnableWritesReachTheActiveTopology();
     testSetParamNormalizedLeavesBypassAndUnboundSlotsAlone();
     testAutomationTraceFollowsItsEnvironmentVariable();
     std::cout << "EffeTune VST processing lifecycle tests passed\n";

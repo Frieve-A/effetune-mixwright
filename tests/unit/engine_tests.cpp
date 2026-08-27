@@ -373,6 +373,16 @@ void testStateCodec() {
              reencoded.find("futureTopLevel") != std::string::npos,
          "unknown top-level and plugin fields preservation");
 
+  constexpr auto transientCapabilities = R"({"plugins":[{"name":"Volume","parameters":{"gain":0.5},"executionCapabilities":{"requiresWasm":true},"futurePluginField":{"v":2}}]})";
+  expect(StateCodec::decode(transientCapabilities, decoded, &error),
+         "state with transient execution capabilities");
+  const auto transientReencoded = choc::json::parse(StateCodec::encode(decoded));
+  const auto transientPlugin = transientReencoded["pipelineA"][0];
+  expect(transientPlugin["executionCapabilities"].isVoid() &&
+             transientPlugin["futurePluginField"]["v"].getWithDefault<std::int64_t>(0) == 2 &&
+             transientPlugin["parameters"]["gain"].getWithDefault<double>(0.0) == 0.5,
+         "state drops transient execution capabilities while preserving unknown fields");
+
   constexpr auto shortForm = R"({"plugins":[{"nm":"Volume","en":true,"vl":-3,"ch":"Left"}]})";
   expect(StateCodec::decode(shortForm, decoded, &error), "short-form state");
   expect(decoded.pipelineA.plugins[0].name == "Volume" &&
@@ -386,6 +396,42 @@ void testStateCodec() {
              decoded.pipelineA.plugins[0].name == "Delay" &&
              !decoded.pipelineA.plugins[0].enabled,
          "legacy array normalization");
+
+  constexpr auto legacyPipelines =
+      R"({"pipelineA":[{"name":"Legacy A"}],"pipelineB":[{"name":"Legacy B"}]})";
+  expect(StateCodec::decode(legacyPipelines, decoded, &error) &&
+             decoded.pipelineA.plugins[0].id == 1u &&
+             decoded.pipelineB.plugins[0].id == 2u,
+         "legacy A/B entries receive globally unique generated IDs");
+
+  const auto stateBeforeInvalidPipeline = StateCodec::encode(decoded);
+  constexpr auto duplicateIds =
+      R"({"pipelineA":[{"id":7,"name":"Known","future":{"v":1}},{"id":7,"name":"Future","unknown":true,"future":{"v":2}}]})";
+  expect(!StateCodec::decode(duplicateIds, decoded, &error) &&
+             error == "State pipeline plugin IDs must be unique" &&
+             StateCodec::encode(decoded) == stateBeforeInvalidPipeline,
+         "state rejects duplicate positive IDs before replacing the decoded authority");
+
+  constexpr auto duplicateIdsAcrossPipelines =
+      R"({"pipelineA":[{"id":7,"name":"Known"}],"pipelineB":[{"id":7,"name":"Future","unknown":true}]})";
+  expect(!StateCodec::decode(duplicateIdsAcrossPipelines, decoded, &error) &&
+             error == "State pipeline plugin IDs must be unique" &&
+             StateCodec::encode(decoded) == stateBeforeInvalidPipeline,
+         "state rejects IDs duplicated across A and B before replacing the decoded authority");
+
+  std::string excessivePipeline{R"({"pipelineA":[)"};
+  for (std::uint32_t id = 1; id <= kMaxPipelineNodes + 1u; ++id) {
+    if (id != 1u) {
+      excessivePipeline += ',';
+    }
+    excessivePipeline += R"({"id":)" + std::to_string(id) +
+                         R"(,"name":"Future","unknown":true})";
+  }
+  excessivePipeline += "]}";
+  expect(!StateCodec::decode(excessivePipeline, decoded, &error) &&
+             error == "State pipeline exceeds the node limit" &&
+             StateCodec::encode(decoded) == stateBeforeInvalidPipeline,
+         "state rejects 129 nodes before replacing the decoded authority");
 
   constexpr auto futureVersion = R"({"formatVersion":2,"pipelineA":[]})";
   expect(!StateCodec::decode(futureVersion, decoded, &error),
@@ -539,6 +585,33 @@ void testMessageRouter() {
   expect(plugin.logical.extraJson.find("TestGainPlugin") != std::string::npos,
          "bridge runtime type preservation");
 
+  expect(MessageRouter::decode(
+             R"({"type":"pipeline/rebuild","payload":{"pipeline":"A","plugins":[{"id":9,"type":"TestGainPlugin","name":"Constrained here","parameters":{"gain":0.75},"wasmParams":[0.75],"wasmParamsHash":123,"executionCapabilities":{"requiresWasm":true,"supportedSampleRates":[48000,96000],"supportedChannelModes":["mono","stereo-pair"]},"futurePayload":{"v":2}}]}})",
+             message, &error) && message.plugins.size() == 1 &&
+             message.plugins[0].runtime.type == "TestGainPlugin" &&
+             message.plugins[0].runtime.packedParameters == std::vector<float>{0.75f} &&
+             message.plugins[0].runtime.executionCapabilities.constrainsSampleRate &&
+             message.plugins[0].runtime.executionCapabilities.supportedSampleRateCount == 2u &&
+             message.plugins[0].runtime.executionCapabilities.constrainsChannelMode &&
+             message.plugins[0].logical.extraJson.find("futurePayload") != std::string::npos &&
+             message.plugins[0].logical.extraJson.find("executionCapabilities") ==
+                 std::string::npos,
+         "bridge keeps bounded execution capabilities with the dormant runtime image");
+  const auto &capabilities = message.plugins[0].runtime.executionCapabilities;
+  expect(supportsExecutionContext(capabilities, std::nullopt, 48000.0, 2u) &&
+             !supportsExecutionContext(capabilities, std::nullopt, 384000.0, 2u) &&
+             !supportsExecutionContext(capabilities, std::optional<std::string>{"A"},
+                                       48000.0, 2u) &&
+             !supportsExecutionContext(capabilities, std::optional<std::string>{"78"},
+                                       48000.0, 2u) &&
+             supportsExecutionContext(capabilities, std::optional<std::string>{"78"},
+                                      48000.0, 8u),
+         "native admission matches upstream sample-rate and channel-mode routing");
+  expect(!MessageRouter::decode(
+             R"({"type":"pipeline/rebuild","payload":{"plugins":[{"id":9,"type":"TestGainPlugin","wasmParams":[0.75],"wasmParamsHash":123,"executionCapabilities":{"supportedChannelModes":["future-mode"]}}]}})",
+             message, &error),
+         "bridge rejects execution modes outside the shared vocabulary");
+
   expect(!MessageRouter::decode(
              R"({"type":"pipeline/rebuild","payload":{"plugins":[{"id":7,"type":"SectionPlugin"},{"id":7,"type":"TestGainPlugin","wasmParams":[1],"wasmParamsHash":1}]}})",
              message, &error) &&
@@ -562,6 +635,11 @@ void testMessageRouter() {
              message.pipelineB[0].logical.id == 44 &&
              message.pipelineB[0].runtime.packedParameters == std::vector<float>{2.0f},
          "history restore carries an edited inactive pipeline in the same request");
+  expect(!MessageRouter::decode(
+             R"({"type":"pipeline/restoreHistory","payload":{"pipelineA":[{"id":44,"type":"TestGainPlugin"}],"pipelineB":[{"id":44,"type":"FuturePlugin"}],"pipelineBInitialized":true,"currentPipeline":"A"}})",
+             message, &error) &&
+             error == "Pipeline plugin IDs must be unique",
+         "history restore rejects IDs duplicated across A and B");
   expect(MessageRouter::decode(
              R"({"type":"automation/edit","payload":{"pipeline":"B","pluginId":44,"pluginType":"TestGainPlugin","parameterKey":"gain","elementIndex":2,"normalized":0.75}})",
              message, &error) && message.action == UiAction::editAutomationParameter &&
@@ -835,6 +913,176 @@ void testEngineHost() {
          "direct descriptor update remains available off the audio path");
 }
 
+void testContextualBypassPreservesCrossBusRouting() {
+  EngineHost engine;
+  std::string error;
+  expect(engine.prepare(48000.0, 2, EngineHost::kDefaultTelemetryBytes, &error),
+         "contextual bypass engine prepare: " + error);
+  const auto kernel = engine.kernels().find("TestGainPlugin");
+  expect(kernel != engine.kernels().end(), "contextual bypass test-gain kernel");
+
+  PipelineState pipeline;
+  PluginState send;
+  send.id = 81;
+  send.name = "Constrained send";
+  send.inputBus = 0;
+  send.outputBus = 1;
+  send.channel = "L";
+  PluginState returning;
+  returning.id = 82;
+  returning.name = "Return gain";
+  returning.inputBus = 1;
+  returning.outputBus = 0;
+  returning.channel = "L";
+  pipeline.plugins = {send, returning};
+
+  RuntimePlugin constrained;
+  constrained.logicalId = 81;
+  constrained.type = "TestGainPlugin";
+  constrained.packedParameters = {0.5f};
+  constrained.paramsHash = kernel->second.paramsHash;
+  RuntimePlugin returnGain;
+  returnGain.logicalId = 82;
+  returnGain.type = "TestGainPlugin";
+  returnGain.packedParameters = {0.5f};
+  returnGain.paramsHash = kernel->second.paramsHash;
+  std::vector runtimes{constrained, returnGain};
+
+  std::array<float, EngineHost::kMaxProcessFrames> left{};
+  std::array<float, EngineHost::kMaxProcessFrames> right{};
+  float *channels[] = {left.data(), right.data()};
+  const auto render = [&] {
+    left.fill(1.0f);
+    right.fill(-1.0f);
+    expect(engine.tryProcessBlock(channels, 2, EngineHost::kMaxProcessFrames,
+                                  0.0, false),
+           "contextual cross-bus process");
+  };
+
+  expect(engine.rebuild(pipeline, runtimes, &error),
+         "admitted cross-bus rebuild: " + error);
+  render();
+  expect(std::abs(left[0] - 1.25f) < 1.0e-7f && right[0] == -1.0f,
+         "admitted node uses the selected left-channel cross-bus route");
+
+  runtimes[0].contextuallyBypassed = true;
+  expect(engine.rebuild(pipeline, runtimes, &error),
+         "contextually bypassed cross-bus rebuild: " + error);
+  constexpr std::array bypassedParameterUpdate{0.0f};
+  expect(engine.pipelineLatency() == 0u &&
+             engine.updateParameters(81, bypassedParameterUpdate,
+                                     constrained.paramsHash),
+         "synthetic bypass is zero latency and accepts original-hash parameters as a no-op");
+  EngineHost::ProcessBatch batch;
+  EngineHost::ResolvedParameterTarget target;
+  left.fill(1.0f);
+  right.fill(-1.0f);
+  expect(engine.beginProcessBatch(batch) &&
+             batch.resolveParameterTarget(81, constrained.paramsHash, target) &&
+             target.contextuallyBypassed &&
+             batch.stageParameters(target, bypassedParameterUpdate) &&
+             batch.processChunk(channels, 2, EngineHost::kMaxProcessFrames,
+                                0.0, false) &&
+             batch.finish(),
+         "audio-batch automation treats the dormant original image as a successful no-op");
+  expect(std::abs(left[0] - 1.5f) < 1.0e-7f && right[0] == -1.0f,
+         "contextual bypass preserves bus send, unity gain, and channel selection");
+
+  runtimes[0].contextuallyBypassed = false;
+  expect(engine.rebuild(pipeline, runtimes, &error),
+         "re-admitted cross-bus rebuild: " + error);
+  render();
+  expect(std::abs(left[0] - 1.25f) < 1.0e-7f && right[0] == -1.0f,
+         "re-admission restores the dormant original runtime image");
+
+  {
+    EngineHost monoEngine;
+    expect(monoEngine.prepare(48000.0, 1, EngineHost::kDefaultTelemetryBytes,
+                              &error),
+           "mono channel-context engine prepare: " + error);
+    const auto monoKernel = monoEngine.kernels().find("TestGainPlugin");
+    expect(monoKernel != monoEngine.kernels().end(),
+           "mono channel-context test-gain kernel");
+    PipelineState monoPipeline;
+    PluginState monoSend;
+    monoSend.id = 83;
+    monoSend.name = "Mono send";
+    monoSend.outputBus = 1;
+    PluginState monoReturn;
+    monoReturn.id = 84;
+    monoReturn.name = "Mono return";
+    monoReturn.inputBus = 1;
+    monoPipeline.plugins = {monoSend, monoReturn};
+    RuntimePlugin monoSendRuntime;
+    monoSendRuntime.logicalId = 83;
+    monoSendRuntime.type = "TestGainPlugin";
+    monoSendRuntime.packedParameters = {0.5f};
+    monoSendRuntime.paramsHash = monoKernel->second.paramsHash;
+    RuntimePlugin monoReturnRuntime = monoSendRuntime;
+    monoReturnRuntime.logicalId = 84;
+    std::array<float, EngineHost::kMaxProcessFrames> mono{};
+    mono.fill(1.0f);
+    float *monoChannels[] = {mono.data()};
+    expect(monoEngine.rebuild(
+               monoPipeline, {monoSendRuntime, monoReturnRuntime}, &error) &&
+               monoEngine.tryProcessBlock(monoChannels, 1,
+                                          EngineHost::kMaxProcessFrames,
+                                          0.0, false),
+           "mono null-selection cross-bus process: " + error);
+    expect(std::abs(mono[0] - 1.25f) < 1.0e-7f,
+           "mono null selection processes channel zero instead of skipping a stereo pair");
+  }
+
+  {
+    EngineHost partialPairEngine;
+    expect(partialPairEngine.prepare(
+               48000.0, 3, EngineHost::kDefaultTelemetryBytes, &error),
+           "partial-pair channel-context engine prepare: " + error);
+    const auto partialKernel =
+        partialPairEngine.kernels().find("TestGainPlugin");
+    expect(partialKernel != partialPairEngine.kernels().end(),
+           "partial-pair channel-context test-gain kernel");
+    PipelineState partialPipeline;
+    PluginState partialSend;
+    partialSend.id = 85;
+    partialSend.name = "Partial-pair send";
+    partialSend.outputBus = 1;
+    partialSend.channel = "34";
+    PluginState partialReturn;
+    partialReturn.id = 86;
+    partialReturn.name = "Partial-pair return";
+    partialReturn.inputBus = 1;
+    partialReturn.channel = "3";
+    partialPipeline.plugins = {partialSend, partialReturn};
+    RuntimePlugin partialSendRuntime;
+    partialSendRuntime.logicalId = 85;
+    partialSendRuntime.type = "TestGainPlugin";
+    partialSendRuntime.packedParameters = {0.5f};
+    partialSendRuntime.paramsHash = partialKernel->second.paramsHash;
+    partialSendRuntime.contextuallyBypassed = true;
+    RuntimePlugin partialReturnRuntime = partialSendRuntime;
+    partialReturnRuntime.logicalId = 86;
+    partialReturnRuntime.contextuallyBypassed = false;
+    std::array<float, EngineHost::kMaxProcessFrames> first{};
+    std::array<float, EngineHost::kMaxProcessFrames> second{};
+    std::array<float, EngineHost::kMaxProcessFrames> third{};
+    first.fill(10.0f);
+    second.fill(-10.0f);
+    third.fill(1.0f);
+    float *partialChannels[] = {first.data(), second.data(), third.data()};
+    expect(partialPairEngine.rebuild(
+               partialPipeline, {partialSendRuntime, partialReturnRuntime},
+               &error) &&
+               partialPairEngine.tryProcessBlock(
+                   partialChannels, 3, EngineHost::kMaxProcessFrames, 0.0,
+                   false),
+           "contextual partial-pair cross-bus process: " + error);
+    expect(first[0] == 10.0f && second[0] == -10.0f &&
+               std::abs(third[0] - 1.5f) < 1.0e-7f,
+           "contextual bypass narrows channel 34 to the available third channel");
+  }
+}
+
 void testEngineAssetTransferAndReplay() {
   EngineHost engine;
   std::string error;
@@ -880,9 +1128,13 @@ void testEngineAssetTransferAndReplay() {
   std::memcpy(asset.payload.data() + 32u, &impulse, sizeof(impulse));
   asset.footprintBytes = 4u * 1024u * 1024u;
 
+  const auto planRevisionBeforeAsset = engine.pipelinePlanRevision();
   expect(engine.setAsset(asset, &error), "IR reverb asset staging: " + error);
   expect((engine.assetState(91, 0) & 0xffu) == ET_ASSET_STATE_PREPARING,
          "IR reverb asset enters preparing state");
+  expect(engine.pipelineLatency() == 128u &&
+             engine.pipelinePlanRevision() > planRevisionBeforeAsset,
+         "asset commit publishes its latency before another audio block is rendered");
 
   std::array<float, EngineHost::kMaxProcessFrames> left{};
   std::array<float, EngineHost::kMaxProcessFrames> right{};
@@ -902,8 +1154,8 @@ void testEngineAssetTransferAndReplay() {
   const auto stagedPlanRevision = engine.pipelinePlanRevision();
   prepareAsset(engine, channels, "IR reverb asset becomes active");
   expect(engine.pipelineLatency() == 128u &&
-             engine.pipelinePlanRevision() > stagedPlanRevision,
-         "active IR reverb publishes latency and requests compensation refresh");
+             engine.pipelinePlanRevision() == stagedPlanRevision,
+         "asset readiness preserves the latency already published at commit");
   const auto activeAssetRefreshes = engine.processCounters().latencyRefreshes;
   for (std::uint32_t quantum = 0; quantum < 4u; ++quantum) {
     expect(engine.tryProcessBlock(channels, 2, EngineHost::kMaxProcessFrames,
@@ -915,6 +1167,17 @@ void testEngineAssetTransferAndReplay() {
   expect(engine.setAsset(asset, &error), "identical IR reverb asset replay: " + error);
   expect((engine.assetState(91, 0) & 0xffu) == ET_ASSET_STATE_ACTIVE,
          "identical IR reverb asset replay preserves the active convolution");
+
+  runtime.contextuallyBypassed = true;
+  expect(engine.rebuild(pipeline, {runtime}, &error) &&
+             (engine.assetState(91, 0) & 0xffu) == ET_ASSET_STATE_NONE &&
+             engine.pipelineLatency() == 0u && engine.setAsset(asset, &error),
+         "contextual bypass keeps the original asset cached without addressing unity DSP");
+  runtime.contextuallyBypassed = false;
+  expect(engine.rebuild(pipeline, {runtime}, &error) &&
+             (engine.assetState(91, 0) & 0xffu) == ET_ASSET_STATE_PREPARING,
+         "re-admission stages the cached asset on the restored original runtime");
+  prepareAsset(engine, channels, "re-admitted IR reverb asset becomes active");
 
   engine.reset();
   float wetPeak = 0.0f;
@@ -1139,6 +1402,7 @@ int main() {
     testMessageRouter();
     testResampler();
     testEngineHost();
+    testContextualBypassPreservesCrossBusRouting();
     testEngineAssetTransferAndReplay();
     testRuntimeLatencyAndTelemetryPublication();
     testMasterBypassLatencyAlignment();

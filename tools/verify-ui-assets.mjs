@@ -35,6 +35,10 @@ const pluginList = await readFile(path.join(assets, 'plugins', 'plugins.txt'), '
 const vinylSimulator = await readFile(
   path.join(assets, 'plugins', 'lofi', 'vinyl_simulator.js'), 'utf8');
 const pluginBase = await readFile(path.join(assets, 'plugins', 'plugin-base.js'), 'utf8');
+const fifteenBandGeq = await readFile(
+  path.join(assets, 'plugins', 'eq', 'fifteen_band_geq.js'), 'utf8');
+const narrowRange = await readFile(path.join(assets, 'plugins', 'eq', 'narrow_range.js'), 'utf8');
+const tiltEq = await readFile(path.join(assets, 'plugins', 'eq', 'tilt_eq.js'), 'utf8');
 const dspParams = await readFile(
   path.join(assets, 'js', 'audio', 'dsp-params.generated.js'), 'utf8');
 const dspMetadata = await readFile(
@@ -92,6 +96,8 @@ const forbiddenHtml = [
   'googletagmanager.com',
   'google-analytics.com',
   'doubleBlindTestButton',
+  'pipelineAnalyzerButton',
+  'pipelineAnalyzerPanel',
   'jszip-3.10.1.min.js',
   'jsmediatags-3.9.5.min.js'
 ];
@@ -128,6 +134,15 @@ if (html.indexOf('vst-bootstrap.js') > html.indexOf('js/app.js')) {
 }
 if (!bootstrap.includes('html { background-color: #1e1e1e; }')) {
   throw new Error('The VST document background does not match the dark UI');
+}
+if (!bootstrap.includes('const needsHomeKeyForEditing = target => {') ||
+    !bootstrap.includes("tagName === 'input'") ||
+    !bootstrap.includes("tagName === 'textarea'") ||
+    !bootstrap.includes("tagName === 'select'") ||
+    !bootstrap.includes('target?.isContentEditable === true') ||
+    !bootstrap.includes("event.key !== 'Home' || needsHomeKeyForEditing(event.target)") ||
+    !bootstrap.includes('event.stopImmediatePropagation();')) {
+  throw new Error('The VST WebView does not reserve Home outside editable controls');
 }
 if (!app.includes("../vst-audio-manager.js")) {
   throw new Error('The application module was not redirected to the VST audio adapter');
@@ -176,6 +191,16 @@ if (!app.includes('async applyStartupViewPreference() {}') ||
     uiManager.includes('createWebCatalogRecoveryController')) {
   throw new Error('Music-library startup and keyboard alternate entries remain reachable');
 }
+if (uiManager.includes('new PipelineAnalyzerController({') ||
+    uiManager.includes('this.pipelineAnalyzerController.initialize();') ||
+    uiManager.includes('this.initPipelineAnalyzerMenuIntegration();') ||
+    uiManager.includes("from './pipeline-analyzer/")) {
+  throw new Error('Pipeline Analyzer remains active in the VST WebView');
+}
+if (!uiManager.includes(
+      'this.audioManager?.pipelineCpuAveragePercent ?? this.pipelineCpuAveragePercent')) {
+  throw new Error('Localized UI startup does not read the current native CPU average');
+}
 if (!pluginList.includes(
       'lofi/vinyl_simulator: Vinyl Simulator | Lo-Fi | VinylSimulatorPlugin | css') ||
     !vinylSimulator.includes('class VinylSimulatorPlugin extends PluginBase') ||
@@ -198,7 +223,10 @@ if (!bootstrap.includes('const maximumMeasurementImportBytes = 128 * 1024 * 1024
     !bootstrap.includes('measurement?.imported !== true') ||
     !bootstrap.includes('confirmImportedMeasurementDeletion(measurement)') ||
     !bootstrap.includes('clearDeletedMeasurementReferences(measurementId)') ||
-    !bootstrap.includes("ms: ''") ||
+    !bootstrap.includes("parameters.ms = ''") ||
+    !bootstrap.includes('plugin.channelMeasurementIds?.[index] !== measurementId') ||
+    !bootstrap.includes("parameters[`ms${index}`] = ''") ||
+    !bootstrap.includes("parameters[`mn${index}`] = ''") ||
     !bootstrap.includes('targetPlugin.setParameters({') ||
     !bootstrap.includes('window.__effetuneMeasurementImport = {') ||
     !measurementStorage.includes('async importMeasurementFromJSON(jsonString)') ||
@@ -326,7 +354,22 @@ if (hiddenHostInfo < 0 || hiddenSkip < hiddenHostInfo ||
 if (!/window\.app\?\.initialized === true &&\s*result\.contextGeneration/.test(audioAdapter)) {
   throw new Error('Native context synchronization can clear the pipeline before startup restore');
 }
-if (!audioAdapter.includes('this.preserveReadyNativePipelineDuringStartup = info.dspReady === true;') ||
+if (!audioAdapter.includes('this.applyNativePerformanceStatus(result);') ||
+    !audioAdapter.includes('this.applyNativePerformanceStatus(info, false);') ||
+    !audioAdapter.includes('info?.processingLatencySamples') ||
+    !audioAdapter.includes('info?.latencyCompensated !== false') ||
+    !audioAdapter.includes("this.dispatchEvent('dspLatency', {") ||
+    !audioAdapter.includes("this.dispatchEvent('pipelineCpuUsage', { average: cpuAverage });") ||
+    !/scheduleLatencyService\(\) \{[\s\S]*?host\/getInfo[\s\S]*?applyNativePerformanceStatus\(info\)/.test(audioAdapter)) {
+  throw new Error('Native latency and CPU status are not connected to the upstream UI');
+}
+if (!audioAdapter.includes('outputChannelCount: exposeAudioOutputChannelCount(owner)') ||
+    !audioAdapter.includes('getPluginParameterOptions(this.owner, true)') ||
+    !audioAdapter.includes('const parameterOptions = getPluginParameterOptions(this, true);') ||
+    !audioAdapter.includes('exposeAudioOutputChannelCount(this);')) {
+  throw new Error('The native output width is not propagated to plug-in parameter images');
+}
+if (!audioAdapter.includes('info.dspReady === true && info.stateReplacementPending !== true;') ||
     !/if \(this\.preserveReadyNativePipelineDuringStartup && window\.app\?\.initialized !== true\) \{[\s\S]*?this\.synchronizeNativeAssetMembership\(\);[\s\S]*?return '';/.test(audioAdapter)) {
   throw new Error('A recreated UI can rebuild an already-running native DSP pipeline');
 }
@@ -517,9 +560,19 @@ if (beginPointerGestureBody === '' || closeGestureBody === '' ||
     !closeGestureBody.includes('this.livePointerIds.clear();')) {
   throw new Error('A pointer release the page never receives poisons every later touch');
 }
-if (!/endPointerGesture = event => \{[\s\S]{0,400}?if \(event\?\.type === 'pointerup' && \(event\.buttons \?\? 0\) !== 0\) return;[\s\S]{0,200}?livePointerIds\.delete\([\s\S]{0,200}?if \(this\.livePointerIds\.size === 0\) this\.closePointerGesture\(\);/
-  .test(audioAdapter)) {
+if (!/endPointerGesture = event => \{[\s\S]{0,500}?if \(event\?\.type === 'pointerup' && \(event\.buttons \?\? 0\) !== 0\) return;[\s\S]{0,200}?livePointerIds\.delete\([\s\S]{0,200}?if \(this\.livePointerIds\.size !== 0\) return;/
+      .test(audioAdapter)) {
   throw new Error('An open touch does not survive a second pointer releasing inside it');
+}
+// A button's click runs after pointerup. The effect toggle must identify its
+// already-bound synthetic enable parameter on pointerdown, and the last
+// pointerup must defer the close through that click; otherwise its changed
+// value reaches the host only after the touch has already ended.
+if (!beginPointerGestureBody.includes('this.effectToggleAutomationTarget(event)') ||
+    !beginPointerGestureBody.includes("__effetuneHostCall('automation/beginGesture'") ||
+    !/pointerGestureCloseTimer = setTimeout\(\(\) => \{[\s\S]{0,180}?closePointerGesture\(\);/
+      .test(audioAdapter)) {
+  throw new Error('An effect toggle can publish its value outside its pointer touch');
 }
 // A state restore ends every open touch and then asks the editor to reload, but
 // the reload is a request the old context outlives: a drag still in progress
@@ -643,6 +696,21 @@ if (!/syncUIControls\(\) \{\s*if \(!this\._syncedUIControls\.length && !this\._u
 if ((pluginBase.match(/this\._uiRefreshHooks = \[\]/g) || []).length < 3 ||
     (pluginBase.match(/this\._graphPointerProbes(?: = new Set\(\)|\.clear\(\))/g) || []).length < 3) {
   throw new Error('The UI refresh registries are not reset on createUI() and cleanup()');
+}
+if (!fifteenBandGeq.includes(
+  'if (this.isHeldByUser(slider) || this.isHeldByUser(valueDisplay)) continue;')) {
+  throw new Error('Fifteen Band GEQ refresh does not preserve each slider/readout pair while held');
+}
+if (!narrowRange.includes('const hpfFrequencyHeld = [...hpfInputs].some(input => this.isHeldByUser(input));') ||
+    !narrowRange.includes('const lpfFrequencyHeld = [...lpfInputs].some(input => this.isHeldByUser(input));') ||
+    !narrowRange.includes('if (!hpfFrequencyHeld) {') ||
+    !narrowRange.includes('if (!lpfFrequencyHeld) {')) {
+  throw new Error('Narrow Range refresh does not preserve frequency pairs while held');
+}
+if (!tiltEq.includes('const pivotFrequencyHeld =') ||
+    !tiltEq.includes('this.isHeldByUser(pivotLogSlider) || this.isHeldByUser(pivotHzInput)') ||
+    !tiltEq.includes('if (!pivotFrequencyHeld) {')) {
+  throw new Error('Tilt EQ refresh does not preserve its pivot pair while held');
 }
 
 if (!uiManager.includes('this.refreshDynamicLocalizedUI();') ||
