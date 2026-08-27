@@ -414,7 +414,7 @@ struct MainThreadRequest {
 void runMainThreadRequest(void *context) {
   std::unique_ptr<std::shared_ptr<MainThreadRequest>> holder(
       static_cast<std::shared_ptr<MainThreadRequest> *>(context));
-  const auto request = **holder;
+  const auto request = *holder;
   if (!request->cancelled.load(std::memory_order_acquire)) {
     request->callback(request);
   }
