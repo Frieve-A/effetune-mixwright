@@ -49,6 +49,11 @@ add_executable(effetune_automation_parameter_bank_tests
   unit/automation_parameter_bank_tests.cpp
   ${PROJECT_SOURCE_DIR}/src/plugin/automation_parameters.cpp)
 target_link_libraries(effetune_automation_parameter_bank_tests PRIVATE sdk effetune_engine)
+if(APPLE)
+  # The SDK's string and UUID helpers use CoreFoundation on macOS.
+  target_link_libraries(effetune_automation_parameter_bank_tests PRIVATE
+    "-framework CoreFoundation")
+endif()
 target_include_directories(effetune_automation_parameter_bank_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/src)
 target_compile_features(effetune_automation_parameter_bank_tests PRIVATE cxx_std_20)
