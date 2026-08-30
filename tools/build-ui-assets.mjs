@@ -60,6 +60,13 @@ await cp(path.join(projectRoot, 'ui-shim', 'vst-audio-manager.js'),
 await mkdir(path.join(output, 'features', 'measurement'), { recursive: true });
 await cp(path.join(source, 'features', 'measurement', 'dataStorage.js'),
          path.join(output, 'features', 'measurement', 'dataStorage.js'));
+await cp(path.join(source, 'features', 'measurement', 'measurement-model.js'),
+         path.join(output, 'features', 'measurement', 'measurement-model.js'));
+await mkdir(path.join(output, 'features', 'measurement', 'audio-utils'), { recursive: true });
+for (const entry of ['channel-selection.js', 'output-routing.js']) {
+  await cp(path.join(source, 'features', 'measurement', 'audio-utils', entry),
+           path.join(output, 'features', 'measurement', 'audio-utils', entry));
+}
 await cp(path.join(projectRoot, 'THIRD-PARTY-NOTICES.txt'),
          path.join(output, 'THIRD-PARTY-NOTICES.txt'));
 
@@ -185,6 +192,74 @@ app = app.replace(publishInitialConfig, `${publishInitialConfig}
                 localStorage.setItem('pipelineColumns', String(config.columns));
             }`);
 await writeFile(appPath, app, 'utf8');
+
+const routingDialogPath = path.join(
+  output, 'js', 'ui', 'pipeline', 'pipeline-routing-dialog.js');
+let routingDialog = await readFile(routingDialogPath, 'utf8');
+const upstreamChannelOptions = `        // Define channel options - changed for multi-channel support
+        const channelOptions = [
+            { text: 'Stereo', value: '' },  // Default - process first 2 channels only (null)
+            { text: 'All', value: 'A' },    // All channels
+            { text: 'Left', value: 'L' },   // Left channel only
+            { text: 'Right', value: 'R' },  // Right channel only
+            { text: '3+4', value: '34' },   // Channels 3 & 4 as stereo pair
+            { text: '5+6', value: '56' },   // Channels 5 & 6 as stereo pair
+            { text: '7+8', value: '78' },   // Channels 7 & 8 as stereo pair
+            { text: '9+10', value: '910' },
+            { text: '11+12', value: '1112' },
+            { text: '13+14', value: '1314' },
+            { text: '15+16', value: '1516' }
+        ];
+
+        // Routing can be prepared before the output device is active.
+        for (let i = 3; i <= 16; i++) {
+            channelOptions.push({ text: \`Ch \${i}\`, value: String(i) });
+        }
+
+        channelOptions.forEach(option => {
+            const optionEl = document.createElement('option');
+            optionEl.value = option.value;
+            optionEl.textContent = option.text;
+            // Compare plugin.channel with option value
+            const currentChannelValue = plugin.channel === null ? '' : plugin.channel;
+            optionEl.selected = currentChannelValue === option.value;
+            channelSelect.appendChild(optionEl);
+        });`;
+if (routingDialog.split(upstreamChannelOptions).length - 1 !== 1) {
+  throw new Error('Unable to locate the upstream 16-channel routing options');
+}
+routingDialog = routingDialog.replace(upstreamChannelOptions, `        // The VST engine supports up to eight channels. Keep a restored wider
+        // route visible without offering it for a new selection.
+        const currentChannelValue = plugin.channel === null ? '' : plugin.channel;
+        const channelOptions = [
+            { text: 'Stereo', value: '' },
+            { text: 'All', value: 'A' },
+            { text: 'Left', value: 'L' },
+            { text: 'Right', value: 'R' },
+            { text: '3+4', value: '34' },
+            { text: '5+6', value: '56' },
+            { text: '7+8', value: '78' }
+        ];
+        for (let i = 3; i <= 8; i++) {
+            channelOptions.push({ text: \`Ch \${i}\`, value: String(i) });
+        }
+        if (!channelOptions.some(option => option.value === currentChannelValue)) {
+            channelOptions.push({
+                text: \`Unavailable in this plug-in (\${currentChannelValue})\`,
+                value: currentChannelValue,
+                disabled: true
+            });
+        }
+
+        channelOptions.forEach(option => {
+            const optionEl = document.createElement('option');
+            optionEl.value = option.value;
+            optionEl.textContent = option.text;
+            optionEl.disabled = option.disabled === true;
+            optionEl.selected = currentChannelValue === option.value;
+            channelSelect.appendChild(optionEl);
+        });`);
+await writeFile(routingDialogPath, routingDialog, 'utf8');
 
 const fifteenBandGeqPath = path.join(output, 'plugins', 'eq', 'fifteen_band_geq.js');
 let fifteenBandGeq = await readFile(fifteenBandGeqPath, 'utf8');

@@ -3,6 +3,7 @@
 #include <fstream>
 #include <iterator>
 #include <system_error>
+#include <utility>
 
 #if defined(_WIN32)
 #include <Windows.h>
@@ -14,16 +15,21 @@
 namespace effetune::vst {
 namespace {
 
-constexpr std::string_view kPresetFileName = "effetune_presets.json";
+constexpr char kPresetFileName[] = "effetune_presets.json";
+constexpr char kPluginPresetFileName[] = "effetune_plugin_presets.json";
 
-[[nodiscard]] std::string virtualFileName(const std::string_view path) {
+[[nodiscard]] std::string_view virtualFileName(const std::string_view path) noexcept {
   const auto separator = path.find_last_of("/\\");
-  return std::string(path.substr(separator == std::string_view::npos ? 0 : separator + 1));
+  return path.substr(separator == std::string_view::npos ? 0 : separator + 1);
 }
 
 } // namespace
 
-PresetStore::PresetStore() : presetPath_(resolvePresetPath()) {}
+PresetStore::PresetStore() : PresetStore(resolvePresetPath()) {}
+
+PresetStore::PresetStore(std::filesystem::path presetPath)
+    : presetPath_(std::move(presetPath)),
+      pluginPresetPath_(presetPath_.parent_path() / kPluginPresetFileName) {}
 
 void PresetStore::setError(std::string *destination, std::string value) {
   if (destination != nullptr) {
@@ -60,24 +66,38 @@ std::filesystem::path PresetStore::resolvePresetPath() {
 }
 
 bool PresetStore::handles(const std::string_view virtualPath) const {
-  return virtualFileName(virtualPath) == kPresetFileName;
+  return pathForVirtualFile(virtualPath) != nullptr;
+}
+
+const std::filesystem::path *
+PresetStore::pathForVirtualFile(const std::string_view virtualPath) const noexcept {
+  const auto fileName = virtualFileName(virtualPath);
+  if (fileName == kPresetFileName) {
+    return &presetPath_;
+  }
+  if (fileName == kPluginPresetFileName) {
+    return &pluginPresetPath_;
+  }
+  return nullptr;
 }
 
 bool PresetStore::exists(const std::string_view virtualPath) const {
-  if (!handles(virtualPath)) {
+  const auto *path = pathForVirtualFile(virtualPath);
+  if (path == nullptr) {
     return false;
   }
   std::error_code error;
-  return std::filesystem::is_regular_file(presetPath_, error);
+  return std::filesystem::is_regular_file(*path, error);
 }
 
 bool PresetStore::read(const std::string_view virtualPath, std::string &content,
                        std::string *error) const {
-  if (!handles(virtualPath)) {
+  const auto *path = pathForVirtualFile(virtualPath);
+  if (path == nullptr) {
     setError(error, "The requested virtual file is not allowed");
     return false;
   }
-  std::ifstream input(presetPath_, std::ios::binary);
+  std::ifstream input(*path, std::ios::binary);
   if (!input) {
     setError(error, "Preset store does not exist");
     return false;
@@ -93,18 +113,19 @@ bool PresetStore::read(const std::string_view virtualPath, std::string &content,
 bool PresetStore::write(const std::string_view virtualPath, const std::string_view content,
                         std::string *error) const {
   constexpr std::size_t maximumBytes = 8u * 1024u * 1024u;
-  if (!handles(virtualPath) || content.size() > maximumBytes) {
+  const auto *path = pathForVirtualFile(virtualPath);
+  if (path == nullptr || content.size() > maximumBytes) {
     setError(error, "Preset store write is not allowed or is too large");
     return false;
   }
 
   std::error_code filesystemError;
-  std::filesystem::create_directories(presetPath_.parent_path(), filesystemError);
+  std::filesystem::create_directories(path->parent_path(), filesystemError);
   if (filesystemError) {
     setError(error, "Unable to create preset store directory");
     return false;
   }
-  auto temporary = presetPath_;
+  auto temporary = *path;
   temporary += ".tmp";
   {
     std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
@@ -117,14 +138,14 @@ bool PresetStore::write(const std::string_view virtualPath, const std::string_vi
   }
 
 #if defined(_WIN32)
-  if (MoveFileExW(temporary.c_str(), presetPath_.c_str(),
+  if (MoveFileExW(temporary.c_str(), path->c_str(),
                   MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == 0) {
     std::filesystem::remove(temporary, filesystemError);
     setError(error, "Unable to atomically replace preset store");
     return false;
   }
 #else
-  std::filesystem::rename(temporary, presetPath_, filesystemError);
+  std::filesystem::rename(temporary, *path, filesystemError);
   if (filesystemError) {
     std::filesystem::remove(temporary, filesystemError);
     setError(error, "Unable to atomically replace preset store");

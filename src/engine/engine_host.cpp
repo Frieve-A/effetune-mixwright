@@ -17,6 +17,12 @@
 
 namespace effetune::vst {
 
+struct EngineHost::LatencyUpdateStorage {
+  effetune::Engine::PipelineLatencySnapshot snapshot;
+  std::unique_ptr<effetune::Engine::PipelineLatencyUpdate> update;
+  std::uint64_t revision = 0;
+};
+
 struct EngineHost::TelemetryStorage {
   struct Slot {
     std::array<std::uint8_t, kDefaultTelemetryBytes> bytes{};
@@ -160,7 +166,9 @@ void writeUint32(std::uint8_t *bytes, const std::uint32_t value) noexcept {
 
 } // namespace
 
-EngineHost::EngineHost() : telemetry_(std::make_unique<TelemetryStorage>()) {
+EngineHost::EngineHost()
+    : latencyUpdate_(std::make_unique<LatencyUpdateStorage>()),
+      telemetry_(std::make_unique<TelemetryStorage>()) {
   if (et_abi_version() != EFFETUNE_DSP_ABI_VERSION) {
     throw std::runtime_error("Unsupported EffeTune DSP ABI");
   }
@@ -943,7 +951,7 @@ bool EngineHost::ProcessBatch::finish(const bool refreshLatency) noexcept {
   auto *host = host_;
   const auto assetLatencyMayHaveChanged = host->assetPreparationLatencyPolling_;
   auto instanceLatencyChanged = false;
-  if (latencyDirty_ || refreshLatency) {
+  if (latencyDirty_ || pipelinePlanDirty_ || refreshLatency) {
     (void)host->refreshLatencyUnlocked(&instanceLatencyChanged);
     host->processCounterAtoms_.latencyRefreshes.fetch_add(1,
                                                           std::memory_order_relaxed);
@@ -1043,15 +1051,58 @@ bool EngineHost::refreshPipelinePlan(std::uint64_t &refreshedRevision,
     setError(error, "DSP pipeline is not configured");
     return false;
   }
-  const auto status = engine_->configurePipeline(activeDescriptor_.data(),
-                                                  activeDescriptorByteCount_);
+  effetune::Engine::PipelineLatencySnapshot snapshot;
+  effetune::Engine::PipelineLatencyUpdate update;
+  auto status = engine_->capturePipelineLatencySnapshot(snapshot);
+  if (status == ET_OK) {
+    status = effetune::Engine::preparePipelineLatencyUpdate(snapshot, update);
+  }
+  if (status == ET_OK) {
+    status = engine_->applyPipelineLatencyUpdate(update);
+  }
   if (status != ET_OK) {
-    setError(error, "et_pipeline_configure failed with status " + std::to_string(status));
+    setError(error, "Pipeline latency update failed with status " + std::to_string(status));
     return false;
   }
   refreshedRevision = pipelinePlanRevision_.load(std::memory_order_acquire);
   (void)refreshLatencyUnlocked();
   return true;
+}
+
+bool EngineHost::capturePipelineLatencyUpdate() noexcept {
+  if (!prepared_ ||
+      engine_->capturePipelineLatencySnapshot(latencyUpdate_->snapshot) != ET_OK) {
+    return false;
+  }
+  latencyUpdate_->revision = pipelinePlanRevision();
+  return true;
+}
+
+bool EngineHost::preparePipelineLatencyUpdate(std::uint32_t &latency) noexcept {
+  // Only the transferred snapshot is read here, never the live Engine.
+  auto update = std::unique_ptr<effetune::Engine::PipelineLatencyUpdate>(
+      new (std::nothrow) effetune::Engine::PipelineLatencyUpdate);
+  if (!update || effetune::Engine::preparePipelineLatencyUpdate(
+                     latencyUpdate_->snapshot, *update) != ET_OK) {
+    return false;
+  }
+  latency = update->plannedLatency();
+  latencyUpdate_->update.swap(update);
+  return true;
+}
+
+bool EngineHost::applyPipelineLatencyUpdate(std::uint64_t &revision) noexcept {
+  if (!latencyUpdate_->update ||
+      engine_->applyPipelineLatencyUpdate(*latencyUpdate_->update) != ET_OK) {
+    return false;
+  }
+  revision = latencyUpdate_->revision;
+  (void)refreshLatencyUnlocked();
+  return true;
+}
+
+void EngineHost::discardPipelineLatencyUpdate() noexcept {
+  latencyUpdate_->update.reset();
 }
 
 void EngineHost::storeActiveDescriptorUnlocked(const std::uint8_t *descriptor,
@@ -1068,8 +1119,6 @@ bool EngineHost::refreshLatencyUnlocked(bool *instanceLatencyChanged) noexcept {
   if (instanceLatencyChanged != nullptr) {
     *instanceLatencyChanged = false;
   }
-  std::array<std::array<std::uint32_t, kMaxChannels>, kMaxBus + 1u> latency{};
-  std::array<std::array<bool, kMaxChannels>, kMaxBus + 1u> hasContent{};
   if (!validDescriptor(activeDescriptor_.data(), activeDescriptorByteCount_)) {
     observedLatencyNodes_.fill(false);
     const auto previous = pipelineLatency_.exchange(0, std::memory_order_acq_rel);
@@ -1081,9 +1130,6 @@ bool EngineHost::refreshLatencyUnlocked(bool *instanceLatencyChanged) noexcept {
   const auto previousLatencies = observedInstanceLatencies_;
   const auto previousNodes = observedLatencyNodes_;
   observedLatencyNodes_.fill(false);
-  for (std::uint32_t channel = 0; channel < channels_; ++channel) {
-    hasContent[0][channel] = true;
-  }
   const auto nodeCount = readUint32(activeDescriptor_.data() + 4u);
   for (std::uint32_t index = 0; index < nodeCount; ++index) {
     const auto *node = activeDescriptor_.data() + kPipelineDescriptorHeaderBytes +
@@ -1122,28 +1168,11 @@ bool EngineHost::refreshLatencyUnlocked(bool *instanceLatencyChanged) noexcept {
          (previousNodes[index] && previousLatencies[index] != instanceLatency))) {
       *instanceLatencyChanged = true;
     }
-    for (std::uint32_t offset = 0; offset < routedChannels; ++offset) {
-      const auto channel = firstChannel + offset;
-      const auto inputLatency = hasContent[inputBus][channel] ? latency[inputBus][channel] : 0u;
-      const auto incomingLatency =
-          instanceLatency > std::numeric_limits<std::uint32_t>::max() - inputLatency
-              ? std::numeric_limits<std::uint32_t>::max()
-              : inputLatency + instanceLatency;
-      if (inputBus == outputBus || !hasContent[outputBus][channel]) {
-        latency[outputBus][channel] = incomingLatency;
-        hasContent[outputBus][channel] = true;
-      } else if (incomingLatency > latency[outputBus][channel]) {
-        latency[outputBus][channel] = incomingLatency;
-      }
-    }
   }
 
-  std::uint32_t pipelineLatency = 0;
-  for (std::uint32_t channel = 0; channel < channels_; ++channel) {
-    if (hasContent[0][channel] && latency[0][channel] > pipelineLatency) {
-      pipelineLatency = latency[0][channel];
-    }
-  }
+  // Kernel latencies above detect a stale plan, but only the upstream applied
+  // plan is the latency the host may advertise.
+  const auto pipelineLatency = engine_->pipelineLatency();
   const auto previous = pipelineLatency_.exchange(pipelineLatency, std::memory_order_acq_rel);
   if (previous != pipelineLatency) {
     latencyRevision_.fetch_add(1, std::memory_order_acq_rel);

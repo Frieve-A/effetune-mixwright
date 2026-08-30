@@ -186,6 +186,12 @@ public:
   [[nodiscard]] std::uint32_t pipelineLatency() const;
   [[nodiscard]] bool refreshPipelinePlan(std::uint64_t &refreshedRevision,
                                          std::string *error = nullptr);
+  // The caller transfers exclusive ownership of this single slot between
+  // capture/apply on the engine owner and prepare/discard on a control thread.
+  [[nodiscard]] bool capturePipelineLatencyUpdate() noexcept;
+  [[nodiscard]] bool preparePipelineLatencyUpdate(std::uint32_t &latency) noexcept;
+  [[nodiscard]] bool applyPipelineLatencyUpdate(std::uint64_t &revision) noexcept;
+  void discardPipelineLatencyUpdate() noexcept;
   [[nodiscard]] std::uint64_t pipelinePlanRevision() const noexcept {
     return pipelinePlanRevision_.load(std::memory_order_acquire);
   }
@@ -236,6 +242,8 @@ private:
   static void setError(std::string *destination, std::string message);
 
   std::unique_ptr<effetune::Engine> engine_;
+  struct LatencyUpdateStorage;
+  std::unique_ptr<LatencyUpdateStorage> latencyUpdate_;
   float *combined_ = nullptr;
   double sampleRate_ = 0.0;
   double processedFrames_ = 0.0;

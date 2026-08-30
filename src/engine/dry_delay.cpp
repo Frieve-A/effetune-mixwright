@@ -66,17 +66,40 @@ bool DryDelayLine::setDelay(const std::uint32_t delayFrames) {
     return true;
   }
 
-  std::size_t nextSize = 0;
-  if (!storageSize(channels_, requiredFrames, nextSize)) {
+  Update update;
+  if (!prepareUpdate(update, channels_, delayFrames)) {
     return false;
   }
-  std::vector<float> next;
+  applyUpdate(update);
+  return true;
+}
+
+bool DryDelayLine::prepareUpdate(Update &update, const std::uint32_t channels,
+                                 const std::uint32_t delayFrames) noexcept {
+  std::size_t nextSize = 0;
+  if (channels == 0 || channels > 8 ||
+      delayFrames == std::numeric_limits<std::uint32_t>::max() ||
+      !storageSize(channels, delayFrames + 1u, nextSize)) {
+    return false;
+  }
   try {
-    next.assign(nextSize, 0.0f);
+    update.history.assign(nextSize, 0.0f);
   } catch (...) {
     return false;
   }
+  update.delayFrames = delayFrames;
+  return true;
+}
 
+void DryDelayLine::applyUpdate(Update &update) noexcept {
+  const auto requiredFrames = update.delayFrames + 1u;
+  // The owner validates the configuration before committing the wet update.
+  // Shrinks retain the existing capacity and history, just like unchanged wet
+  // compensation delays. No vector is destroyed at this boundary.
+  if (requiredFrames <= capacityFrames_) {
+    delayFrames_ = update.delayFrames;
+    return;
+  }
   const auto keepFrames = std::min(historyFrames_, requiredFrames);
   const auto firstFrame =
       (writeFrame_ + capacityFrames_ - keepFrames) % capacityFrames_;
@@ -84,15 +107,15 @@ bool DryDelayLine::setDelay(const std::uint32_t delayFrames) {
     const auto oldOffset = static_cast<std::size_t>(channel) * capacityFrames_;
     const auto newOffset = static_cast<std::size_t>(channel) * requiredFrames;
     for (std::uint32_t frame = 0; frame < keepFrames; ++frame) {
-      next[newOffset + frame] = history_[oldOffset + (firstFrame + frame) % capacityFrames_];
+      update.history[newOffset + frame] =
+          history_[oldOffset + (firstFrame + frame) % capacityFrames_];
     }
   }
-  history_.swap(next);
+  history_.swap(update.history);
   capacityFrames_ = requiredFrames;
-  delayFrames_ = delayFrames;
+  delayFrames_ = update.delayFrames;
   historyFrames_ = keepFrames;
   writeFrame_ = keepFrames % capacityFrames_;
-  return true;
 }
 
 void DryDelayLine::reset() noexcept {

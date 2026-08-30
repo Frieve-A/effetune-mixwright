@@ -117,17 +117,18 @@ std::int8_t encodeChannelSpec(const std::optional<std::string> &channel) {
   if (*channel == "R" || *channel == "2") {
     return 1;
   }
-  if (*channel == "34") {
-    return 17;
+  constexpr std::array<std::string_view, 7> pairSpecs{
+      "34", "56", "78", "910", "1112", "1314", "1516"};
+  const auto pair = std::find(pairSpecs.begin(), pairSpecs.end(), *channel);
+  if (pair != pairSpecs.end()) {
+    return static_cast<std::int8_t>(17 + std::distance(pairSpecs.begin(), pair));
   }
-  if (*channel == "56") {
-    return 18;
-  }
-  if (*channel == "78") {
-    return 19;
-  }
-  if (channel->size() == 1 && channel->front() >= '1' && channel->front() <= '8') {
-    return static_cast<std::int8_t>(channel->front() - '1');
+  constexpr std::array<std::string_view, 16> singleSpecs{
+      "1", "2", "3", "4", "5", "6", "7", "8",
+      "9", "10", "11", "12", "13", "14", "15", "16"};
+  const auto single = std::find(singleSpecs.begin(), singleSpecs.end(), *channel);
+  if (single != singleSpecs.end()) {
+    return static_cast<std::int8_t>(std::distance(singleSpecs.begin(), single));
   }
   throw std::invalid_argument("Unsupported channel specifier: " + *channel);
 }

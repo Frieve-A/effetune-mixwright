@@ -98,11 +98,11 @@ void setError(std::string *destination, std::string value) {
       headBlock == 0 || headBlock == 128 || headBlock == 256 || headBlock == 512 ||
       headBlock == 1024;
   if (formatTag <= 0 || formatTag > std::numeric_limits<std::uint32_t>::max() || channels < 1 ||
-      channels > 8 || frames < 1 || frames > std::numeric_limits<std::uint32_t>::max() ||
+      channels > 16 || frames < 1 || frames > std::numeric_limits<std::uint32_t>::max() ||
       topology < 1 || topology > 4 || !validHeadBlock ||
       (rateDivider != 1 && rateDivider != 2 && rateDivider != 4) || pathCount < 0 ||
-      pathCount > 8 || inputCount < 0 || inputCount > 8 || processingChannels < 1 ||
-      processingChannels > 8 || byteSize < 1 ||
+      pathCount > 16 || inputCount < 0 || inputCount > 16 || processingChannels < 1 ||
+      processingChannels > EngineHost::kMaxChannels || byteSize < 1 ||
       byteSize > EngineHost::kMaximumAssetPayloadBytes || footprintBytes < byteSize ||
       footprintBytes > EngineHost::kMaximumAssetPayloadBytes) {
     setError(error, "DSP asset metadata is invalid or exceeds the plug-in capacity");

@@ -243,13 +243,14 @@ void testChannelAwarePipelineLatencyRouting() {
   const auto previousPlanRevision = engine.pipelinePlanRevision();
   expect(engine.updateParameters(101, updatedLeft, limiter->second.paramsHash),
          "live latency parameter update");
-  expect(engine.pipelineLatency() == 576u &&
+  expect(engine.pipelineLatency() == 144u &&
              engine.pipelinePlanRevision() > previousPlanRevision,
-         "latency refresh reads the live instance latency");
+         "a staged latency leaves the applied plan unchanged");
   std::uint64_t refreshedPlanRevision = 0;
   expect(engine.refreshPipelinePlan(refreshedPlanRevision, &error) &&
-             refreshedPlanRevision == engine.pipelinePlanRevision(),
-         "non-RT refresh rebuilds the active compensation plan");
+             refreshedPlanRevision == engine.pipelinePlanRevision() &&
+             engine.pipelineLatency() == 576u,
+         "non-RT refresh applies the new compensation plan");
 
   PipelineState serial;
   serial.plugins = {makeNode(201, "BrickwallLimiterPlugin", "L"),
@@ -295,6 +296,93 @@ void testChannelAwarePipelineLatencyRouting() {
          "paired and numbered channel specs share only their selected path");
 }
 
+void testLiveLatencyHandoffForParallelAndBusMerges() {
+  for (const bool useBus : {false, true}) {
+    EngineHost engine;
+    std::string error;
+    expect(engine.prepare(48000, 2, EngineHost::kDefaultTelemetryBytes, &error),
+           "prepare live latency routing");
+    const auto hash = engine.kernels().at("BrickwallLimiterPlugin").paramsHash;
+    PipelineState pipeline;
+    pipeline.plugins = {
+        makeNode(1, "BrickwallLimiterPlugin", "L", 0, useBus ? 1 : 0),
+        makeNode(2, "BrickwallLimiterPlugin", "R", 0, useBus ? 1 : 0)};
+    std::vector<RuntimePlugin> runtimes{makeLimiter(1, 1, hash), makeLimiter(2, 3, hash)};
+    if (useBus) {
+      pipeline.plugins.push_back(makeNode(3, "TestGainPlugin", "L", 1, 0));
+      pipeline.plugins.push_back(makeNode(4, "TestGainPlugin", "R", 1, 0));
+      const auto gainHash = engine.kernels().at("TestGainPlugin").paramsHash;
+      runtimes.push_back(makeGain(3, gainHash));
+      runtimes.push_back(makeGain(4, gainHash));
+    }
+    expect(engine.rebuild(pipeline, runtimes, &error), "build live latency routing");
+    std::array<float, 64> left{}, right{};
+    float *channels[]{left.data(), right.data()};
+    const auto render = [&] {
+      return engine.tryProcessBlock(channels, 2, 64, 0, false);
+    };
+    // The final two edits have the same total latency but different output or
+    // merge compensation, so comparing only the total would miss them.
+    for (const auto lookahead : {10.0f, 2.0f, 1.0f}) {
+      const auto before = engine.pipelineLatency();
+      auto image = makeLimiter(1, lookahead, hash);
+      EngineHost::ProcessBatch batch;
+      expect(engine.beginProcessBatch(batch) &&
+                 batch.stageParameters(1, image.packedParameters, hash) && batch.finish(),
+             "stage a latency edit on the owner");
+      expect(engine.pipelineLatency() == before && engine.capturePipelineLatencyUpdate(),
+             "capture does not change the applied plan");
+      std::uint32_t planned = 0;
+      expect(engine.preparePipelineLatencyUpdate(planned), "prepare transferred snapshot");
+      expect(render(), "continue processing while a prepared update waits");
+      std::uint64_t revision = 0;
+      expect(engine.applyPipelineLatencyUpdate(revision), "apply at the audio boundary");
+      const auto expected = lookahead == 10 ? 480u : 144u;
+      expect(engine.pipelineLatency() == expected && planned == expected &&
+                 revision == engine.pipelinePlanRevision(),
+             "only the applied plan publishes its latency and revision");
+      engine.discardPipelineLatencyUpdate();
+      for (int block = 0; block < 16; ++block) {
+        left.fill(0);
+        right.fill(0);
+        expect(render(), "settle the live updated plan without reset");
+      }
+      std::array<std::uint32_t, 2> peaks{};
+      std::array<float, 2> magnitudes{};
+      for (std::uint32_t block = 0; block < 12; ++block) {
+        left.fill(0);
+        right.fill(0);
+        if (block == 0) {
+          left[0] = 0.25f;
+          right[0] = 0.25f;
+        }
+        expect(render(), "render live compensated impulse");
+        for (std::uint32_t channel = 0; channel < 2; ++channel) {
+          for (std::uint32_t frame = 0; frame < 64; ++frame) {
+            const auto value = std::abs(channels[channel][frame]);
+            if (value > magnitudes[channel]) {
+              magnitudes[channel] = value;
+              peaks[channel] = block * 64 + frame;
+            }
+          }
+        }
+      }
+      expect(peaks[0] == expected && peaks[1] == expected &&
+                 magnitudes[0] > 0.2f && magnitudes[1] > 0.2f,
+             "parallel and bus-merge impulses match the applied latency");
+    }
+    expect(engine.capturePipelineLatencyUpdate(), "capture before topology replacement");
+    std::uint32_t planned = 0;
+    expect(engine.preparePipelineLatencyUpdate(planned), "prepare before topology replacement");
+    pipeline.plugins[0].enabled = false;
+    expect(engine.updateDescriptor(pipeline, &error), "replace the captured topology");
+    std::uint64_t revision = 0;
+    expect(!engine.applyPipelineLatencyUpdate(revision) && engine.pipelineLatency() == 144u,
+           "a topology replacement rejects the stale plan without changing applied latency");
+    engine.discardPipelineLatencyUpdate();
+  }
+}
+
 } // namespace
 
 int main() {
@@ -306,6 +394,7 @@ int main() {
     testSingleTransactionAndBoundaryStaging();
     testFailureCounters();
     testChannelAwarePipelineLatencyRouting();
+    testLiveLatencyHandoffForParallelAndBusMerges();
     std::cout << "EffeTune engine batch tests passed\n";
     return 0;
   } catch (const std::exception &exception) {

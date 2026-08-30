@@ -8,9 +8,17 @@ namespace effetune::vst {
 
 class DryDelayLine {
 public:
+  struct Update {
+    std::vector<float> history;
+    std::uint32_t delayFrames = 0;
+  };
   [[nodiscard]] bool prepare(std::uint32_t channels, std::uint32_t maxBlockFrames,
                              std::uint32_t delayFrames);
   [[nodiscard]] bool setDelay(std::uint32_t delayFrames);
+  [[nodiscard]] static bool prepareUpdate(Update &update, std::uint32_t channels,
+                                          std::uint32_t delayFrames) noexcept;
+  // Apply swaps retired storage into update; reclaim it on the control thread.
+  void applyUpdate(Update &update) noexcept;
   void reset() noexcept;
   [[nodiscard]] const float *const *process(const float *const *input,
                                             std::uint32_t channels,

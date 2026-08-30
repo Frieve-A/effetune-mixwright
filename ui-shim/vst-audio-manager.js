@@ -97,13 +97,17 @@ function writeAutomationPlain(parameters, descriptor, value) {
 }
 
 function storageAutomationToNormalized(descriptor, packedValue) {
-  return normalizeDSPAutomationValue(
-    descriptor, unpackDSPAutomationValue(descriptor, packedValue));
+  const publicValue = descriptor.kind === 'enum' || descriptor.kind === 'bool'
+    ? packedValue
+    : unpackDSPAutomationValue(descriptor, packedValue);
+  return normalizeDSPAutomationValue(descriptor, publicValue);
 }
 
 function normalizedAutomationToStorage(descriptor, normalizedValue) {
-  return packDSPAutomationValue(
-    descriptor, denormalizeDSPAutomationValue(descriptor, normalizedValue));
+  const publicValue = denormalizeDSPAutomationValue(descriptor, normalizedValue);
+  return descriptor.kind === 'enum' || descriptor.kind === 'bool'
+    ? publicValue
+    : packDSPAutomationValue(descriptor, publicValue);
 }
 
 // The single enumeration of a plug-in's automation targets. Baseline seeding and

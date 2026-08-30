@@ -182,6 +182,10 @@ private:
   // caller runs it inside a window that proved the audio thread is out of
   // process() first.
   [[nodiscard]] bool synchronizeLatencyLocked(bool &latencyChanged);
+  void capturePendingLatencyUpdate() noexcept;
+  [[nodiscard]] bool prepareCapturedLatencyUpdate() noexcept;
+  [[nodiscard]] bool applyPreparedLatencyUpdate() noexcept;
+  void discardPendingLatencyUpdate() noexcept;
   // How long the rendered-block counter has to stand still before the transport
   // counts as stopped. It has to outlast one host block, and the host already
   // told us how long that is through setupProcessing().
@@ -489,6 +493,17 @@ private:
   BlockAdapter blockAdapter_;
   Oversampler oversampler_;
   DryDelayLine dryDelay_;
+  enum class LatencyUpdateState : std::uint8_t { idle, captured, prepared, retired };
+  // A release/acquire handoff gives one side exclusive ownership of both the
+  // EngineHost slot and dry storage. Control owns captured/retired; audio owns
+  // idle/prepared. Lifecycle mutations hold the existing engine window.
+  std::atomic<LatencyUpdateState> latencyUpdateState_{LatencyUpdateState::idle};
+  DryDelayLine::Update dryLatencyUpdate_;
+  std::uint32_t latencyUpdateChannels_ = 0;
+  std::uint32_t latencyUpdateResampler_ = 0;
+  std::uint32_t latencyUpdateOversampling_ = 1;
+  std::uint64_t latencyUpdateRevision_ = 0;
+  std::atomic_bool appliedLatencyNotificationPending_{false};
   OutputTransition outputTransition_;
   LatestParameterMailbox parameterMailbox_;
   std::optional<AudioCommand> pendingDescriptorCommand_;

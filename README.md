@@ -64,6 +64,16 @@ node external/effetune/tools/dsp-parity/run.mjs --native \
 
 The relative path passed to `--native-runner` is resolved from `external/effetune`.
 
+Latency-changing parameter and asset updates are serviced while audio callbacks continue,
+whether transport is playing or stopped. The audio owner captures the current pipeline;
+the control service prepares compensation and bypass storage; a later audio-block boundary
+applies the matching wet plan, bypass delay, and host latency together. Stale preparations
+are recaptured, and allocation failures retain the applied plan with a deferred diagnostic
+and bounded retry. Retired storage is reclaimed only by the control service. Host latency
+notifications remain debounced and describe applied, not merely prepared, compensation.
+Retiming preserves available recent delay history, but does not guarantee click-free
+changes or recover samples older than the previous delay capacity.
+
 To benchmark the resampler in a Release build, run `build/windows-release/src/tools/effetune-resampler-bench.exe`.
 
 pluginval at strictness level 10, compatibility testing in target DAWs, testing on physical macOS hardware, code signing, and notarization are separate release-QA steps.

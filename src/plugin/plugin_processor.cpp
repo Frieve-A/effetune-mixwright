@@ -1056,7 +1056,7 @@ tresult PLUGIN_API EffeTuneProcessor::getParamStringByValue(
   const auto publicValue = automationPublicValue(
       AutomationDenormalization{target->normalization, target->transform,
                                 target->transformReference, target->minimum,
-                                target->maximum, target->stepCount},
+                                target->maximum, target->stepCount, target->step},
       valueNormalized);
   if (!publicValue.has_value()) {
     // A degenerate range or a position outside 0..1: the scale cannot say what
@@ -1085,7 +1085,7 @@ tresult PLUGIN_API EffeTuneProcessor::getParamValueByString(
   const auto typed = trimmed(utf8FromTChars(string));
   const AutomationDenormalization denormalization{
       target->normalization, target->transform, target->transformReference,
-      target->minimum,       target->maximum,   target->stepCount};
+      target->minimum,       target->maximum,   target->stepCount, target->step};
   std::optional<double> publicValue;
   if (target->normalization == AutomationValueNormalization::boolean) {
     if (equalsIgnoringCase(typed, kBooleanOnText)) {
@@ -1503,7 +1503,7 @@ void EffeTuneProcessor::publishAutomationApplyTableLocked() noexcept {
     entry.packedOffset = target->packedOffset;
     entry.denormalization = {target->normalization, target->transform,
                              target->transformReference, target->minimum,
-                             target->maximum, target->stepCount};
+                             target->maximum, target->stepCount, target->step};
   }
   if (staging == automationApplyTables_[published]) {
     // Nothing the audio thread can observe changed. Keeping the current face
@@ -2758,16 +2758,7 @@ tresult PLUGIN_API EffeTuneProcessor::process(ProcessData &data) {
     dryPointers[static_cast<std::size_t>(channel)] =
         dryTransitionPointers_[static_cast<std::size_t>(channel)];
   }
-  const auto *delayedDry = dryDelay_.process(
-      const_cast<const float *const *>(input.channelBuffers32),
-      static_cast<std::uint32_t>(input.numChannels),
-      static_cast<std::uint32_t>(data.numSamples));
-  if (delayedDry == nullptr) {
-    finishDry();
-    recordProcessTransactionFailure(ProcessTransactionError::dryDelayUnavailable);
-    completeAutomationBlock(false);
-    return kResultOk;
-  }
+  const float *const *delayedDry = nullptr;
   const auto oversamplingFactor = activeOversamplingFactor_.load(std::memory_order_acquire);
 
   const auto *upsampled = oversampler_.upsample(
@@ -2854,9 +2845,8 @@ tresult PLUGIN_API EffeTuneProcessor::process(ProcessData &data) {
     }
     std::fill_n(hostBypassMask_.begin() + slice.hostOffset, slice.hostFrames,
                 sliceBypass ? 1u : 0u);
-    // Staging a parameter may change an instance latency. The batch records
-    // that so the control service can reconfigure the compensation plan; this
-    // block keeps processing with the plan the engine already holds.
+    // Stage before validating the prepared plan, so a newer image cannot
+    // accidentally commit stale compensation.
     // The dirty flags are left standing while the control service owns the
     // image, so whatever is pending reaches the engine from the next block.
     for (std::size_t runtimeIndex = 0;
@@ -2879,6 +2869,20 @@ tresult PLUGIN_API EffeTuneProcessor::process(ProcessData &data) {
     if (!processed || slice.hostFrames == 0) {
       continue;
     }
+    if (delayedDry == nullptr) {
+      // Commit wet compensation, dry history and the published host latency
+      // together, before either path processes this host block. Later slices
+      // may stage newer parameters; their plan is captured at block end.
+      (void)applyPreparedLatencyUpdate();
+      delayedDry = dryDelay_.process(
+          const_cast<const float *const *>(input.channelBuffers32),
+          static_cast<std::uint32_t>(input.numChannels),
+          static_cast<std::uint32_t>(data.numSamples));
+      if (delayedDry == nullptr) {
+        processed = false;
+        break;
+      }
+    }
     const auto engineOffset = slice.hostOffset * oversamplingFactor;
     const auto sliceEngineFrames = slice.hostFrames * oversamplingFactor;
     for (std::uint32_t channel = 0; channel < static_cast<std::uint32_t>(input.numChannels);
@@ -2900,6 +2904,7 @@ tresult PLUGIN_API EffeTuneProcessor::process(ProcessData &data) {
         });
   }
   const auto batchFinished = batch.finish(refreshLatencyAtBlockEnd);
+  capturePendingLatencyUpdate();
   processed = processed && batchFinished;
 
   auto failure = ProcessTransactionError::none;
@@ -2997,6 +3002,9 @@ std::uint32_t EffeTuneProcessor::processingLatencySamples() const noexcept {
 }
 
 bool EffeTuneProcessor::synchronizeLatencyLocked(bool &latencyChanged) {
+  // Every caller owns the engine window and control mutex, so no captured or
+  // prepared result can survive a lifecycle/configuration replacement.
+  discardPendingLatencyUpdate();
   const auto next = calculateTotalLatency(
       resamplerLatencySamples_.load(std::memory_order_acquire),
       activeOversamplingFactor_.load(std::memory_order_acquire), engine_.pipelineLatency());
@@ -3026,8 +3034,70 @@ bool EffeTuneProcessor::synchronizeLatencyLocked(bool &latencyChanged) {
   return true;
 }
 
+void EffeTuneProcessor::capturePendingLatencyUpdate() noexcept {
+  if (latencyUpdateState_.load(std::memory_order_acquire) != LatencyUpdateState::idle ||
+      engine_.pipelinePlanRevision() ==
+          servicedPipelinePlanRevision_.load(std::memory_order_acquire)) {
+    return;
+  }
+  if (engine_.capturePipelineLatencyUpdate()) {
+    latencyUpdateChannels_ = engine_.channels();
+    latencyUpdateResampler_ = resamplerLatencySamples_.load(std::memory_order_relaxed);
+    latencyUpdateOversampling_ = activeOversamplingFactor_.load(std::memory_order_relaxed);
+    latencyUpdateRevision_ = engine_.pipelinePlanRevision();
+    latencyUpdateState_.store(LatencyUpdateState::captured, std::memory_order_release);
+  }
+}
+
+bool EffeTuneProcessor::prepareCapturedLatencyUpdate() noexcept {
+  std::uint32_t plannedLatency = 0;
+  return engine_.preparePipelineLatencyUpdate(plannedLatency) &&
+         DryDelayLine::prepareUpdate(
+             dryLatencyUpdate_, latencyUpdateChannels_,
+             calculateTotalLatency(latencyUpdateResampler_,
+                                   latencyUpdateOversampling_, plannedLatency));
+}
+
+void EffeTuneProcessor::discardPendingLatencyUpdate() noexcept {
+  engine_.discardPipelineLatencyUpdate();
+  dryLatencyUpdate_ = {};
+  latencyUpdateState_.store(LatencyUpdateState::idle, std::memory_order_release);
+}
+
+bool EffeTuneProcessor::applyPreparedLatencyUpdate() noexcept {
+  if (latencyUpdateState_.load(std::memory_order_acquire) !=
+      LatencyUpdateState::prepared) {
+    return false;
+  }
+  std::uint64_t revision = 0;
+  const auto applied = engine_.applyPipelineLatencyUpdate(revision);
+  if (applied) {
+    dryDelay_.applyUpdate(dryLatencyUpdate_);
+    const auto next = dryLatencyUpdate_.delayFrames;
+    const auto previous = latencySamples_.exchange(next, std::memory_order_acq_rel);
+    servicedLatencyRevision_.store(engine_.latencyRevision(), std::memory_order_release);
+    servicedPipelinePlanRevision_.store(revision, std::memory_order_release);
+    if (previous != next) {
+      appliedLatencyNotificationPending_.store(true, std::memory_order_release);
+    }
+    recordPipelinePlanRefreshOutcome(true);
+    if (trace::enabled()) {
+      trace::latency(traceInstance_, trace::Event::latencySynced, previous, next,
+                     engine_.pipelineLatency(), latencyUpdateResampler_,
+                     latencyUpdateOversampling_);
+    }
+  }
+  // Staleness is normal during a drag. Preserve the old plan, retire on the
+  // control thread, and capture again after it returns the slot. No callback
+  // allocation, destruction, lock, retry loop or host notification occurs here.
+  latencyUpdateState_.store(LatencyUpdateState::retired, std::memory_order_release);
+  return applied;
+}
+
 bool EffeTuneProcessor::hasPendingControlWork() const noexcept {
-  return descriptorGeneration_.load(std::memory_order_acquire) !=
+  return latencyUpdateState_.load(std::memory_order_acquire) != LatencyUpdateState::idle ||
+         appliedLatencyNotificationPending_.load(std::memory_order_acquire) ||
+         descriptorGeneration_.load(std::memory_order_acquire) !=
              servicedDescriptorGeneration_.load(std::memory_order_acquire) ||
          parameterImageGeneration_.load(std::memory_order_acquire) !=
              servicedParameterImageGeneration_.load(std::memory_order_acquire) ||
@@ -3130,6 +3200,43 @@ void EffeTuneProcessor::serviceLatencyUpdates(const bool restartDebounce) {
   if (!resources.owns_lock()) {
     return;
   }
+  if (appliedLatencyNotificationPending_.exchange(false, std::memory_order_acq_rel)) {
+    queueLatencyNotification(restartDebounce);
+  }
+  auto updateState = latencyUpdateState_.load(std::memory_order_acquire);
+  if (updateState == LatencyUpdateState::retired) {
+    discardPendingLatencyUpdate();
+    updateState = LatencyUpdateState::idle;
+  }
+  if (updateState == LatencyUpdateState::captured &&
+      latencyUpdateRevision_ != engine_.pipelinePlanRevision()) {
+    discardPendingLatencyUpdate();
+    updateState = LatencyUpdateState::idle;
+  }
+  if (updateState == LatencyUpdateState::captured &&
+      (latencyUpdateRevision_ != failedPipelinePlanRevision_ ||
+       now >= pipelinePlanRetryDeadline_)) {
+    auto prepared = false;
+#if defined(EFFETUNE_PROCESSOR_TEST_HOOKS)
+    if (pipelinePlanRefreshFailuresForTesting_ != 0) {
+      --pipelinePlanRefreshFailuresForTesting_;
+    } else
+#endif
+    {
+      prepared = prepareCapturedLatencyUpdate();
+    }
+    if (prepared) {
+      pipelinePlanRefreshFailureCount_ = 0;
+      latencyUpdateState_.store(LatencyUpdateState::prepared, std::memory_order_release);
+    } else {
+      failedPipelinePlanRevision_ = latencyUpdateRevision_;
+      pipelinePlanRefreshFailureCount_ =
+          std::min(pipelinePlanRefreshFailureCount_ + 1u, 6u);
+      pipelinePlanRetryDeadline_ = now + std::chrono::milliseconds(
+          50u << std::min(pipelinePlanRefreshFailureCount_ - 1u, 4u));
+      recordPipelinePlanRefreshOutcome(false);
+    }
+  }
   // Runs as its own scope because every deferral below leaves through an early
   // return, while the debounce that follows still has to be evaluated.
   const auto servicePendingControlWork = [&] {
@@ -3164,21 +3271,9 @@ void EffeTuneProcessor::serviceLatencyUpdates(const bool restartDebounce) {
     // in earns that: a descriptor being applied now, which is the explicit
     // topology change the user is waiting for, and anything at all once the
     // audio callback has stopped rendering and is no longer there to apply it.
-    // A stale compensation plan or a stale reported latency is neither. The
-    // engine keeps applying the delays it already holds, so those wait for a
-    // quiet callback instead of costing a block in the middle of a parameter
-    // drag -- which is exactly what a drag on a delay-bearing parameter
-    // produces, one plan revision per block.
-    //
-    // The residual trade-off is deliberate: for as long as the callback keeps
-    // rendering, the compensation plan and the reported latency stay behind the
-    // values the engine would compute now. It resolves at the next genuine
-    // quiescence -- suspend, or a host that stops calling process() -- and at
-    // the next topology edit, because applyDescriptor owns the engine whether or
-    // not the callback is idle. It is also the only moment a host can act on
-    // one of them: a VST3 host answers restartComponent(kLatencyChanged) by
-    // deactivating and reactivating, so a latency reported mid-stream is
-    // deferred by the host anyway.
+    // Running compensation updates use the snapshot handoff above and never
+    // close this gate. Once audio is idle the same upstream API can be applied
+    // synchronously by the exclusive control owner.
     const auto ownEngine = applyDescriptor || audioIdle;
     const auto planRevisionIsNew =
         engine_.pipelinePlanRevision() != failedPipelinePlanRevision_ ||
@@ -3195,6 +3290,7 @@ void EffeTuneProcessor::serviceLatencyUpdates(const bool restartDebounce) {
     std::optional<EngineMutationWindow> engineWindow;
     if (engineOwned) {
       engineWindow.emplace(*this);
+      discardPendingLatencyUpdate();
     }
     parameterImageGeneration =
         parameterImageGeneration_.load(std::memory_order_acquire);
@@ -3268,8 +3364,6 @@ void EffeTuneProcessor::serviceLatencyUpdates(const bool restartDebounce) {
       if (!newRevision && retryDeferred) {
         return;
       }
-      std::uint64_t refreshedRevision = 0;
-      std::string error;
       auto refreshed = false;
 #if defined(EFFETUNE_PROCESSOR_TEST_HOOKS)
       if (pipelinePlanRefreshFailuresForTesting_ != 0) {
@@ -3277,7 +3371,13 @@ void EffeTuneProcessor::serviceLatencyUpdates(const bool restartDebounce) {
       } else
 #endif
       {
-        refreshed = engine_.refreshPipelinePlan(refreshedRevision, &error);
+        capturePendingLatencyUpdate();
+        if (latencyUpdateState_.load(std::memory_order_acquire) ==
+                LatencyUpdateState::captured && prepareCapturedLatencyUpdate()) {
+          latencyUpdateState_.store(LatencyUpdateState::prepared, std::memory_order_release);
+          refreshed = applyPreparedLatencyUpdate();
+        }
+        discardPendingLatencyUpdate();
       }
       if (!refreshed) {
         failedPipelinePlanRevision_ = planRevision;
@@ -3285,8 +3385,6 @@ void EffeTuneProcessor::serviceLatencyUpdates(const bool restartDebounce) {
         recordRefreshFailure(newRevision);
         return;
       }
-      servicedPipelinePlanRevision_.store(refreshedRevision,
-                                           std::memory_order_release);
       failedPipelinePlanRevision_ = 0;
       failedParameterImageGeneration_ = 0;
       pipelinePlanRefreshFailureCount_ = 0;
@@ -3318,6 +3416,9 @@ void EffeTuneProcessor::serviceLatencyUpdates(const bool restartDebounce) {
     }
   };
   servicePendingControlWork();
+  if (appliedLatencyNotificationPending_.exchange(false, std::memory_order_acq_rel)) {
+    queueLatencyNotification(restartDebounce);
+  }
 
   // Nothing below reads control state that the mutex guards -- the debounce is
   // carried entirely by atomics -- and what follows is a call into the host. The
@@ -3683,7 +3784,10 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     result.addMember("latencySamples", static_cast<std::int64_t>(reportedLatency));
     result.addMember("processingLatencySamples",
                      static_cast<std::int64_t>(processingLatency));
-    result.addMember("latencyCompensated", processingLatency == reportedLatency);
+    result.addMember("latencyCompensated",
+                     processingLatency == reportedLatency &&
+                         engine_.pipelinePlanRevision() ==
+                             servicedPipelinePlanRevision_.load(std::memory_order_acquire));
     result.addMember(
         "pipelineCpuAverage",
         static_cast<double>(pipelineCpuAverageHundredths_.load(std::memory_order_acquire)) /
@@ -3739,7 +3843,10 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     result.addMember("latencySamples", static_cast<std::int64_t>(reportedLatency));
     result.addMember("processingLatencySamples",
                      static_cast<std::int64_t>(processingLatency));
-    result.addMember("latencyCompensated", processingLatency == reportedLatency);
+    result.addMember("latencyCompensated",
+                     processingLatency == reportedLatency &&
+                         engine_.pipelinePlanRevision() ==
+                             servicedPipelinePlanRevision_.load(std::memory_order_acquire));
     result.addMember(
         "pipelineCpuAverage",
         static_cast<double>(pipelineCpuAverageHundredths_.load(std::memory_order_acquire)) /

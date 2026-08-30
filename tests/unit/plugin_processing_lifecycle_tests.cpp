@@ -746,6 +746,11 @@ public:
     restartFlags |= flags;
     if ((flags & RestartFlags::kLatencyChanged) != 0) {
       ++latencyRestartCount;
+      if (latencyProbe != nullptr &&
+          latencyProbe->getLatencySamples() !=
+              PluginProcessorTestAccess::enginePipelineLatency(*latencyProbe)) {
+        latencyMismatch = true;
+      }
     }
     recordStep(EditStep::restart, 0);
     // A host processes restartComponent inline too, and re-reading the
@@ -809,6 +814,8 @@ public:
   bool probeRestartLock = false;
   bool restartFoundResourcesLocked = false;
   std::size_t probedRestartCount = 0;
+  EffeTuneProcessor *latencyProbe = nullptr;
+  bool latencyMismatch = false;
   // The two handler methods that leave no record in the edit log. Counted so a
   // test can assert that a code path made no IComponentHandler or
   // IComponentHandler2 call of any kind, not merely no edit.
@@ -3529,12 +3536,12 @@ void testDeferredLatencyPlanRefreshAlignsParallelAndBypassPaths() {
   const auto pendingPlanRevision =
       PluginProcessorTestAccess::pipelinePlanRevision(*processor);
   expect(pendingPlanRevision > previousPlanRevision &&
-             PluginProcessorTestAccess::latencyRevision(*processor) >
+             PluginProcessorTestAccess::latencyRevision(*processor) ==
                  previousLatencyRevision &&
              PluginProcessorTestAccess::servicedPipelinePlanRevision(*processor) <
                  pendingPlanRevision &&
              processor->getLatencySamples() == 144u,
-         "audio processing publishes revisions without changing host PDC");
+         "audio staging requests a plan without changing the applied latency or host PDC");
 
   data.inputParameterChanges = nullptr;
   inputLeft.fill(0.25f);
@@ -4346,18 +4353,39 @@ void testGroupDelayAssetPublishesCurrentUiLatency() {
              revisionBeforeAsset,
          "Group Delay EQ asset commit immediately publishes a compensation revision");
 
-  // Keep the callback logically in flight while host/getInfo services its
-  // normal control work. That prevents the deliberately deferred host PDC from
-  // catching up and reproduces the state in which the footer used to stay at 0.
+  // A snapshot cannot be captured while this synthetic callback is in flight.
+  // The UI must distinguish the applied plan from pending kernel latency.
   PluginProcessorTestAccess::beginSyntheticBlock(*processor);
   const auto info = hostInfo(*processor);
   PluginProcessorTestAccess::endSyntheticBlock(*processor);
-  constexpr std::int64_t expectedProcessingLatency = 128 + 8192;
   expect(info["latencySamples"].getWithDefault<std::int64_t>(-1) == 0 &&
-             info["processingLatencySamples"].getWithDefault<std::int64_t>(-1) ==
-                 expectedProcessingLatency &&
+             info["processingLatencySamples"].getWithDefault<std::int64_t>(-1) == 0 &&
              !info["latencyCompensated"].getWithDefault<bool>(true),
-         "the UI sees current Group Delay EQ latency while host PDC is pending");
+         "the UI reports only applied latency and marks the asset plan pending");
+
+  std::array<float, 64> left{}, right{};
+  Sample32 *channels[]{left.data(), right.data()};
+  AudioBusBuffers buffer{};
+  buffer.numChannels = 2;
+  buffer.channelBuffers32 = channels;
+  ProcessData data{};
+  data.symbolicSampleSize = kSample32;
+  data.numSamples = 64;
+  data.numInputs = 1;
+  data.numOutputs = 1;
+  data.inputs = &buffer;
+  data.outputs = &buffer;
+  const auto before = PluginProcessorTestAccess::processCounters(*processor);
+  for (int block = 0; block < 64; ++block) {
+    expect(processor->process(data) == kResultOk, "activate the asset with callbacks running");
+    PluginProcessorTestAccess::serviceLatencyUpdates(*processor);
+  }
+  const auto appliedInfo = hostInfo(*processor);
+  expect(processor->getLatencySamples() == 128u + 8192u &&
+             appliedInfo["latencyCompensated"].getWithDefault<bool>(false) &&
+             PluginProcessorTestAccess::processCounters(*processor).completedBatches ==
+                 before.completedBatches + 64,
+         "asset compensation reaches wet, dry and public latency without dropping a block");
 
   expect(processor->setActive(false) == kResultOk,
          "deactivate Group Delay EQ latency publication test");
@@ -5218,11 +5246,10 @@ void testRefusedPluginUpdateLeavesTheStateDocumentUnchanged() {
 }
 
 // Dragging a delay-bearing control republishes an instance latency from every
-// block, so the compensation plan and the reported latency are permanently
-// stale while the gesture lasts. Refreshing either one takes the engine away
-// from the audio thread, so it waits for a stopped transport instead of costing
-// a block. The service is reached here through the editor's poll alone: the
-// control-service timer lives on a message loop a second instance can take
+// block. Compensation preparation must run alongside those blocks and apply
+// without taking the engine away from the audio thread. The service is reached
+// here through the editor's poll alone: the control-service timer lives on a
+// message loop a second instance can take
 // over, so a service that only sampled idleness from the timer would read a
 // playing transport as stopped and open a window on every tick.
 void testDelayBearingEditsDuringPlaybackKeepEveryBlockWet() {
@@ -5260,15 +5287,13 @@ void testDelayBearingEditsDuringPlaybackKeepEveryBlockWet() {
   expect(processor->process(data) == kResultOk,
          "warm the delay-bearing drag test");
 
-  const auto latencyBeforeDrag = processor->getLatencySamples();
   const auto before = PluginProcessorTestAccess::processCounters(*processor);
   const auto failuresBefore =
       PluginProcessorTestAccess::processFailureSequence(*processor);
   std::atomic_bool running{true};
   std::atomic_bool published{true};
   std::atomic<std::uint64_t> serviceTicks{0};
-  // Built once: the Debug allocation guard is process-wide, so this thread must
-  // not reach the heap while a block is in the engine.
+  // Reuse the mailbox payload throughout the gesture.
   auto command = std::make_unique<effetune::vst::AudioCommand>();
   std::array<float, 6> packed{0.0f, 100.0f, 3.0f, 1.0f, 0.0f, -1.0f};
   std::thread control([&] {
@@ -5307,11 +5332,12 @@ void testDelayBearingEditsDuringPlaybackKeepEveryBlockWet() {
   expect(PluginProcessorTestAccess::processFailureSequence(*processor) ==
              failuresBefore,
          "a delay-bearing drag raises no deferred diagnostic");
-  expect(processor->getLatencySamples() == latencyBeforeDrag,
-         "the reported latency waits for a stopped transport instead of taking "
-         "the engine away from a block");
-  expect(PluginProcessorTestAccess::hasPendingControlWork(*processor),
-         "the compensation plan stays outstanding while the transport runs");
+  for (int block = 0; block < 8; ++block) {
+    expect(processor->process(data) == kResultOk, "settle the final drag image while running");
+    PluginProcessorTestAccess::serviceLatencyUpdates(*processor);
+  }
+  expect(!PluginProcessorTestAccess::hasPendingControlWork(*processor),
+         "the final drag compensation converges without stopping the callback");
 
   expect(processor->setActive(false) == kResultOk,
          "deactivate the delay-bearing drag test");
@@ -6241,13 +6267,9 @@ void testTopologyEditsDuringPlaybackRaiseNoDiagnostic() {
 // A stopped transport is not a stopped audio device, and neither of them is what
 // hands the engine to the control service. Hosts keep the audio engine turning
 // for live input monitoring and go on sending ordinary blocks; those blocks stage
-// the parameter images themselves, so pending work waits for them exactly as it
-// waits for a playing transport. What ends the wait is the audio callback going
-// quiet -- a suspend, or a host that simply stops calling process() -- and the
-// deferred plan and latency refreshes must not be stranded until the next edit
-// when it does. The window that opens then costs one block per pending batch and
-// does not recur: once the batch is serviced there is nothing left to claim the
-// engine for.
+// the parameter images themselves and apply prepared compensation. When those
+// callbacks cease entirely, the control owner must finish any pending work
+// without requiring another edit or callback. A settled service claims nothing.
 void testPendingWorkIsServicedWhenTheAudioCallbackQuiesces() {
   auto processor = std::make_unique<EffeTuneProcessor>();
   expect(processor->initialize(nullptr) == kResultOk,
@@ -6284,21 +6306,25 @@ void testPendingWorkIsServicedWhenTheAudioCallbackQuiesces() {
 
   const auto playingCounters = PluginProcessorTestAccess::processCounters(*processor);
   for (int tick = 0; tick < 64; ++tick) {
-    renderBlock("keep playing while the refresh stays deferred");
+    renderBlock("keep playing while the refresh is prepared and applied");
     PluginProcessorTestAccess::serviceLatencyUpdates(*processor);
   }
   const auto afterPlaying = PluginProcessorTestAccess::processCounters(*processor);
   expect(afterPlaying.completedBatches - playingCounters.completedBatches == 64u,
          "a playing transport keeps every block inside the engine");
-  expect(processor->getLatencySamples() == 144u &&
-             PluginProcessorTestAccess::hasPendingControlWork(*processor),
-         "the refresh waits rather than taking the engine from a playing block");
+  expect(processor->getLatencySamples() == 480u &&
+             !PluginProcessorTestAccess::hasPendingControlWork(*processor),
+         "the applied plan converges while playing without taking the engine");
 
   // The transport stops but the host keeps the audio engine running for live
   // input monitoring, so ordinary blocks keep arriving. The audio thread is
-  // still the one staging the images, so the refresh goes on waiting: a window
+  // still the one staging images and applying plans: a control mutation window
   // opened here would cost a block in the middle of ordinary monitoring.
   context.state = 0;
+  const std::array<float, 6> stoppedPacked{0.0f, 100.0f, 2.0f, 1.0f, 0.0f, -1.0f};
+  expect(PluginProcessorTestAccess::publishParameterImage(
+             *processor, *command, 65u, 3039928906u, std::span<const float>(stoppedPacked)),
+         "publish a latency decrease with stopped transport and live monitoring");
   const auto stoppedCounters = PluginProcessorTestAccess::processCounters(*processor);
   for (int tick = 0; tick < 64; ++tick) {
     renderBlock("a stopped transport keeps the audio engine running");
@@ -6308,10 +6334,14 @@ void testPendingWorkIsServicedWhenTheAudioCallbackQuiesces() {
   expect(afterStopped.completedBatches - stoppedCounters.completedBatches == 64u,
          "a stopped transport with a running audio device keeps every block "
          "inside the engine too");
-  expect(processor->getLatencySamples() == 144u &&
-             PluginProcessorTestAccess::hasPendingControlWork(*processor),
-         "and leaves the refresh deferred, because those blocks are still "
-         "staging the images themselves");
+  expect(processor->getLatencySamples() == 96u &&
+             !PluginProcessorTestAccess::hasPendingControlWork(*processor),
+         "the decreased plan also converges while transport is stopped");
+
+  expect(PluginProcessorTestAccess::publishParameterImage(
+             *processor, *command, 65u, 3039928906u, std::span<const float>(packed)),
+         "publish another change just before the callback quiesces");
+  renderBlock("capture a plan before callback quiescence");
 
   // The audio callback goes quiet: the host stopped calling process(). That,
   // and not the transport state, is what hands the engine to the control
@@ -6394,15 +6424,13 @@ void testDelayBearingEditsWithAStoppedTransportKeepEveryBlockWet() {
   expect(processor->process(rig.data) == kResultOk,
          "warm the stopped-transport drag test");
 
-  const auto latencyBeforeDrag = processor->getLatencySamples();
   const auto before = PluginProcessorTestAccess::processCounters(*processor);
   const auto failuresBefore =
       PluginProcessorTestAccess::processFailureSequence(*processor);
   std::atomic_bool running{true};
   std::atomic_bool published{true};
   std::atomic<std::uint64_t> serviceTicks{0};
-  // Built once: the Debug allocation guard is process-wide, so this thread must
-  // not reach the heap while a block is in the engine.
+  // Reuse the mailbox payload throughout the gesture.
   auto command = std::make_unique<effetune::vst::AudioCommand>();
   std::array<float, 6> packed{0.0f, 100.0f, 3.0f, 1.0f, 0.0f, -1.0f};
   std::thread control([&] {
@@ -6453,16 +6481,163 @@ void testDelayBearingEditsWithAStoppedTransportKeepEveryBlockWet() {
   expect(PluginProcessorTestAccess::processFailureSequence(*processor) ==
              failuresBefore,
          "and raises no deferred diagnostic");
-  expect(processor->getLatencySamples() == latencyBeforeDrag,
-         "the reported latency waits for a quiet callback instead of taking the "
-         "engine away from a block");
-  expect(PluginProcessorTestAccess::hasPendingControlWork(*processor),
-         "the compensation plan stays outstanding while the blocks keep coming");
+  for (int block = 0; block < 8; ++block) {
+    expect(processor->process(rig.data) == kResultOk,
+           "settle the stopped-transport drag without stopping callbacks");
+    PluginProcessorTestAccess::serviceLatencyUpdates(*processor);
+  }
+  expect(!PluginProcessorTestAccess::hasPendingControlWork(*processor),
+         "the final stopped-transport compensation converges while blocks keep coming");
 
   expect(processor->setActive(false) == kResultOk,
          "deactivate the stopped-transport drag test");
   expect(processor->terminate() == kResultOk,
          "terminate the stopped-transport drag test");
+}
+
+void testLiveLatencyCommitAlignsWetBypassAndHost() {
+  for (const bool parallel : {false, true}) {
+    for (const int transport : {0, 1, 2}) {
+      auto processor = std::make_unique<EffeTuneProcessor>();
+      expect(processor->initialize(nullptr) == kResultOk, "initialize live latency commit");
+      auto processSetup = setup(48000, 64);
+      expect(processor->setupProcessing(processSetup) == kResultOk, "prepare live latency commit");
+      if (parallel) {
+        installParallelLimiterPipeline(*processor);
+      } else {
+        installLimiterPipeline(*processor, 41);
+      }
+      auto *handler = new TestComponentHandler();
+      handler->latencyProbe = processor.get();
+      expect(processor->setComponentHandler(handler) == kResultOk, "install applied latency probe");
+      expect(processor->setActive(true) == kResultOk, "activate live latency commit");
+      gate_ordering::AudioRig rig(0);
+      ProcessContext context{};
+      context.state = transport == 1 ? ProcessContext::kPlaying : 0;
+      rig.data.processContext = transport == 0 ? nullptr : &context;
+      const auto render = [&] {
+        tresult result;
+        {
+          effetune::allocation_guard::Scope noAudioAllocation;
+          result = processor->process(rig.data);
+        }
+        expect(result == kResultOk, "render through the live latency handoff");
+        context.projectTimeSamples += rig.data.numSamples;
+      };
+      for (int block = 0; block < 16; ++block) {
+        render();
+      }
+      auto command = std::make_unique<effetune::vst::AudioCommand>();
+      const auto publish = [&](const float lookahead) {
+        const std::array<float, 6> image{0, 100, lookahead, 1, 0, -1};
+        expect(PluginProcessorTestAccess::publishParameterImage(
+                   *processor, *command, 41, 3039928906u, image), "publish live lookahead");
+      };
+      const auto settlePlan = [&] {
+        for (int block = 0; block < 8; ++block) {
+          render();
+          PluginProcessorTestAccess::serviceLatencyUpdates(*processor);
+        }
+        expect(!PluginProcessorTestAccess::hasPendingControlWork(*processor),
+               "the matching plan converges with uninterrupted callbacks");
+      };
+      PluginProcessorTestAccess::failPipelinePlanRefreshes(*processor, 1);
+      publish(7);
+      render();
+      PluginProcessorTestAccess::serviceLatencyUpdates(*processor);
+      expect(processor->getLatencySamples() == 144u &&
+                 PluginProcessorTestAccess::enginePipelineLatency(*processor) == 144u,
+             "a preparation failure leaves both applied latency and bypass unchanged");
+      expect(pumpMainThreadUntil([&] {
+               render();
+               PluginProcessorTestAccess::serviceLatencyUpdates(*processor);
+               return processor->getLatencySamples() == 336u;
+             }, std::chrono::milliseconds(500)),
+             "bounded preparation retry recovers while callbacks keep running");
+      settlePlan();
+      const auto beforeStale = processor->getLatencySamples();
+      // Prepare 10 ms, then stage a newer value at the very apply boundary.
+      // Neither dry delay nor public latency may adopt the obsolete result.
+      publish(10);
+      render();
+      PluginProcessorTestAccess::serviceLatencyUpdates(*processor);
+      publish(5);
+      render();
+      expect(processor->getLatencySamples() == beforeStale,
+             "a stale prepared result cannot advance public or dry latency");
+      PluginProcessorTestAccess::serviceLatencyUpdates(*processor);
+      settlePlan();
+      expect(processor->getLatencySamples() == 240u, "a fresh result replaces the stale update");
+
+      const auto before = PluginProcessorTestAccess::processCounters(*processor);
+      std::uint64_t renderedBlocks = 0;
+      for (const float lookahead : {10.0f, 2.0f, 1.0f}) {
+        publish(lookahead);
+        settlePlan();
+        renderedBlocks += 8;
+        const auto expected = static_cast<std::uint32_t>(
+            (parallel ? std::max(lookahead, 3.0f) : lookahead) * 48);
+        expect(processor->getLatencySamples() == expected,
+               "host reports the successful applied increase or decrease");
+        for (const bool bypass : {false, true}) {
+          ParameterChanges changes(1);
+          int32 index = 0;
+          auto *queue = changes.addParameterData(kBypassParameterId, index);
+          expect(queue && queue->addPoint(0, bypass ? 1.0 : 0.0, index) == kResultTrue,
+                 "set master bypass at the block boundary");
+          rig.data.inputParameterChanges = &changes;
+          render();
+          ++renderedBlocks;
+          rig.data.inputParameterChanges = nullptr;
+          rig.inputLeft.fill(0);
+          rig.inputRight.fill(0);
+          for (int block = 0; block < 16; ++block) {
+            render();
+            ++renderedBlocks;
+          }
+          std::array<std::uint32_t, 2> peaks{};
+          std::array<float, 2> magnitudes{};
+          for (std::uint32_t block = 0; block < 12; ++block) {
+            rig.inputLeft.fill(0);
+            rig.inputRight.fill(0);
+            if (block == 0) {
+              rig.inputLeft[0] = 0.25f;
+              rig.inputRight[0] = 0.25f;
+            }
+            render();
+            ++renderedBlocks;
+            for (std::uint32_t channel = 0; channel < 2; ++channel) {
+              for (std::uint32_t frame = 0; frame < 64; ++frame) {
+                const auto value = std::abs(rig.outputChannels[channel][frame]);
+                if (value > magnitudes[channel]) {
+                  magnitudes[channel] = value;
+                  peaks[channel] = block * 64 + frame;
+                }
+              }
+            }
+          }
+          expect(peaks[0] == expected && peaks[1] == expected &&
+                     magnitudes[0] > 0.2f && magnitudes[1] > 0.2f,
+                 "wet and master-bypass impulses match applied host latency");
+        }
+      }
+      const auto after = PluginProcessorTestAccess::processCounters(*processor);
+      expect(after.completedBatches - before.completedBatches == renderedBlocks &&
+                 after.processFailures == before.processFailures,
+             "every block is processed across preparation, apply and retirement");
+      expect(pumpMainThreadUntil([&] {
+               render();
+               PluginProcessorTestAccess::serviceLatencyUpdates(*processor);
+               return handler->latencyRestartCount != 0;
+             }, std::chrono::milliseconds(500)),
+             "the control thread notifies latency while callbacks continue");
+      expect(!handler->latencyMismatch, "every host notification observes the applied plan");
+      handler->latencyProbe = nullptr;
+      expect(processor->setComponentHandler(nullptr) == kResultOk, "remove applied latency probe");
+      expect(processor->setActive(false) == kResultOk, "deactivate live latency commit");
+      expect(processor->terminate() == kResultOk, "terminate live latency commit");
+    }
+  }
 }
 
 // A plan or latency refresh that keeps failing is control work, and the audio
@@ -8577,13 +8752,16 @@ void testLinkedMultiParameterBatchIsOneHostGroupEdit() {
   // produce from a single drag.
   constexpr std::size_t kLinkedChannels = 8;
   const auto panelPlugin = [](const char *volumes) {
+    constexpr std::size_t kPackedParameterCount = 79;
+    std::string packedParameters = "0";
+    for (std::size_t index = 1; index < kPackedParameterCount; ++index) {
+      packedParameters += ",0";
+    }
     return std::string{R"({"id":81,"type":"MultiChannelPanelPlugin",)"
                        R"("name":"Multi Channel Panel","enabled":true,)"
                        R"("parameters":{"v":)"} +
            volumes + R"(,"d":[0,0,0,0,0,0,0,0]},"wasmParams":[)" +
-           std::string("0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,"
-                       "0,0,0,0,0,0,0,0,0,0,0,0") +
-           R"(],"wasmParamsHash":4191368224})";
+           packedParameters + R"(],"wasmParamsHash":2638026937})";
   };
   const auto installed = choc::json::parse(processor->handleUiMessage(
       std::string{R"({"type":"pipeline/rebuild","payload":{"pipeline":"A",)"
@@ -8921,6 +9099,81 @@ void testDisplayStringsCarryTheStepsOwnDecimalCount() {
          "the saved document still carries the plug-in");
   return choc::json::parse(savedPlugin->parametersJson)[key.c_str()]
       .getWithDefault<std::string>({});
+}
+
+void testSteppedIntegerAutomationMatchesStateTextAndAudio() {
+  auto processor = std::make_unique<EffeTuneProcessor>();
+  expect(processor->initialize(nullptr) == kResultOk, "initialize stepped integer automation");
+  auto processSetup = setup(48000, 64);
+  expect(processor->setupProcessing(processSetup) == kResultOk,
+         "prepare stepped integer automation");
+  const auto installed = choc::json::parse(processor->handleUiMessage(
+      R"({"type":"pipeline/rebuild","payload":{"pipeline":"A","plugins":[)"
+      R"({"id":181,"type":"PhaserPlugin","name":"Phaser","enabled":true,)"
+      R"("parameters":{"md":"Classic","rt":0.5,"cf":1000,"rg":3,"st":6,)"
+      R"("fb":20,"sp":90,"dr":"Up","mx":50},)"
+      R"("wasmParams":[0,0.5,1000,3,6,20,90,0,50],"wasmParamsHash":2823426285},)"
+      R"({"id":182,"type":"BandPassFilterPlugin","name":"Band Pass","enabled":true,)"
+      R"("parameters":{"hf":1000,"lf":1000,"hs":-24,"ls":-24},)"
+      R"("wasmParams":[1000,1000,-24,-24],"wasmParamsHash":2360494665}]}})"));
+  expect(installed["ok"].getWithDefault<bool>(false), "install the real Phaser stage target");
+  const auto stagesId = boundAutomationParameterId(
+      *processor, {'A', 181, "PhaserPlugin", "st", 0});
+  const auto slopeId = boundAutomationParameterId(
+      *processor, {'A', 182, "BandPassFilterPlugin", "hs", 0});
+  ParameterInfo info{};
+  expect(processor->getParameterInfoByTag(stagesId, info) == kResultTrue &&
+             info.stepCount == 5 && info.defaultNormalizedValue == 0.4 &&
+             processor->getParamNormalized(stagesId) == 0.4,
+         "Phaser defaults and current six stages occupy position 0.4");
+  expect(processor->setActive(true) == kResultOk, "activate stepped integer automation");
+  expect(processor->setParamNormalized(stagesId, 1.0) == kResultTrue &&
+             savedPluginParameter(*processor, 181, "st") == 12.0,
+         "a controller-only maximum writes twelve stages to saved state");
+  gate_ordering::AudioRig rig(0.1f);
+  constexpr std::array positions{0.0, 0.4, 1.0};
+  constexpr std::array stages{2, 6, 12};
+  for (std::size_t index = 0; index < positions.size(); ++index) {
+    const auto text = std::to_string(stages[index]);
+    expect(displayString(*processor, stagesId, positions[index]) == text,
+           "host display prints the stepped stage count");
+    ParamValue parsed = -1;
+    expect(processor->getParamValueByString(stagesId, utf16Of(text).data(), parsed) ==
+               kResultTrue && parsed == positions[index],
+           "typed stage counts round-trip to the matching normalized position");
+    ParameterChanges changes(1);
+    int32 queueIndex = 0;
+    auto *queue = changes.addParameterData(stagesId, queueIndex);
+    int32 pointIndex = 0;
+    expect(queue && queue->addPoint(0, positions[index], pointIndex) == kResultTrue,
+           "queue the host stage position");
+    rig.data.inputParameterChanges = &changes;
+    tresult processed;
+    {
+      effetune::allocation_guard::Scope noAudioAllocation;
+      processed = processor->process(rig.data);
+    }
+    rig.data.inputParameterChanges = nullptr;
+    expect(processed == kResultOk &&
+               PluginProcessorTestAccess::runtimePackedParameter(*processor, 181, 4) ==
+                   stages[index] &&
+               savedPluginParameter(*processor, 181, "st") == stages[index],
+           "the real-time parameter image and saved state match the host stage count");
+  }
+  ParamValue refused = -1;
+  expect(processor->getParamValueByString(stagesId, utf16Of("7").data(), refused) ==
+             kResultFalse && refused == -1,
+         "an unrepresentable stage count is not silently rounded to another value");
+  ParamValue slope = -1;
+  expect(displayString(*processor, slopeId, 0.25) == "-36" &&
+             processor->getParamValueByString(slopeId, utf16Of("-36").data(), slope) ==
+                 kResultTrue && slope == 0.25,
+         "negative nondefault slope text round-trips with a twelve-unit step");
+  expect(processor->getParamValueByString(slopeId, utf16Of("-42").data(), refused) ==
+             kResultFalse && refused == -1,
+         "a typed slope outside its step grid is refused");
+  expect(processor->setActive(false) == kResultOk, "deactivate stepped integer automation");
+  expect(processor->terminate() == kResultOk, "terminate stepped integer automation");
 }
 
 // State chunks become the save/UI authority before the WebView replacement is
@@ -10355,6 +10608,7 @@ int main() {
     testTopologyEditsDuringPlaybackRaiseNoDiagnostic();
     testPendingWorkIsServicedWhenTheAudioCallbackQuiesces();
     testDelayBearingEditsWithAStoppedTransportKeepEveryBlockWet();
+    testLiveLatencyCommitAlignsWetBypassAndHost();
     testRefreshFailuresStayOffTheAudioDiagnosticBurst();
     testHostRefusedGestureStillAdoptsTheUserValue();
     testOpenTouchOutranksHostAutomationInput();
@@ -10385,6 +10639,7 @@ int main() {
     testLinkedMultiParameterBatchIsOneHostGroupEdit();
     testBoundSlotsRenderDenormalizedDisplayStrings();
     testDisplayStringsCarryTheStepsOwnDecimalCount();
+    testSteppedIntegerAutomationMatchesStateTextAndAudio();
     testInvalidStatePipelineNeverReplacesTheAuthority();
     testStructuredParameterShapeChangeRebuildsTheRuntime();
     testStaleBulkRequestsCannotCrossStateReplacement();

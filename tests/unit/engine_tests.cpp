@@ -1,7 +1,9 @@
 #include "bridge/state_codec.h"
 #include "bridge/message_router.h"
 #include "bridge/config_store.h"
+#include "bridge/preset_store.h"
 #include "engine/block_adapter.h"
+#include "engine/automation_catalog.h"
 #include "engine/command_queue.h"
 #include "engine/dry_delay.h"
 #include "engine/engine_host.h"
@@ -57,6 +59,21 @@ void testDescriptor() {
   expect(bytes[20] == 103u && bytes[25] == 1u && bytes[26] == 0u,
          "second descriptor node");
   expect(static_cast<std::int8_t>(bytes[27]) == 17, "paired channel encoding");
+
+  PipelineState extendedChannels;
+  extendedChannels.plugins = {
+      PluginState{4, "Ch 9", true, 0, 0, std::string("9")},
+      PluginState{5, "Ch 16", true, 0, 0, std::string("16")},
+      PluginState{6, "Ch 9+10", true, 0, 0, std::string("910")},
+      PluginState{7, "Ch 15+16", true, 0, 0, std::string("1516")},
+  };
+  const auto extendedBytes = encodePipelineDescriptor(
+      extendedChannels, [](const std::uint32_t id) { return id; }, false);
+  expect(static_cast<std::int8_t>(extendedBytes[15]) == 8 &&
+             static_cast<std::int8_t>(extendedBytes[27]) == 15 &&
+             static_cast<std::int8_t>(extendedBytes[39]) == 20 &&
+             static_cast<std::int8_t>(extendedBytes[51]) == 23,
+         "sixteen-channel descriptor encoding");
 
   pipeline.plugins[0].enabled = false;
   const auto inactive = encodePipelineDescriptor(
@@ -173,6 +190,52 @@ void testOutputTransition() {
   transition.apply(outputPointers.data(), dryPointers.data(), channels, 0, 1000.0, true);
 }
 
+void testSteppedIntegerAutomationCatalog() {
+  PluginStateDocument document;
+  document.pipelineA.plugins = {
+      PluginState{81, "Phaser", true, 0, 0, std::nullopt, R"({"st":6})", false,
+                  R"({"type":"PhaserPlugin"})"},
+      PluginState{82, "Band Pass", true, 0, 0, std::nullopt, R"({"hs":-24})", false,
+                  R"({"type":"BandPassFilterPlugin"})"}};
+  const auto targets = generatedAutomationTargets(document);
+  for (const auto &target : targets) {
+    const auto phaser = target.identity.pluginType == "PhaserPlugin";
+    const std::array<double, 3> values = phaser ? std::array{2.0, 6.0, 12.0}
+                                               : std::array{-48.0, -24.0, 0.0};
+    const std::array<double, 3> positions = phaser ? std::array{0.0, 0.4, 1.0}
+                                                  : std::array{0.0, 0.5, 1.0};
+    expect(target.normalization == AutomationValueNormalization::integer &&
+               target.step == (phaser ? 2.0 : 12.0) &&
+               target.defaultNormalized == positions[1] &&
+               target.currentNormalized == positions[1],
+           "generated integer defaults and current values use the declared step");
+    const AutomationDenormalization conversion{
+        target.normalization, target.transform, target.transformReference,
+        target.minimum, target.maximum, target.stepCount, target.step};
+    expect(!automationNormalizedFromPublicValue(conversion, phaser ? 7.0 : -42.0),
+           "typed values outside the integer step grid are refused");
+    auto capacityExhausted = false;
+    const auto slot = bindAutomationTarget(document, targets, target.identity, capacityExhausted);
+    expect(slot.has_value() && !capacityExhausted, "bind the generated stepped integer");
+    const auto &binding = document.automation.bindings[*slot];
+    for (std::size_t index = 0; index < values.size(); ++index) {
+      expect(automationPublicValue(conversion, positions[index]) == values[index] &&
+                 denormalizeAutomationPackedValue(target, positions[index]) == values[index] &&
+                 automationNormalizedFromPublicValue(conversion, values[index]) == positions[index],
+             "integer endpoints and midpoint round-trip through their step");
+      expect(applyAutomationNormalizedValue(document, binding, positions[index]),
+             "apply the stepped normalized value to native state");
+      const auto current = generatedAutomationTargets(document);
+      const auto found = std::find_if(current.begin(), current.end(), [&](const auto &item) {
+        return item.identity == target.identity;
+      });
+      expect(found != current.end() && found->currentNormalized == positions[index],
+             "saved integer state normalizes back to the host position");
+    }
+  }
+  expect(targets.size() == 2, "both real non-unit integer descriptors are exercised");
+}
+
 void testDryDelayLine() {
   static_assert(noexcept(std::declval<DryDelayLine &>().process(nullptr, 0, 0)));
 
@@ -211,6 +274,25 @@ void testDryDelayLine() {
   expect(output != nullptr &&
              std::equal(output[0], output[0] + 4, expectedAfterGrow.begin()),
          "dry delay grow preserves the latest available history");
+
+  DryDelayLine::Update update;
+  expect(DryDelayLine::prepareUpdate(update, 1, 6), "prepare dry growth off audio");
+  delay.applyUpdate(update);
+  expect(!update.history.empty(), "retired dry storage remains owned by the update");
+  input[0] = active.data();
+  output = delay.process(input, 1, 4);
+  constexpr std::array expectedPreparedGrow{0.0f, 4.0f, 5.0f, 6.0f};
+  expect(output && std::equal(output[0], output[0] + 4, expectedPreparedGrow.begin()),
+         "prepared dry growth preserves all retained history without allocation");
+  expect(DryDelayLine::prepareUpdate(update, 1, 2), "prepare dry shrink off audio");
+  const auto *preparedStorage = update.history.data();
+  delay.applyUpdate(update);
+  expect(update.history.data() == preparedStorage,
+         "dry shrink retains active capacity and never frees it");
+  output = delay.process(input, 1, 4);
+  constexpr std::array expectedShrink{3.0f, 4.0f, 1.0f, 2.0f};
+  expect(output && std::equal(output[0], output[0] + 4, expectedShrink.begin()),
+         "dry shrink keeps the latest samples");
 }
 
 void testConfigStore() {
@@ -712,6 +794,16 @@ void testMessageRouter() {
              message.assetByteSize == 2432 && message.operationRevision == 7,
          "DSP asset begin routing");
   expect(MessageRouter::decode(
+             R"({"type":"pipeline/assetBegin","payload":{"pluginId":44,"slot":0,"formatTag":1,"channels":16,"frames":600,"topology":4,"headBlock":128,"rateDivider":1,"pathCount":16,"inputCount":16,"processingChannels":8,"footprintBytes":4194304,"byteSize":2432,"operationRevision":8}})",
+             message, &error) && message.asset.channels == 16 &&
+             message.asset.pathCount == 16 && message.asset.inputCount == 16 &&
+             message.asset.processingChannels == EngineHost::kMaxChannels,
+         "DSP asset routing accepts the upstream source width at the VST processing limit");
+  expect(!MessageRouter::decode(
+             R"({"type":"pipeline/assetBegin","payload":{"pluginId":44,"slot":0,"formatTag":1,"channels":16,"frames":600,"topology":4,"headBlock":128,"rateDivider":1,"pathCount":16,"inputCount":8,"processingChannels":9,"footprintBytes":4194304,"byteSize":2432,"operationRevision":8}})",
+             message, &error),
+         "DSP asset routing rejects processing wider than the VST engine");
+  expect(MessageRouter::decode(
              R"({"type":"pipeline/assetChunk","payload":{"pluginId":44,"slot":0,"operationRevision":7,"offset":192,"data":"AQID"}})",
              message, &error) && message.action == UiAction::appendPluginAsset &&
              message.asset.logicalId == 44 && message.assetOffset == 192 &&
@@ -783,6 +875,49 @@ void testMessageRouter() {
   expect(MessageRouter::decode(R"({"type":"telemetry/discard"})", message, &error) &&
              message.action == UiAction::discardTelemetry,
          "telemetry discard routing");
+}
+
+void testPresetStoreRouting() {
+  const auto testDirectory = std::filesystem::temp_directory_path() /
+                             ("effetune-vst-preset-store-" +
+                              std::to_string(std::chrono::steady_clock::now()
+                                                 .time_since_epoch()
+                                                 .count()));
+  struct Cleanup {
+    std::filesystem::path path;
+    ~Cleanup() {
+      std::error_code error;
+      std::filesystem::remove_all(path, error);
+    }
+  } cleanup{testDirectory};
+
+  PresetStore store(testDirectory / "effetune_presets.json");
+  RoutedUiMessage message;
+  std::string error;
+  expect(MessageRouter::decode(
+             R"({"type":"storage/writeFile","payload":{"path":"vst-user-data/effetune_plugin_presets.json","content":"{\"plugin\":1}"}})",
+             message, &error) && message.action == UiAction::storageWriteFile &&
+             store.write(message.path, message.content, &error),
+         "effect preset write follows the native storage route: " + error);
+  expect(store.write("vst-user-data/effetune_presets.json", "{\"pipeline\":2}",
+                     &error),
+         "pipeline preset write: " + error);
+
+  std::string pluginPresets;
+  std::string pipelinePresets;
+  expect(store.exists("vst-user-data/effetune_plugin_presets.json") &&
+             store.exists("vst-user-data/effetune_presets.json") &&
+             store.read("vst-user-data/effetune_plugin_presets.json", pluginPresets,
+                        &error) &&
+             store.read("vst-user-data/effetune_presets.json", pipelinePresets,
+                        &error) &&
+             pluginPresets == "{\"plugin\":1}" &&
+             pipelinePresets == "{\"pipeline\":2}",
+         "effect and pipeline preset stores remain physically isolated: " + error);
+  expect(!store.handles("vst-user-data/other.json") &&
+             !store.exists("vst-user-data/other.json") &&
+             !store.write("vst-user-data/other.json", "{}", &error),
+         "preset storage rejects every basename outside the allowlist");
 }
 
 void testResampler() {
@@ -875,6 +1010,11 @@ void testEngineHost() {
              !engine.tryProcessBlock(channels, 2, EngineHost::kMaxProcessFrames + 1u,
                                      0.2, false),
          "engine enforces the variable process-frame bounds");
+
+  EngineHost unsupportedWidth;
+  expect(!unsupportedWidth.prepare(48000.0, EngineHost::kMaxChannels + 1u,
+                                   EngineHost::kDefaultTelemetryBytes, &error),
+         "engine preserves the eight-channel bus boundary");
 
   pipeline.plugins[0].enabled = false;
   AudioCommand descriptorCommand;
@@ -994,6 +1134,41 @@ void testContextualBypassPreservesCrossBusRouting() {
   render();
   expect(std::abs(left[0] - 1.25f) < 1.0e-7f && right[0] == -1.0f,
          "re-admission restores the dormant original runtime image");
+
+  {
+    EngineHost dormantEngine;
+    expect(dormantEngine.prepare(48000.0, EngineHost::kMaxChannels,
+                                 EngineHost::kDefaultTelemetryBytes, &error),
+           "dormant wider-route engine prepare: " + error);
+    const auto dormantKernel = dormantEngine.kernels().find("TestGainPlugin");
+    expect(dormantKernel != dormantEngine.kernels().end(),
+           "dormant wider-route test-gain kernel");
+    PipelineState dormantPipeline;
+    dormantPipeline.plugins = {
+        PluginState{87, "Restored channel 9", true, 0, 0, std::string("9")}};
+    RuntimePlugin dormantRuntime;
+    dormantRuntime.logicalId = 87;
+    dormantRuntime.type = "TestGainPlugin";
+    dormantRuntime.packedParameters = {0.5f};
+    dormantRuntime.paramsHash = dormantKernel->second.paramsHash;
+    std::array<std::array<float, EngineHost::kMaxProcessFrames>,
+               EngineHost::kMaxChannels>
+        dormantSamples{};
+    std::array<float *, EngineHost::kMaxChannels> dormantChannels{};
+    for (std::size_t channel = 0; channel < dormantSamples.size(); ++channel) {
+      dormantSamples[channel].fill(static_cast<float>(channel + 1u));
+      dormantChannels[channel] = dormantSamples[channel].data();
+    }
+    expect(dormantEngine.rebuild(dormantPipeline, {dormantRuntime}, &error) &&
+               dormantEngine.tryProcessBlock(
+                   dormantChannels.data(), EngineHost::kMaxChannels,
+                   EngineHost::kMaxProcessFrames, 0.0, false),
+           "upstream range checks keep a restored wider route dormant: " + error);
+    for (std::size_t channel = 0; channel < dormantSamples.size(); ++channel) {
+      expect(dormantSamples[channel][0] == static_cast<float>(channel + 1u),
+             "dormant channel-9 route leaves every VST channel unchanged");
+    }
+  }
 
   {
     EngineHost monoEngine;
@@ -1132,9 +1307,12 @@ void testEngineAssetTransferAndReplay() {
   expect(engine.setAsset(asset, &error), "IR reverb asset staging: " + error);
   expect((engine.assetState(91, 0) & 0xffu) == ET_ASSET_STATE_PREPARING,
          "IR reverb asset enters preparing state");
-  expect(engine.pipelineLatency() == 128u &&
+  expect(engine.pipelineLatency() == 0u &&
              engine.pipelinePlanRevision() > planRevisionBeforeAsset,
-         "asset commit publishes its latency before another audio block is rendered");
+         "asset commit requests compensation without publishing an unapplied plan");
+  std::uint64_t refreshedAssetRevision = 0;
+  expect(engine.refreshPipelinePlan(refreshedAssetRevision, &error),
+         "apply staged asset compensation");
 
   std::array<float, EngineHost::kMaxProcessFrames> left{};
   std::array<float, EngineHost::kMaxProcessFrames> right{};
@@ -1202,9 +1380,12 @@ void testEngineAssetTransferAndReplay() {
   expect(engine.clearAsset(91, 0), "IR reverb asset clear");
   expect((engine.assetState(91, 0) & 0xffu) == ET_ASSET_STATE_NONE,
          "IR reverb asset clear resets native state");
-  expect(engine.pipelineLatency() == 0u &&
+  expect(engine.pipelineLatency() == 128u &&
              engine.pipelinePlanRevision() > activePlanRevision,
-         "cleared IR reverb removes latency and requests compensation refresh");
+         "cleared IR reverb requests compensation refresh before changing applied latency");
+  expect(engine.refreshPipelinePlan(refreshedAssetRevision, &error) &&
+             engine.pipelineLatency() == 0u,
+         "cleared asset latency is published after applying its plan");
 }
 
 void testRuntimeLatencyAndTelemetryPublication() {
@@ -1285,9 +1466,18 @@ void testRuntimeLatencyAndTelemetryPublication() {
   const auto previousRevision = engine.latencyRevision();
   expect(engine.tryProcessBlock(channels, 2, EngineHost::kMaxProcessFrames, 1.0, false, &queue),
          "apply variable-latency parameter update");
-  expect(engine.pipelineLatency() == 480u, "updated limiter lookahead latency");
-  expect(engine.latencyRevision() > previousRevision,
-         "audio-thread latency update must publish a new revision");
+  expect(engine.pipelineLatency() == 144u && engine.latencyRevision() == previousRevision,
+         "parameter staging preserves the applied limiter latency");
+  std::uint32_t plannedLatency = 0;
+  std::uint64_t appliedLatencyRevision = 0;
+  expect(engine.capturePipelineLatencyUpdate() &&
+             engine.preparePipelineLatencyUpdate(plannedLatency) && plannedLatency == 480u &&
+             engine.pipelineLatency() == 144u,
+         "prepared compensation is not advertised as applied");
+  expect(engine.applyPipelineLatencyUpdate(appliedLatencyRevision) &&
+             engine.pipelineLatency() == 480u && engine.latencyRevision() > previousRevision,
+         "audio-boundary application publishes the new limiter latency");
+  engine.discardPipelineLatencyUpdate();
 
   pipeline.plugins[0].enabled = false;
   expect(engine.makeDescriptorCommand(pipeline, std::span<const RuntimePlugin>(&runtime, 1),
@@ -1394,12 +1584,14 @@ int main() {
     testQueue();
     testOutputTransition();
     testDryDelayLine();
+    testSteppedIntegerAutomationCatalog();
     testConfigStore();
     testBlockAdapter();
     testBlockSizeMatrix();
     testLatency();
     testStateCodec();
     testMessageRouter();
+    testPresetStoreRouting();
     testResampler();
     testEngineHost();
     testContextualBypassPreservesCrossBusRouting();

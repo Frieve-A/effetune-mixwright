@@ -27,6 +27,10 @@ const pipelineAiDialog = await readFile(
   path.join(assets, 'js', 'ui', 'pipeline', 'pipeline-ai-dialog.js'), 'utf8');
 const browserAudioManager = await readFile(path.join(assets, 'js', 'audio-manager.js'), 'utf8');
 const pipelineManager = await readFile(path.join(assets, 'js', 'ui', 'pipeline-manager.js'), 'utf8');
+const routingDialog = await readFile(
+  path.join(assets, 'js', 'ui', 'pipeline', 'pipeline-routing-dialog.js'), 'utf8');
+const pluginPresetStore = await readFile(
+  path.join(assets, 'js', 'ui', 'pipeline', 'plugin-preset-store.js'), 'utf8');
 const clipboard = await readFile(
   path.join(assets, 'js', 'ui', 'pipeline', 'clipboard-manager.js'), 'utf8');
 const history = await readFile(
@@ -59,6 +63,9 @@ const requiredFiles = [
   'plugins/lofi/vinyl_simulator.js',
   'presets/presets.txt',
   'features/measurement/dataStorage.js',
+  'features/measurement/measurement-model.js',
+  'features/measurement/audio-utils/channel-selection.js',
+  'features/measurement/audio-utils/output-routing.js',
   'js/locales/en.json5',
   'js/locales/ja.json5'
 ];
@@ -146,6 +153,22 @@ if (!bootstrap.includes('const needsHomeKeyForEditing = target => {') ||
 }
 if (!app.includes("../vst-audio-manager.js")) {
   throw new Error('The application module was not redirected to the VST audio adapter');
+}
+if (!routingDialog.includes('for (let i = 3; i <= 8; i++)') ||
+    !routingDialog.includes(
+      'channelOptions.some(option => option.value === currentChannelValue)') ||
+    !routingDialog.includes('Unavailable in this plug-in (${currentChannelValue})') ||
+    !routingDialog.includes('optionEl.disabled = option.disabled === true;') ||
+    ['910', '1112', '1314', '1516'].some(
+      value => routingDialog.includes(`value: '${value}'`)) ||
+    routingDialog.includes('for (let i = 3; i <= 16; i++)')) {
+  throw new Error('The VST routing dialog does not enforce its eight-channel selection boundary');
+}
+if (!pluginPresetStore.includes("const STORAGE_FILE = 'effetune_plugin_presets.json';") ||
+    !pluginPresetStore.includes('window.electronAPI.fileExists(filePath)') ||
+    !pluginPresetStore.includes('window.electronAPI.readFile(filePath)') ||
+    !pluginPresetStore.includes('window.electronAPI.saveFile(filePath')) {
+  throw new Error('Effect presets are not routed through the dedicated VST storage file');
 }
 const hasLegacyVstDualPipelinePatch =
   app.includes('legacy single-pipeline path should force pipeline A');
@@ -265,6 +288,9 @@ if (!bootstrap.includes('.config-dialog .config-dialog-content { display: block 
     !bootstrap.includes('.config-dialog .device-section:has(#language-select) { display: block !important; }') ||
     !bootstrap.includes('.config-dialog .config-dialog-power-column { display: none !important; }')) {
   throw new Error('The VST settings dialog is not restricted to the language setting');
+}
+if (bootstrap.includes('.pipeline-header-right')) {
+  throw new Error('The VST shim overrides the upstream pipeline header alignment');
 }
 if (!bootstrap.includes("helpButton.id = 'helpSettingsButton';") ||
     !bootstrap.includes("[helpButton, 'menu.help.help', 'Help']") ||
@@ -743,7 +769,10 @@ for (const excluded of [
 }
 
 const visitedModules = new Set();
-const pendingModules = [path.join(assets, 'js', 'app.js')];
+const pendingModules = [
+  path.join(assets, 'js', 'app.js'),
+  path.join(assets, 'vst-bootstrap.js')
+];
 while (pendingModules.length > 0) {
   const modulePath = pendingModules.pop();
   if (visitedModules.has(modulePath)) continue;

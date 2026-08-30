@@ -319,6 +319,31 @@ void testEnumerationSlotsArePublishedAsLists() {
          "an unbound slot carries no list flag");
 }
 
+void testGeneratedSteppedIntegerMetadata() {
+  ParameterContainer parameters;
+  AutomationParameterBank bank;
+  expect(bank.registerParameters(parameters), "register the stepped integer parameter bank");
+  PluginStateDocument document;
+  document.pipelineA.plugins = {
+      PluginState{81, "Phaser", true, 0, 0, std::nullopt, R"({"st":12})", false,
+                  R"({"type":"PhaserPlugin"})"}};
+  const auto targets = generatedAutomationTargets(document);
+  expect(targets.size() == 1, "resolve the real Phaser stages descriptor");
+  auto capacityExhausted = false;
+  const auto slot = bindAutomationTarget(document, targets, targets[0].identity,
+                                         capacityExhausted);
+  expect(slot.has_value() && !capacityExhausted, "bind Phaser stages");
+  AutomationBindingRegistry registry;
+  (void)registry.reconcile(document, targets);
+  expect(bank.apply(registry), "publish Phaser stages metadata");
+  const auto *parameter = parameters.getParameter(automationParameterId(*slot));
+  expect(parameter != nullptr && parameter->getInfo().stepCount == 5 &&
+             parameter->getInfo().defaultNormalizedValue == 0.4 &&
+             parameter->getNormalized() == 1.0 &&
+             (parameter->getInfo().flags & ParameterInfo::kIsList) == 0,
+         "six integer stage choices publish five steps, default six and current twelve");
+}
+
 } // namespace
 
 int main() {
@@ -329,6 +354,7 @@ int main() {
     testActiveMetadataIsRepublishedAfterReinitialize();
     testValueOnlyChangeIsNotAMetadataChange();
     testEnumerationSlotsArePublishedAsLists();
+    testGeneratedSteppedIntegerMetadata();
     std::cout << "EffeTune automation parameter bank tests passed\n";
     return 0;
   } catch (const std::exception &exception) {

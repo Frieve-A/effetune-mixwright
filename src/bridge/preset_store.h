@@ -9,6 +9,7 @@ namespace effetune::vst {
 class PresetStore {
 public:
   PresetStore();
+  explicit PresetStore(std::filesystem::path presetPath);
 
   [[nodiscard]] bool handles(std::string_view virtualPath) const;
   [[nodiscard]] bool exists(std::string_view virtualPath) const;
@@ -20,9 +21,12 @@ public:
 
 private:
   [[nodiscard]] static std::filesystem::path resolvePresetPath();
+  [[nodiscard]] const std::filesystem::path *
+  pathForVirtualFile(std::string_view virtualPath) const noexcept;
   static void setError(std::string *destination, std::string value);
 
   std::filesystem::path presetPath_;
+  std::filesystem::path pluginPresetPath_;
 };
 
 } // namespace effetune::vst

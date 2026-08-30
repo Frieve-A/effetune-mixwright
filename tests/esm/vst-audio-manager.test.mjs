@@ -1973,8 +1973,11 @@ test('the deltas one packet carries for a plug-in cost a single parameter write'
     source.indexOf('\n  async synchronizeNativeContext(',
       source.indexOf('  applyHostAutomationDeltas(')));
   vm.runInNewContext(`this.Manager = class {${classBody}\n};`, context);
-  const descriptors = context.DSP_AUTOMATION_CATALOG.PhaserPlugin.slice(0, 2);
+  const descriptors = ['md', 'rt'].map(key =>
+    context.DSP_AUTOMATION_CATALOG.PhaserPlugin.find(descriptor => descriptor.key === key));
   assert.equal(descriptors.length, 2, 'the plug-in exposes several automation lanes');
+  assert.equal(descriptors[0]?.kind, 'enum', 'Phaser mode is the public enum lane');
+  assert.equal(descriptors[1]?.normalization, 'log', 'Phaser rate remains numeric storage');
   const writes = [];
   // Mirrors the upstream parameter wrapper: every write packs the plug-in's whole
   // parameter image, which is the cost a take moving several lanes multiplies.
@@ -2012,25 +2015,95 @@ test('the deltas one packet carries for a plug-in cost a single parameter write'
   });
 
   manager.applyHostAutomationDeltas([
-    delta(23, descriptors[0], 0.2),
-    delta(24, descriptors[0], 0.4),
+    delta(23, descriptors[0], 1),
+    delta(24, descriptors[0], 0),
     delta(23, descriptors[1], 0.3)
   ]);
 
   assert.deepEqual(writes, [23, 24],
     'each plug-in in the packet is written once, however many of its lanes moved');
   for (const [index, descriptor] of descriptors.entries()) {
-    const normalized = [0.2, 0.3][index];
+    const normalized = [1, 0.3][index];
+    const storageValue = moved.parameters[descriptor.field];
+    const retained = descriptor.kind === 'enum' || descriptor.kind === 'bool'
+      ? storageValue : context.unpackDSPAutomationValue(descriptor, storageValue);
     assert.equal(port.adoptedAutomationValues.get(`A:23:PhaserPlugin:${descriptor.key}:0`),
-      context.normalizeDSPAutomationValue(descriptor, context.unpackDSPAutomationValue(
-        descriptor, moved.parameters[descriptor.field])),
+      context.normalizeDSPAutomationValue(descriptor, retained),
       'every lane of the batched write still adopts the value the plug-in retained');
-    assert.ok(Math.abs(moved.parameters[descriptor.field] -
-      context.denormalizeDSPAutomationValue(descriptor, normalized)) < 1e-9,
-    'and every lane still reaches the plug-in');
+    assert.equal(storageValue, descriptor.kind === 'enum'
+      ? descriptor.values.at(-1)
+      : context.packDSPAutomationValue(
+        descriptor, context.denormalizeDSPAutomationValue(descriptor, normalized)),
+    'and every lane still reaches the plug-in in its public or numeric storage form');
   }
-  assert.ok(Math.abs(other.parameters[descriptors[0].field] -
-    context.denormalizeDSPAutomationValue(descriptors[0], 0.4)) < 1e-9);
+  assert.equal(other.parameters[descriptors[0].field], descriptors[0].default);
+});
+
+test('public enum and bool automation survive gestures and host reflection', async () => {
+  const { context, hostCalls, port } = createNativePort();
+  const classBody = source.slice(source.indexOf('  applyHostAutomationDeltas('),
+    source.indexOf('\n  async synchronizeNativeContext(',
+      source.indexOf('  applyHostAutomationDeltas(')));
+  vm.runInNewContext(`this.Manager = class {${classBody}\n};`, context);
+  const type = 'AMRadioSimulatorPlugin';
+  const enumDescriptor = context.DSP_AUTOMATION_CATALOG[type]
+    .find(descriptor => descriptor.key === 'sm');
+  const boolDescriptor = context.DSP_AUTOMATION_CATALOG[type]
+    .find(descriptor => descriptor.key === 'rd');
+  assert.deepEqual({ key: enumDescriptor?.key, kind: enumDescriptor?.kind,
+    default: enumDescriptor?.default, values: Array.from(enumDescriptor?.values || []) },
+  { key: 'sm', kind: 'enum', default: 'Mono', values: ['Mono', 'C-QUAM'] });
+  assert.deepEqual({ key: boolDescriptor?.key, kind: boolDescriptor?.kind,
+    default: boolDescriptor?.default },
+  { key: 'rd', kind: 'bool', default: true });
+
+  let writes = 0;
+  const plugin = {
+    id: 31,
+    type,
+    name: 'AM Radio Simulator',
+    enabled: true,
+    parameters: Object.fromEntries(context.DSP_AUTOMATION_CATALOG[type]
+      .map(descriptor => [descriptor.field, descriptor.default])),
+    getParameters() { return { ...this.parameters }; },
+    setParameters(parameters) { this.parameters = { ...parameters }; writes += 1; }
+  };
+  const manager = new context.Manager();
+  Object.assign(manager, {
+    currentPipeline: 'A',
+    pipelineA: [plugin],
+    pipelineB: [],
+    hostAutomationApplyDepth: 0,
+    nativePort: port,
+    getCurrentPipeline() { return this.pipelineA; },
+    synchronizeNativeAssetMembership() {},
+    scheduleLatencyService() {}
+  });
+  port.owner = manager;
+  port.rememberAdoptedPlugin('A', plugin);
+
+  plugin.parameters[enumDescriptor.field] = 'C-QUAM';
+  plugin.parameters[boolDescriptor.field] = false;
+  await port.postMessage({ type: 'updatePlugin', plugin });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const edits = automationEditPayloads(hostCalls);
+  assert.deepEqual(edits.map(({ parameterKey, elementIndex, normalized, beginGesture, endGesture }) =>
+    ({ parameterKey, elementIndex, normalized, beginGesture, endGesture })), [
+    { parameterKey: 'rd', elementIndex: 0, normalized: 0, beginGesture: true, endGesture: true },
+    { parameterKey: 'sm', elementIndex: 0, normalized: 1, beginGesture: true, endGesture: true }
+  ], 'both public values become their host gestures without numeric packing');
+
+  plugin.parameters[enumDescriptor.field] = enumDescriptor.default;
+  plugin.parameters[boolDescriptor.field] = boolDescriptor.default;
+  writes = 0;
+  manager.applyHostAutomationDeltas(edits);
+  assert.equal(writes, 1, 'one host packet writes the plug-in once for both public lanes');
+  assert.deepEqual({ [enumDescriptor.field]: plugin.parameters[enumDescriptor.field],
+    [boolDescriptor.field]: plugin.parameters[boolDescriptor.field] },
+  { [enumDescriptor.field]: 'C-QUAM', [boolDescriptor.field]: false },
+  'host reflection restores the upstream public enum string and boolean');
+  assert.equal(port.adoptedAutomationValues.get(`A:31:${type}:${enumDescriptor.key}:0`), 1);
+  assert.equal(port.adoptedAutomationValues.get(`A:31:${type}:${boolDescriptor.key}:0`), 0);
 });
 
 test('host automation application suppresses the WebView update echo', () => {

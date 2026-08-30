@@ -19,6 +19,7 @@ struct AutomationDenormalization {
   double minimum = 0.0;
   double maximum = 1.0;
   std::int32_t stepCount = 0;
+  double step = 1.0;
 
   [[nodiscard]] bool operator==(const AutomationDenormalization &) const = default;
 };

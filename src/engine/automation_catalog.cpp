@@ -179,6 +179,12 @@ normalizePublicValue(const AutomationParameterDescriptor &descriptor,
                  std::log(descriptor.maximum / descriptor.minimum);
     break;
   case AutomationNormalization::Integer:
+    if (descriptor.stepCount == 0 || !(descriptor.step > 0.0f)) {
+      return std::nullopt;
+    }
+    normalized = (value - descriptor.minimum) / descriptor.step /
+                 static_cast<double>(descriptor.stepCount);
+    break;
   case AutomationNormalization::Enum:
     if (descriptor.stepCount == 0) {
       return std::nullopt;
@@ -368,6 +374,12 @@ automationPublicValue(const AutomationDenormalization &denormalization,
             std::pow(denormalization.maximum / denormalization.minimum, normalized);
     break;
   case AutomationValueNormalization::integer:
+    if (denormalization.stepCount <= 0 || !(denormalization.step > 0.0)) {
+      return std::nullopt;
+    }
+    value = denormalization.minimum +
+            std::round(normalized * denormalization.stepCount) * denormalization.step;
+    break;
   case AutomationValueNormalization::enumeration:
     value = denormalization.minimum +
             std::round(normalized * denormalization.stepCount);
@@ -399,7 +411,17 @@ std::optional<double> automationNormalizedFromPublicValue(
     normalized = std::log(value / denormalization.minimum) /
                  std::log(denormalization.maximum / denormalization.minimum);
     break;
-  case AutomationValueNormalization::integer:
+  case AutomationValueNormalization::integer: {
+    if (denormalization.stepCount <= 0 || !(denormalization.step > 0.0)) {
+      return std::nullopt;
+    }
+    const auto stepPosition = (value - denormalization.minimum) / denormalization.step;
+    if (stepPosition != std::round(stepPosition)) {
+      return std::nullopt;
+    }
+    normalized = stepPosition / static_cast<double>(denormalization.stepCount);
+    break;
+  }
   case AutomationValueNormalization::enumeration:
     if (denormalization.stepCount == 0) {
       return std::nullopt;
@@ -442,7 +464,7 @@ std::optional<float> denormalizeAutomationPackedValue(
   return denormalizeAutomationPackedValue(
       AutomationDenormalization{target.normalization, target.transform,
                                 target.transformReference, target.minimum,
-                                target.maximum, target.stepCount},
+                                target.maximum, target.stepCount, target.step},
       normalized);
 }
 
@@ -505,6 +527,7 @@ bool applyAutomationNormalizedValue(PluginStateDocument &document,
   conversion.minimum = descriptor->minimum;
   conversion.maximum = descriptor->maximum;
   conversion.stepCount = static_cast<std::int32_t>(descriptor->stepCount);
+  conversion.step = descriptor->step;
   conversion.transform = valueTransform(descriptor->transform);
   conversion.transformReference = descriptor->transformReference;
   const auto packed = denormalizeAutomationPackedValue(conversion, normalized);
