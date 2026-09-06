@@ -14,6 +14,7 @@ if (assetsIndex < 0 || !args[assetsIndex + 1]) {
 const assets = path.resolve(args[assetsIndex + 1]);
 const html = await readFile(path.join(assets, 'effetune.html'), 'utf8');
 const app = await readFile(path.join(assets, 'js', 'app.js'), 'utf8');
+const startup = await readFile(path.join(assets, 'js', 'startup.js'), 'utf8');
 const columns = await readFile(
   path.join(assets, 'js', 'ui', 'pipeline', 'pipeline-column-manager.js'), 'utf8');
 const audioAdapter = await readFile(path.join(assets, 'vst-audio-manager.js'), 'utf8');
@@ -57,6 +58,7 @@ const japaneseLocale = await readFile(path.join(assets, 'js', 'locales', 'ja.jso
 const requiredFiles = [
   'vst-bootstrap.js',
   'vst-audio-manager.js',
+  'js/startup.js',
   'THIRD-PARTY-NOTICES.txt',
   'plugins/plugins.txt',
   'plugins/lofi/vinyl_simulator.css',
@@ -85,7 +87,7 @@ const requiredHtml = [
   '<meta name="twitter:title" content="EffeTune Mixwright - Real-time Audio Effect Processor">',
   'alt="EffeTune Mixwright Icon"',
   'vst-bootstrap.js',
-  'js/app.js'
+  'js/startup.js'
 ];
 for (const fragment of requiredHtml) {
   if (!html.includes(fragment)) {
@@ -136,8 +138,8 @@ for (const [label, source] of productBrandingSources) {
   }
 }
 
-if (html.indexOf('vst-bootstrap.js') > html.indexOf('js/app.js')) {
-  throw new Error('The VST bootstrap must load before the application module');
+if (html.indexOf('vst-bootstrap.js') > html.indexOf('js/startup.js')) {
+  throw new Error('The VST bootstrap must load before the startup module');
 }
 if (!bootstrap.includes('html { background-color: #1e1e1e; }')) {
   throw new Error('The VST document background does not match the dark UI');
@@ -153,6 +155,9 @@ if (!bootstrap.includes('const needsHomeKeyForEditing = target => {') ||
 }
 if (!app.includes("../vst-audio-manager.js")) {
   throw new Error('The application module was not redirected to the VST audio adapter');
+}
+if (!startup.includes("import('./app.js')")) {
+  throw new Error('The startup module no longer loads the application entry');
 }
 if (!routingDialog.includes('for (let i = 3; i <= 8; i++)') ||
     !routingDialog.includes(
@@ -190,7 +195,7 @@ if (!app.includes('plugin.id = pluginState.id') || appIdReservation < 0 ||
     savedStateDeclaration < 0 || automationWatermarkReservation < savedStateDeclaration ||
     automationWatermarkReservation > appPluginCreation ||
     appPluginCreation < 0 || appIdReservation > appPluginCreation ||
-    !app.includes('restoreDoubleBlindTestFromUrl() {}')) {
+    !app.includes('async restoreDoubleBlindTestFromUrl() {}')) {
   throw new Error('Stable restored plug-in IDs or the VST DBT URL exclusion is missing');
 }
 const historyIdReservation =
@@ -207,7 +212,9 @@ if (!history.includes('id: plugin.id') ||
     historyIdReservation > historyPluginCreation) {
   throw new Error('Undo/redo history IDs or single native synchronization contract is missing');
 }
-if (!app.includes('async applyStartupViewPreference() {}') ||
+if (!app.includes('applyStartupViewPreference() {}') ||
+    !app.includes('async openConfiguredStartupView() {}') ||
+    app.includes('applyInitialStartupViewClass(config, windowRef)') ||
     app.includes('this.uiManager?.showLibraryView?.(') ||
     uiManager.includes('this.toggleLibraryView();') ||
     uiManager.includes('this.initLibraryRecovery();') ||
@@ -753,6 +760,7 @@ for (const excluded of [
   'js/vendor/jsmediatags-3.9.5.min.js',
   'js/vendor/music-metadata-browser.mjs',
   'js/ui/double-blind-test',
+  'js/pipeline-analyzer',
   'js/library',
   'js/ui/library',
   'js/ui/audio-player',
@@ -771,6 +779,7 @@ for (const excluded of [
 const visitedModules = new Set();
 const pendingModules = [
   path.join(assets, 'js', 'app.js'),
+  path.join(assets, 'js', 'startup.js'),
   path.join(assets, 'vst-bootstrap.js')
 ];
 while (pendingModules.length > 0) {

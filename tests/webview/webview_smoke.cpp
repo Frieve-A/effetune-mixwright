@@ -8,6 +8,7 @@
 #include <chrono>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -747,6 +748,8 @@ int main(const int argc, char **argv) {
   bool recoveredAfterParentDestruction = false;
   bool reopenedReadyEditorWasRebuilt = false;
   bool missingResourceGuidanceShown = false;
+  bool missingResourceFixtureReady = false;
+  bool missingResourceFixtureCleanupSucceeded = true;
   bool multiThreadedApartmentDiagnosed = false;
   bool editorReportedReady = false;
   bool attached = false;
@@ -1568,48 +1571,123 @@ int main(const int argc, char **argv) {
     webViewProfile.captureChildProcesses();
   }
   if (parent != nullptr && IsWindow(parent) != FALSE) {
-    int fallbackOwner = 0;
-    effetune::vst::WebViewHost fallbackWebView(
-        [](const std::string_view) { return R"({"ok":true})"; },
-        std::filesystem::path(EFFETUNE_WEBVIEW_ASSET_DIR) / "missing-resource-root",
-        false);
-    if (fallbackWebView.attach(
-            &fallbackOwner, parent,
-            effetune::vst::plugin::kDefaultEditorWidth,
-            effetune::vst::plugin::kDefaultEditorHeight)) {
-      ShowWindow(parent, SW_SHOWNOACTIVATE);
-      std::atomic_bool fallbackEvaluationPending{false};
-      const auto deadline =
-          std::chrono::steady_clock::now() + kCompletionTimeout;
-      auto nextFallbackEvaluation =
-          std::chrono::steady_clock::now() + std::chrono::seconds(1);
-      while (!missingResourceGuidanceShown &&
-             std::chrono::steady_clock::now() < deadline) {
-        MSG message{};
-        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE) != 0) {
-          TranslateMessage(&message);
-          DispatchMessageW(&message);
+    std::error_code setupError;
+    const auto tempRoot = std::filesystem::temp_directory_path(setupError);
+    auto normalizedTempRoot = tempRoot.lexically_normal();
+    if (!normalizedTempRoot.has_filename()) {
+      normalizedTempRoot = normalizedTempRoot.parent_path();
+    }
+    const auto missingStartupRoot =
+        normalizedTempRoot / (L"effetune-webview-missing-startup-" +
+                              std::to_wstring(GetCurrentProcessId()) + L"-" +
+                              std::to_wstring(GetTickCount64()));
+    bool fixtureCreated = false;
+    if (setupError || tempRoot.empty() || !tempRoot.is_absolute() ||
+        normalizedTempRoot.empty() ||
+        missingStartupRoot.lexically_normal().parent_path() != normalizedTempRoot) {
+      setupError = std::make_error_code(std::errc::invalid_argument);
+    } else if (std::filesystem::create_directories(missingStartupRoot / L"js",
+                                                    setupError)) {
+      fixtureCreated = true;
+      for (const auto *relative : {"effetune.html", "effetune.css",
+                                   "vst-bootstrap.js", "js/app.js"}) {
+        std::ofstream file(missingStartupRoot / relative, std::ios::binary);
+        if (!file) {
+          setupError = std::make_error_code(std::errc::io_error);
+          break;
         }
-        if (std::chrono::steady_clock::now() >= nextFallbackEvaluation &&
-            !fallbackEvaluationPending.exchange(true, std::memory_order_acq_rel)) {
-          if (!fallbackWebView.evaluate(
-                  "document.documentElement.dataset.effetuneLoadError === "
-                  "'missing-assets' && document.body?.innerText.includes("
-                  "'Reinstall the complete EffeTune Mixwright.vst3 bundle')",
-                  [&](std::string error, std::string result) {
-                    missingResourceGuidanceShown =
-                        error.empty() && result == "true";
-                    fallbackEvaluationPending.store(false,
-                                                    std::memory_order_release);
-                  })) {
-            fallbackEvaluationPending.store(false, std::memory_order_release);
-          }
-          nextFallbackEvaluation =
-              std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
       }
-      fallbackWebView.detach(&fallbackOwner);
+    } else if (!setupError) {
+      setupError = std::make_error_code(std::errc::file_exists);
+    }
+    if (!setupError) {
+      std::error_code probeError;
+      for (const auto *relative : {"effetune.html", "effetune.css",
+                                   "vst-bootstrap.js", "js/app.js"}) {
+        if (!std::filesystem::is_regular_file(missingStartupRoot / relative,
+                                              probeError)) {
+          setupError = probeError ? probeError
+                                  : std::make_error_code(std::errc::io_error);
+          break;
+        }
+      }
+      if (!setupError &&
+          std::filesystem::exists(missingStartupRoot / L"js/startup.js",
+                                  probeError)) {
+        setupError = std::make_error_code(std::errc::file_exists);
+      } else if (!setupError && probeError) {
+        setupError = probeError;
+      }
+    }
+    if (!setupError) {
+      missingResourceFixtureReady = true;
+    } else {
+      std::cerr << "Could not prepare the startup.js-missing WebView fixture";
+      if (setupError) std::cerr << ": " << setupError.message();
+      std::cerr << "\n";
+    }
+    if (fixtureCreated && !missingResourceFixtureReady) {
+      std::error_code cleanupError;
+      std::filesystem::remove_all(missingStartupRoot, cleanupError);
+      if (cleanupError) {
+        missingResourceFixtureCleanupSucceeded = false;
+        std::cerr << "Could not clean up the startup.js-missing WebView fixture: "
+                  << cleanupError.message() << "\n";
+      }
+    }
+    if (missingResourceFixtureReady) {
+      int fallbackOwner = 0;
+      {
+        effetune::vst::WebViewHost fallbackWebView(
+            [](const std::string_view) { return R"({"ok":true})"; },
+            missingStartupRoot,
+            false);
+        if (fallbackWebView.attach(
+                &fallbackOwner, parent,
+                effetune::vst::plugin::kDefaultEditorWidth,
+                effetune::vst::plugin::kDefaultEditorHeight)) {
+          ShowWindow(parent, SW_SHOWNOACTIVATE);
+          std::atomic_bool fallbackEvaluationPending{false};
+          const auto deadline =
+              std::chrono::steady_clock::now() + kCompletionTimeout;
+          auto nextFallbackEvaluation =
+              std::chrono::steady_clock::now() + std::chrono::seconds(1);
+          while (!missingResourceGuidanceShown &&
+                 std::chrono::steady_clock::now() < deadline) {
+            MSG message{};
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE) != 0) {
+              TranslateMessage(&message);
+              DispatchMessageW(&message);
+            }
+            if (std::chrono::steady_clock::now() >= nextFallbackEvaluation &&
+                !fallbackEvaluationPending.exchange(true, std::memory_order_acq_rel)) {
+              if (!fallbackWebView.evaluate(
+                      "document.documentElement.dataset.effetuneLoadError === "
+                      "'missing-assets' && document.body?.innerText.includes("
+                      "'Reinstall the complete EffeTune Mixwright.vst3 bundle')",
+                      [&](std::string error, std::string result) {
+                        missingResourceGuidanceShown =
+                            error.empty() && result == "true";
+                        fallbackEvaluationPending.store(false,
+                                                        std::memory_order_release);
+                      })) {
+                fallbackEvaluationPending.store(false, std::memory_order_release);
+              }
+              nextFallbackEvaluation =
+                  std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+          }
+          fallbackWebView.detach(&fallbackOwner);
+        }
+      }
+      std::error_code cleanupError;
+      std::filesystem::remove_all(missingStartupRoot, cleanupError);
+      if (cleanupError) {
+        missingResourceFixtureCleanupSucceeded = false;
+        std::cerr << "Could not clean up the startup.js-missing WebView fixture: "
+                  << cleanupError.message() << "\n";
+      }
     }
     webViewProfile.captureChildProcesses();
   }
@@ -1949,6 +2027,14 @@ int main(const int argc, char **argv) {
   if (!reopenedReadyEditorWasRebuilt) {
     std::cerr << "Reopening the editor reused a WebView whose controller belonged to the "
                  "previous parent instead of rebuilding it\n";
+    return 1;
+  }
+  if (!missingResourceFixtureReady) {
+    std::cerr << "The startup.js-missing WebView fixture was not verified\n";
+    return 1;
+  }
+  if (!missingResourceFixtureCleanupSucceeded) {
+    std::cerr << "The startup.js-missing WebView fixture was not cleaned up\n";
     return 1;
   }
   if (!missingResourceGuidanceShown) {

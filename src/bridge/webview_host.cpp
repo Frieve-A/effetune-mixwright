@@ -78,6 +78,7 @@ constexpr std::string_view kWebViewHomeUri =
       "effetune.html",
       "effetune.css",
       "vst-bootstrap.js",
+      "js/startup.js",
       "js/app.js",
   };
   return std::all_of(required.begin(), required.end(), [&root](const auto *relative) {

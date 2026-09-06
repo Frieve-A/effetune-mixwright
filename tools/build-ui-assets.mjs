@@ -85,6 +85,7 @@ html = applyProductBranding(html)
   .replace(/<meta http-equiv="Content-Security-Policy"[^>]*>/,
     `<meta http-equiv="Content-Security-Policy" content="default-src 'self' blob: data:; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:; connect-src 'self' blob:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline' blob:;">`)
   .replace(/\s*<script>\s*\(function\(\) \{\s*var measurementId =[\s\S]*?<\/script>/, '')
+  .replace(/\s*<script>\s*\/\/ Apply the Web startup view preference[\s\S]*?<\/script>/, '')
   .replace(/\s*<button class="pipeline-menu-item" id="doubleBlindTestButton">[\s\S]*?<\/button>/, '')
   .replace(/\s*<button class="header-button pipeline-analyzer-button" id="pipelineAnalyzerButton"[\s\S]*?<\/button>/, '')
   .replace(/\s*<aside class="pipeline-analyzer-panel" id="pipelineAnalyzerPanel" hidden><\/aside>/, '')
@@ -107,11 +108,13 @@ if (!app.includes(libraryConstantsImport)) {
 }
 app = app.replace(libraryConstantsImport,
   `const normalizeMusicLibraryStartupView = () => 'tracks';`);
-const startupViewPreference = /    async applyStartupViewPreference\(\) \{[\s\S]*?\n    \}\n\n    \/\*\*\n     \* Initialize and build pipeline/;
+const startupViewPreference = /    applyStartupViewPreference\(\) \{[\s\S]*?\n    \}\n\n    async openConfiguredStartupView\(\) \{[\s\S]*?\n    \}\n\n    \/\*\*\n     \* Initialize and build pipeline/;
 if (!startupViewPreference.test(app)) {
   throw new Error('Unable to locate the music-library startup preference');
 }
-app = app.replace(startupViewPreference, `    async applyStartupViewPreference() {}
+app = app.replace(startupViewPreference, `    applyStartupViewPreference() {}
+
+    async openConfiguredStartupView() {}
 
     /**
      * Initialize and build pipeline`);
@@ -176,13 +179,20 @@ app = app.replaceAll(restoredPluginFailure, `${restoredPluginFailure}
                         this.startupWarningMessage = 'Some effects are unavailable and were bypassed.';
                         this.uiManager.setError('Some effects are unavailable and were bypassed.', false);
                     }`);
-const restoreDoubleBlind = /    restoreDoubleBlindTestFromUrl\(\) \{[\s\S]*?\n    \}\n\n    setStartupWarning/;
+const restoreDoubleBlind = /    async restoreDoubleBlindTestFromUrl\(\) \{[\s\S]*?\n    \}\n\n    setStartupWarning/;
 if (!restoreDoubleBlind.test(app)) {
   throw new Error('Unable to locate Double Blind Test URL restoration');
 }
-app = app.replace(restoreDoubleBlind, `    restoreDoubleBlindTestFromUrl() {}
+app = app.replace(restoreDoubleBlind, `    async restoreDoubleBlindTestFromUrl() {}
 
     setStartupWarning`);
+app = app.replace(/const LIBRARY_STYLESHEET = 'effetune-library\.css';\n/, '');
+const initialStartupClass = /function applyInitialStartupViewClass\(config, windowRef = window\) \{[\s\S]*?\n\}\n/;
+if (!initialStartupClass.test(app)) {
+  throw new Error('Unable to locate the initial library startup class helper');
+}
+app = app.replace(initialStartupClass, 'function applyInitialStartupViewClass() {}\n');
+app = app.replace(`            applyInitialStartupViewClass(config, windowRef);\n`, '');
 const publishInitialConfig = `            windowRef.appConfig = config;`;
 if (!app.includes(publishInitialConfig)) {
   throw new Error('Unable to locate the initial config publication in js/app.js');
@@ -408,18 +418,7 @@ uiManager = uiManager.replace(pipelinePerformanceRefresh, `        this.updatePi
         this.updatePipelineCpuUsage(
             this.audioManager?.pipelineCpuAveragePercent ?? this.pipelineCpuAveragePercent
         );`);
-const pipelineAnalyzerInitialization = `        this.pipelineAnalyzerUI = new PipelineAnalyzerUI({
-            onOpenChange: open => this.setPipelineAnalyzerOpen(open),
-            onConfigurationChange: (configuration, meta) =>
-                this.pipelineAnalyzerController?.setConfiguration(configuration, meta),
-            onRefreshMeasurements: () => this.pipelineAnalyzerController?.refreshMeasurements()
-        });
-        this.pipelineAnalyzerController = new PipelineAnalyzerController({
-            audioManager,
-            workletSync: this.pipelineManager.core.workletSync,
-            ui: this.pipelineAnalyzerUI
-        });
-        this.pipelineAnalyzerController.initialize();
+const pipelineAnalyzerInitialization = `        this.initPipelineAnalyzerBootstrap();
         this.initPipelineAnalyzerMenuIntegration();`;
 if (uiManager.split(pipelineAnalyzerInitialization).length - 1 !== 1) {
   throw new Error('Unable to locate the Pipeline Analyzer initialization');
@@ -429,6 +428,27 @@ uiManager = uiManager.replace(pipelineAnalyzerInitialization, `        // Pipeli
         // or restore a saved open state that starts analysis in the background.
         this.pipelineAnalyzerUI = null;
         this.pipelineAnalyzerController = null;`);
+
+// EffeTune 2.8.0 defers optional features behind module loaders.  The VST
+// bundle removes those feature trees, so remove the loaders as well rather
+// than leaving dynamic imports that make the deleted modules reachable.
+for (const [name, nextName] of [
+  ['loadAudioPlayerClass', 'loadLibraryFeatureModules'],
+  ['loadLibraryFeatureModules', 'loadWebPlaybackResolvers'],
+  ['loadWebPlaybackResolvers', 'loadPipelineAnalyzerModules'],
+  ['loadPipelineAnalyzerModules', 'loadDoubleBlindTestClass']
+]) {
+  const loader = new RegExp(`function ${name}\\(\\) \\{[\\s\\S]*?\\n\\}\\n\\n(?=function ${nextName})`);
+  if (!loader.test(uiManager)) {
+    throw new Error(`Unable to locate excluded lazy loader: ${name}`);
+  }
+  uiManager = uiManager.replace(loader, '');
+}
+const doubleBlindLoader = /function loadDoubleBlindTestClass\(\) \{[\s\S]*?\n\}\n\n(?=function isPipelineAnalyzerStoredOpen)/;
+if (!doubleBlindLoader.test(uiManager)) {
+  throw new Error('Unable to locate excluded lazy loader: loadDoubleBlindTestClass');
+}
+uiManager = uiManager.replace(doubleBlindLoader, '');
 const uiManagerLibraryConstantsImport =
   `import { normalizeMusicLibraryStartupView } from './library/constants.js';`;
 if (!uiManager.includes(uiManagerLibraryConstantsImport)) {
@@ -455,10 +475,7 @@ for (const excludedImport of [
   `import { resolveWebPlaybackSelection } from './ui/playback-selection-router.js';\n`,
   `import { resolveWebCueSiblingFiles } from './ui/web-cue-source-resolver.js';\n`
 ]) {
-  if (!uiManager.includes(excludedImport)) {
-    throw new Error(`Unable to locate excluded UI import: ${excludedImport.trim()}`);
-  }
-  uiManager = uiManager.replace(excludedImport, '');
+  if (uiManager.includes(excludedImport)) uiManager = uiManager.replace(excludedImport, '');
 }
 const musicInitializers = `        this.initOpenMusicButton();
         this.initOpenLibraryButton();
@@ -468,11 +485,13 @@ if (!uiManager.includes(musicInitializers)) {
 }
 uiManager = uiManager.replace(musicInitializers,
   `        // Music player and library are excluded from the VST UI.`);
-const libraryRecoveryInitialization = `        this.libraryRecoveryApi = window.electronAPI?.libraryRecoveryV1 ||
-            createWebCatalogRecoveryController();
-        this.libraryRecoveryState = window.electronAPI?.libraryRecoveryV1
-            ? { apiVersion: 1, status: 'initializing', available: false, canReset: false }
-            : this.libraryRecoveryApi.getState();`;
+const libraryRecoveryInitialization = `        this.libraryRecoveryApi = window.electronAPI?.libraryRecoveryV1 || null;
+        this.libraryRecoveryState = {
+            apiVersion: 1,
+            status: 'initializing',
+            available: false,
+            canReset: false
+        };`;
 if (!uiManager.includes(libraryRecoveryInitialization)) {
   throw new Error('Unable to locate music-library recovery initialization');
 }
@@ -483,23 +502,72 @@ uiManager = uiManager.replace(libraryRecoveryInitialization, `        this.libra
             available: false,
             canReset: false
         };`);
+uiManager = uiManager.replace("        loadStylesheet('effetune-library.css');\n", '');
+const webLibraryRecoveryMethod = /    async ensureWebLibraryRecoveryController\(\) \{[\s\S]*?\n    \}\n\n    deferLibraryStartupView\(initialView\)/;
+if (!webLibraryRecoveryMethod.test(uiManager)) {
+  throw new Error('Unable to locate current web-library recovery loader');
+}
+uiManager = uiManager.replace(webLibraryRecoveryMethod,
+  `    async ensureWebLibraryRecoveryController() { return null; }
+
+    deferLibraryStartupView(initialView)`);
+const libraryManagerMethod = /    async ensureLibraryManager\(options = \{\}\) \{[\s\S]*?\n    \}\n\n    createLibraryManager\(\)/;
+if (!libraryManagerMethod.test(uiManager)) {
+  throw new Error('Unable to locate current lazy library manager');
+}
+uiManager = uiManager.replace(libraryManagerMethod,
+  `    async ensureLibraryManager() { return null; }
+
+    createLibraryManager()`);
+const audioPlayerMethod = /    async createAudioPlayer\(filePaths, replaceExisting = false\) \{[\s\S]*?\n    \}\n\n    \/\*\*\n     \* Load a preset/;
+if (!audioPlayerMethod.test(uiManager)) {
+  throw new Error('Unable to locate current lazy audio-player method');
+}
+uiManager = uiManager.replace(audioPlayerMethod,
+  `    async createAudioPlayer() { return null; }
+
+    /**
+     * Load a preset`);
+const webPlaybackSelectionMethod = /    async openWebPlaybackSelection\(files, gestureResume, \{ fileHandles = null \} = \{\}\) \{[\s\S]*?\n    \}\n\n    \/\*\*\n     \* Initialize music library button/;
+if (!webPlaybackSelectionMethod.test(uiManager)) {
+  throw new Error('Unable to locate current web playback selection method');
+}
+uiManager = uiManager.replace(webPlaybackSelectionMethod,
+  `    async openWebPlaybackSelection() { return false; }
+
+    /**
+     * Initialize music library button`);
 const libraryShortcut = /\n            if \(\(e\.ctrlKey \|\| e\.metaKey\) && !e\.shiftKey && !e\.altKey && String\(e\.key\)\.toLowerCase\(\) === 'l'\) \{[\s\S]*?\n            \}\n/;
 if (!libraryShortcut.test(uiManager)) {
   throw new Error('Unable to locate the music-library keyboard shortcut');
 }
 uiManager = uiManager.replace(libraryShortcut, '\n');
 const doubleBlindImport = `import { DoubleBlindTest } from './ui/double-blind-test/double-blind-test.js';\n`;
-if (!uiManager.includes(doubleBlindImport)) {
-  throw new Error('Unable to locate Double Blind Test import');
-}
-uiManager = uiManager.replace(doubleBlindImport, '');
-const doubleBlindMethods = /    \/\*\*\n     \* Get \(creating on first use\)[\s\S]*?    getDoubleBlindTest\(\) \{[\s\S]*?\n    \}\n\n    \/\*\* Is the Double Blind Test mode currently open\? \*\/\n    isDoubleBlindActive\(\) \{[\s\S]*?\n    \}/;
+if (uiManager.includes(doubleBlindImport)) uiManager = uiManager.replace(doubleBlindImport, '');
+const doubleBlindMethods = /    \/\*\*\n     \* Get \(creating on first use\)[\s\S]*?    async getDoubleBlindTest\(\) \{[\s\S]*?\n    \}\n\n    \/\*\* Is the Double Blind Test mode currently open\? \*\/\n    isDoubleBlindActive\(\) \{[\s\S]*?\n    \}/;
 if (!doubleBlindMethods.test(uiManager)) {
   throw new Error('Unable to locate Double Blind Test UI methods');
 }
-uiManager = uiManager.replace(doubleBlindMethods, `    getDoubleBlindTest() { return null; }
+uiManager = uiManager.replace(doubleBlindMethods, `    async getDoubleBlindTest() { return null; }
 
     isDoubleBlindActive() { return false; }`);
+const pipelineAnalyzerMethods = /    setPipelineAnalyzerOpen\(open\) \{[\s\S]*?\n    \}\n\n    updateURL\(\)/;
+if (!pipelineAnalyzerMethods.test(uiManager)) {
+  throw new Error('Unable to locate current Pipeline Analyzer methods');
+}
+uiManager = uiManager.replace(pipelineAnalyzerMethods, `    setPipelineAnalyzerOpen() { return false; }
+
+    initPipelineAnalyzerBootstrap() {}
+
+    ensurePipelineAnalyzer() { return Promise.resolve(null); }
+
+    isPipelineAnalyzerOpen() { return false; }
+
+    initPipelineAnalyzerMenuIntegration() {}
+
+    disposePipelineAnalyzerIntegration() {}
+
+    updateURL()`);
 const languagePreferenceRefresh = `        await this.loadTranslations(targetLocale, requestGeneration);
         return this.userLanguage;`;
 if (!uiManager.includes(languagePreferenceRefresh)) {
@@ -589,16 +657,43 @@ for (const localeFile of await readdir(localesPath)) {
 
 const browserAudioManagerPath = path.join(output, 'js', 'audio-manager.js');
 let browserAudioManager = await readFile(browserAudioManagerPath, 'utf8');
-const offlineImport = `import { OfflineProcessor } from './audio/offline-processor.js';\n`;
-const offlineConstruction =
-  `        this.offlineProcessor = new OfflineProcessor(this.contextManager, this.audioEncoder);`;
-if (!browserAudioManager.includes(offlineImport) ||
-    !browserAudioManager.includes(offlineConstruction)) {
-  throw new Error('Unable to locate the offline processor integration');
+const audioEncoderImport = `import { AudioEncoder } from './audio/audio-encoder.js';\n`;
+if (browserAudioManager.includes(audioEncoderImport)) {
+  browserAudioManager = browserAudioManager.replace(audioEncoderImport, '');
 }
-browserAudioManager = browserAudioManager
-  .replace(offlineImport, '')
-  .replace(offlineConstruction, '        this.offlineProcessor = null;');
+const audioEncoderConstruction = `        this.audioEncoder = new AudioEncoder();`;
+if (browserAudioManager.includes(audioEncoderConstruction)) {
+  browserAudioManager = browserAudioManager.replace(audioEncoderConstruction,
+    '        this.audioEncoder = null;');
+}
+const offlineImport = `import { OfflineProcessor } from './audio/offline-processor.js';\n`;
+if (browserAudioManager.includes(offlineImport)) {
+  browserAudioManager = browserAudioManager.replace(offlineImport, '');
+}
+const offlineLoader = /    async _ensureOfflineProcessor\(\) \{[\s\S]*?\n    \}\n    \n    \/\*\*\n     \* Encode audio buffer/;
+if (!offlineLoader.test(browserAudioManager)) {
+  throw new Error('Unable to locate current lazy offline processor loader');
+}
+browserAudioManager = browserAudioManager.replace(offlineLoader,
+  `    async _ensureOfflineProcessor() { return null; }
+
+    /**
+     * Encode audio buffer`);
+const offlineProcessMethod = /    async processAudioFile\(file, progressCallback = null, outputSettings = null\) \{[\s\S]*?\n    \}\n\n    \/\*\*\n     \* Cancel the current offline audio processing operation/;
+if (!offlineProcessMethod.test(browserAudioManager)) {
+  throw new Error('Unable to locate current offline processing method');
+}
+browserAudioManager = browserAudioManager.replace(offlineProcessMethod,
+  `    async processAudioFile() { return null; }
+
+    /**
+     * Cancel the current offline audio processing operation`);
+const encodeWavMethod = /    encodeWAV\(audioBuffer\) \{[\s\S]*?\n    \}/;
+if (!encodeWavMethod.test(browserAudioManager)) {
+  throw new Error('Unable to locate current offline WAV encoder method');
+}
+browserAudioManager = browserAudioManager.replace(encodeWavMethod,
+  '    encodeWAV() { return null; }');
 await writeFile(browserAudioManagerPath, browserAudioManager, 'utf8');
 
 const configIntegrationPath = path.join(output, 'js', 'electron', 'configIntegration.js');
@@ -639,6 +734,7 @@ await rm(path.join(output, 'js', 'library'), { recursive: true, force: true });
 await rm(path.join(output, 'js', 'ui', 'library'), { recursive: true, force: true });
 await rm(path.join(output, 'js', 'ui', 'audio-player'), { recursive: true, force: true });
 await rm(path.join(output, 'js', 'ui', 'audio-player.js'), { force: true });
+await rm(path.join(output, 'js', 'pipeline-analyzer'), { recursive: true, force: true });
 await rm(path.join(output, 'js', 'ui', 'pipeline', 'file-processor.js'), { force: true });
 await rm(path.join(output, 'js', 'audio', 'offline-processor.js'), { force: true });
 await writeFile(path.join(output, '.stamp'), `${productName} WebView assets\n`, 'utf8');
