@@ -5,7 +5,7 @@ EffeTune Mixwright brings EffeTune's C++ DSP engine and desktop interface to the
 ## Requirements
 
 - Git (Windows users must run `git config --global core.longpaths true`)
-- CMake 3.24 or later, Ninja, and Node.js 22 or later
+- CMake 3.24 or later, Ninja, Node.js 22 or later, and Python 3.10 or later
 - Windows: Visual Studio 2022 Build Tools with the **Desktop development with C++** workload, plus the WebView2 Runtime
 - macOS: A current version of Xcode and its Command Line Tools
 

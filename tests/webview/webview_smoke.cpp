@@ -1116,10 +1116,17 @@ int main(const int argc, char **argv) {
             "'.vst-os-control > span')); const firstSelectStyle = getComputedStyle("
             "controls?.querySelector('.vst-os-control > select')); "
             "const settings = document.querySelector('.settings-menu-container'); "
+            "const themeColorProbe = document.createElement('span'); "
+            "themeColorProbe.style.color = 'var(--et-text-secondary)'; "
+            "document.body.appendChild(themeColorProbe); "
+            "const themeColor = getComputedStyle(themeColorProbe).color; "
+            "themeColorProbe.remove(); "
             "return !!controls && controls.nextElementSibling === settings && "
             "labels.join('|') === 'Upsampling Factor:|Phase:|Quality:' && "
             "firstLabelStyle.fontSize === '14px' && "
-            "firstLabelStyle.color === 'rgb(195, 199, 204)' && "
+            "getComputedStyle(document.documentElement).getPropertyValue("
+            "'--et-text-secondary').trim() !== '' && "
+            "firstLabelStyle.color === themeColor && "
             "firstSelectStyle.fontSize === '14px' && "
             "firstSelectStyle.backgroundImage !== 'none' && "
             "firstSelectStyle.borderTopColor === 'rgb(86, 86, 86)' && "
@@ -1589,7 +1596,7 @@ int main(const int argc, char **argv) {
     } else if (std::filesystem::create_directories(missingStartupRoot / L"js",
                                                     setupError)) {
       fixtureCreated = true;
-      for (const auto *relative : {"effetune.html", "effetune.css",
+      for (const auto *relative : {"effetune.html", "effetune.css", "effetune-theme.css",
                                    "vst-bootstrap.js", "js/app.js"}) {
         std::ofstream file(missingStartupRoot / relative, std::ios::binary);
         if (!file) {
@@ -1602,7 +1609,7 @@ int main(const int argc, char **argv) {
     }
     if (!setupError) {
       std::error_code probeError;
-      for (const auto *relative : {"effetune.html", "effetune.css",
+      for (const auto *relative : {"effetune.html", "effetune.css", "effetune-theme.css",
                                    "vst-bootstrap.js", "js/app.js"}) {
         if (!std::filesystem::is_regular_file(missingStartupRoot / relative,
                                               probeError)) {

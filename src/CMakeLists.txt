@@ -2,7 +2,6 @@ add_library(effetune_engine STATIC
   engine/automation_catalog.cpp
   engine/automation_binding.cpp
   engine/automation_scheduler.cpp
-  engine/block_adapter.cpp
   engine/dry_delay.cpp
   engine/engine_host.cpp
   engine/latency.cpp

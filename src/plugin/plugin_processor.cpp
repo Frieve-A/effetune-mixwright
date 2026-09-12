@@ -445,7 +445,6 @@ tresult PLUGIN_API EffeTuneProcessor::setActive(const TBool state) {
     // both before it reaches the engine gate, so keeping it out of the engine
     // is not enough: it has to stay out of the callback entirely.
     const AudioTimelineWindow timelineWindow{*this};
-    blockAdapter_.reset();
     oversampler_.reset();
     engine_.reset();
     dryDelay_.reset();
@@ -505,16 +504,25 @@ bool EffeTuneProcessor::configureDspLocked(AutomationResourceLock &resources,
       std::scoped_lock stateLock(stateMutex_);
       snapshot = state_;
     }
-    oversampler_.prepare(snapshot.oversampling, static_cast<std::uint32_t>(configuredChannels),
-                         static_cast<std::uint32_t>(maxHostFrames));
-    const auto maxEngineFrames = static_cast<std::uint32_t>(maxHostFrames) *
-                                 snapshot.oversampling.factor;
-    blockAdapter_.prepare(static_cast<std::uint32_t>(configuredChannels), maxEngineFrames);
+    const auto requestedEngineFrames = static_cast<std::uint64_t>(maxHostFrames) *
+                                       snapshot.oversampling.factor;
+    if (requestedEngineFrames > std::numeric_limits<std::uint32_t>::max() ||
+        requestedEngineFrames > std::numeric_limits<std::size_t>::max() /
+                                    sizeof(float) / static_cast<std::uint32_t>(configuredChannels)) {
+      if (error != nullptr) {
+        *error = "Processing frame capacity is too large";
+      }
+      return false;
+    }
+    const auto maxEngineFrames = static_cast<std::uint32_t>(requestedEngineFrames);
     if (!engine_.prepare(hostSampleRate * snapshot.oversampling.factor,
                          static_cast<std::uint32_t>(configuredChannels),
+                         maxEngineFrames,
                          EngineHost::kDefaultTelemetryBytes, error)) {
       return false;
     }
+    oversampler_.prepare(snapshot.oversampling, static_cast<std::uint32_t>(configuredChannels),
+                         static_cast<std::uint32_t>(maxHostFrames));
     if (!waitForUiRepack) {
       const auto &pipeline =
           snapshot.currentPipeline == 'B' ? snapshot.pipelineB : snapshot.pipelineA;
@@ -2312,6 +2320,12 @@ std::int64_t EffeTuneProcessor::automationBlockStart(const ProcessData &data,
   return start;
 }
 
+double EffeTuneProcessor::dspTimeSeconds(const std::int64_t absoluteStart,
+                                        const std::uint32_t hostOffset,
+                                        const double hostSampleRate) noexcept {
+  return static_cast<double>(absoluteStart + hostOffset) / hostSampleRate;
+}
+
 void EffeTuneProcessor::publishHostContext(const double sampleRate, const std::uint32_t channels,
                                            const std::uint32_t oversamplingFactor) noexcept {
   const auto engineSampleRate = sampleRate * oversamplingFactor;
@@ -2890,18 +2904,10 @@ tresult PLUGIN_API EffeTuneProcessor::process(ProcessData &data) {
       sliceInput[channel] = upsampled[channel] + engineOffset;
       sliceOutput[channel] = engineOutputPointers_[channel] + engineOffset;
     }
-    std::uint32_t sliceFramesProcessed = 0;
-    processed = blockAdapter_.process(
-        sliceInput.data(), sliceOutput.data(), sliceEngineFrames,
-        [&](float *const *channels, const std::uint32_t channelCount,
-            const std::uint32_t frames) noexcept {
-          const auto time = static_cast<double>(absoluteStart + slice.hostOffset) /
-                                hostSampleRate +
-                            static_cast<double>(sliceFramesProcessed) /
-                                (hostSampleRate * oversamplingFactor);
-          sliceFramesProcessed += frames;
-          return batch.processChunk(channels, channelCount, frames, time, sliceBypass);
-        });
+    const auto time = dspTimeSeconds(absoluteStart, slice.hostOffset, hostSampleRate);
+    processed = batch.processChunk(sliceInput.data(), sliceOutput.data(),
+                                    static_cast<std::uint32_t>(input.numChannels),
+                                    sliceEngineFrames, time, sliceBypass);
   }
   const auto batchFinished = batch.finish(refreshLatencyAtBlockEnd);
   capturePendingLatencyUpdate();
@@ -2916,7 +2922,6 @@ tresult PLUGIN_API EffeTuneProcessor::process(ProcessData &data) {
     failure = ProcessTransactionError::downsampleRejected;
   }
   if (failure != ProcessTransactionError::none) {
-    blockAdapter_.reset();
     oversampler_.reset();
     if (stageParameterImages) {
       // The dirty flags belong to whoever owns the runtime image. While the

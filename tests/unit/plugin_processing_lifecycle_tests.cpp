@@ -66,6 +66,12 @@ public:
     return processor.engine_.processCounters();
   }
 
+  [[nodiscard]] static double dspTimeSeconds(const std::int64_t absoluteStart,
+                                            const std::uint32_t hostOffset,
+                                            const double hostSampleRate) noexcept {
+    return EffeTuneProcessor::dspTimeSeconds(absoluteStart, hostOffset, hostSampleRate);
+  }
+
   [[nodiscard]] static bool
   automationDeltaPending(const EffeTuneProcessor &processor) noexcept {
     return processor.automationDeltaPending_.load(std::memory_order_acquire);
@@ -1210,10 +1216,10 @@ void installGroupDelayEqPipeline(EffeTuneProcessor &processor) {
 }
 
 void expectGainProcessing(EffeTuneProcessor &processor, const int32 frames) {
-  std::array<float, 256> left{};
-  std::array<float, 256> right{};
-  std::array<float, 256> outputLeft{};
-  std::array<float, 256> outputRight{};
+  std::array<float, 1024> left{};
+  std::array<float, 1024> right{};
+  std::array<float, 1024> outputLeft{};
+  std::array<float, 1024> outputRight{};
   left.fill(1.0f);
   right.fill(-1.0f);
   Sample32 *inputChannels[]{left.data(), right.data()};
@@ -1239,6 +1245,161 @@ void expectGainProcessing(EffeTuneProcessor &processor, const int32 frames) {
     expect(std::abs(outputLeft[static_cast<std::size_t>(frame)] - expected) < 1.0e-6f &&
                std::abs(outputRight[static_cast<std::size_t>(frame)] + expected) < 1.0e-6f,
            "preserve gain processing across host reconfiguration");
+  }
+}
+
+void testVariableHostBlocksAndOversampledLatency() {
+  auto processor = std::make_unique<EffeTuneProcessor>();
+  expect(processor->initialize(nullptr) == kResultOk, "initialize variable host blocks");
+  auto processSetup = setup(48000.0, 1024);
+  expect(processor->setupProcessing(processSetup) == kResultOk,
+         "prepare variable host blocks");
+  installGainPipeline(*processor);
+  expect(processor->setActive(true) == kResultOk, "activate variable host blocks");
+  ProcessData clockData{};
+  std::int64_t renderedFrames = 0;
+  bool rebase = false;
+  for (const auto frames : {1, 128, 512, 1024, 257}) {
+    expect(PluginProcessorTestAccess::automationBlockStart(*processor, clockData, rebase) ==
+               renderedFrames && !rebase,
+           "variable host blocks begin at the cumulative rendered sample");
+    expectGainProcessing(*processor, frames);
+    renderedFrames += frames;
+  }
+  expect(PluginProcessorTestAccess::automationBlockStart(*processor, clockData, rebase) ==
+             renderedFrames && !rebase,
+         "variable host lengths advance the fallback clock without rebasing");
+  ProcessContext continuousContext{};
+  continuousContext.state = ProcessContext::kContTimeValid;
+  continuousContext.continousTimeSamples = 48017;
+  continuousContext.projectTimeSamples = -500;
+  clockData.processContext = &continuousContext;
+  const auto absoluteStart =
+      PluginProcessorTestAccess::automationBlockStart(*processor, clockData, rebase);
+  expect(absoluteStart == 48017 && rebase,
+         "valid continuous time takes precedence over fallback and project time");
+  constexpr std::array<std::uint32_t, 4> hostOffsets{0, 128, 512, 1000};
+  constexpr std::array expectedSeconds{
+      1.0003541666666667, 1.0030208333333333, 1.0110208333333333, 1.0211875};
+  for (std::size_t index = 0; index < hostOffsets.size(); ++index) {
+    expect(std::abs(PluginProcessorTestAccess::dspTimeSeconds(
+                        absoluteStart, hostOffsets[index], 48000.0) - expectedSeconds[index]) <
+               1.0e-12,
+           "DSP slice time uses the absolute host timeline independently of oversampling");
+  }
+  continuousContext.state = 0;
+  expect(PluginProcessorTestAccess::automationBlockStart(*processor, clockData, rebase) ==
+             renderedFrames && !rebase,
+         "invalid continuous time returns to the unchanged rendered clock");
+  expect(processor->setActive(false) == kResultOk, "deactivate variable host blocks");
+  expect(processor->terminate() == kResultOk, "terminate variable host blocks");
+  processor.reset();
+
+  const auto render = [](const std::uint32_t factor, const bool variableBlocks,
+                         std::uint32_t &latency) {
+    auto instance = std::make_unique<EffeTuneProcessor>();
+    expect(instance->initialize(nullptr) == kResultOk, "initialize variable latency render");
+    auto configuration = setup(48000.0, 1024);
+    expect(instance->setupProcessing(configuration) == kResultOk,
+           "prepare variable latency render");
+    const auto oversampling = choc::json::parse(instance->handleUiMessage(
+        std::string{R"({"type":"os/set","payload":{"factor":)"} +
+        std::to_string(factor) + R"(,"phase":"linear","quality":"medium"}})"));
+    expect(oversampling["ok"].getWithDefault<bool>(false), "configure render oversampling");
+    installLimiterPipeline(*instance, 41);
+    latency = instance->getLatencySamples();
+    expect(latency >= 144u, "reported latency includes the limiter lookahead");
+    expect(instance->setActive(true) == kResultOk, "activate variable latency render");
+    std::array<float, 1024> left{};
+    std::array<float, 1024> right{};
+    std::array<float, 1024> outputLeft{};
+    std::array<float, 1024> outputRight{};
+    Sample32 *inputs[]{left.data(), right.data()};
+    Sample32 *outputs[]{outputLeft.data(), outputRight.data()};
+    AudioBusBuffers input{};
+    input.numChannels = 2;
+    input.channelBuffers32 = inputs;
+    AudioBusBuffers output{};
+    output.numChannels = 2;
+    output.channelBuffers32 = outputs;
+    ProcessData data{};
+    data.symbolicSampleSize = kSample32;
+    data.numInputs = 1;
+    data.numOutputs = 1;
+    data.inputs = &input;
+    data.outputs = &output;
+    std::vector<float> result(4096);
+    constexpr std::array<int32, 4> blockSizes{128, 512, 1024, 257};
+    std::size_t offset = 0;
+    std::size_t block = 0;
+    const auto before = PluginProcessorTestAccess::processCounters(*instance);
+    while (offset < result.size()) {
+      left.fill(0.0f);
+      right.fill(0.0f);
+      if (offset == 0) left[0] = 0.5f;
+      data.numSamples = static_cast<int32>(std::min<std::size_t>(
+          variableBlocks ? blockSizes[block % blockSizes.size()] : 64,
+          result.size() - offset));
+      expect(instance->process(data) == kResultOk, "render variable latency block");
+      std::copy_n(outputLeft.begin(), data.numSamples, result.begin() + offset);
+      expect(std::all_of(outputRight.begin(), outputRight.begin() + data.numSamples,
+                         [](const float sample) { return sample == 0.0f; }),
+             "variable latency processing preserves channel isolation");
+      offset += static_cast<std::size_t>(data.numSamples);
+      ++block;
+    }
+    const auto after = PluginProcessorTestAccess::processCounters(*instance);
+    expect(after.completedBatches == before.completedBatches + block &&
+               after.processFailures == before.processFailures &&
+               instance->getLatencySamples() == latency,
+           "one successful batch per host block preserves reported latency");
+    if (factor == 4u && variableBlocks) {
+      data.numSamples = 1024;
+      left.fill(0.0f);
+      right.fill(0.0f);
+      expect(instance->process(data) == kResultOk, "warm the full oversampled block");
+      left[0] = 0.5f;
+      const auto guardedBefore = PluginProcessorTestAccess::processCounters(*instance);
+      const auto failuresBefore = PluginProcessorTestAccess::processFailureSequence(*instance);
+      effetune::allocation_guard::setAbortOnViolationForTesting(false);
+      const auto allocationsBefore = effetune::allocation_guard::violationCount();
+      Steinberg::tresult processResult = kResultFalse;
+      {
+        effetune::allocation_guard::Scope allocationScope;
+        processResult = instance->process(data);
+      }
+      effetune::allocation_guard::setAbortOnViolationForTesting(true);
+      const auto guardedAfter = PluginProcessorTestAccess::processCounters(*instance);
+      expect(processResult == kResultOk &&
+                 effetune::allocation_guard::violationCount() == allocationsBefore &&
+                 PluginProcessorTestAccess::processFailureSequence(*instance) == failuresBefore &&
+                 guardedAfter.processFailures == guardedBefore.processFailures &&
+                 guardedAfter.completedBatches == guardedBefore.completedBatches + 1u,
+             "the full 4096-frame engine call completes without audio allocation or failure");
+      expect(std::all_of(outputLeft.begin(), outputLeft.end(),
+                         [](const float sample) { return std::isfinite(sample); }) &&
+                 std::all_of(outputRight.begin(), outputRight.end(),
+                             [](const float sample) { return std::isfinite(sample); }) &&
+                 *std::max_element(outputLeft.begin(), outputLeft.end()) > 0.1f &&
+                 std::abs(outputLeft[0] - left[0]) > 0.1f,
+             "the guarded maximum block returns finite delayed wet audio");
+    }
+    expect(instance->setActive(false) == kResultOk, "deactivate variable latency render");
+    expect(instance->terminate() == kResultOk, "terminate variable latency render");
+    return result;
+  };
+  for (const auto factor : {1u, 4u}) {
+    std::uint32_t referenceLatency = 0;
+    std::uint32_t variableLatency = 0;
+    const auto reference = render(factor, false, referenceLatency);
+    const auto variable = render(factor, true, variableLatency);
+    expect(variableLatency == referenceLatency, "latency is independent of host partitioning");
+    for (std::size_t frame = 0; frame < reference.size(); ++frame) {
+      expect(std::abs(reference[frame] - variable[frame]) < 1.0e-6f,
+             "large and partial host blocks preserve oversampled delayed audio");
+    }
+    expect(*std::max_element(variable.begin(), variable.end()) > 0.1f,
+           "the delayed impulse remains present");
   }
 }
 
@@ -3803,7 +3964,7 @@ void testAutomationSliceBlockDoesNotAllocate() {
   auto processor = std::make_unique<EffeTuneProcessor>();
   expect(processor->initialize(nullptr) == kResultOk,
          "initialize the automation-slice allocation test");
-  auto processSetup = setup(48000.0, 64);
+  auto processSetup = setup(48000.0, 1024);
   expect(processor->setupProcessing(processSetup) == kResultOk,
          "prepare the automation-slice allocation test");
   const auto installed = choc::json::parse(processor->handleUiMessage(
@@ -3818,10 +3979,10 @@ void testAutomationSliceBlockDoesNotAllocate() {
   expect(processor->setActive(true) == kResultOk,
          "activate the automation-slice allocation test");
 
-  std::array<float, 64> inputLeft{};
-  std::array<float, 64> inputRight{};
-  std::array<float, 64> outputLeft{};
-  std::array<float, 64> outputRight{};
+  std::array<float, 1024> inputLeft{};
+  std::array<float, 1024> inputRight{};
+  std::array<float, 1024> outputLeft{};
+  std::array<float, 1024> outputRight{};
   Sample32 *inputChannels[]{inputLeft.data(), inputRight.data()};
   Sample32 *outputChannels[]{outputLeft.data(), outputRight.data()};
   AudioBusBuffers input{};
@@ -3832,7 +3993,7 @@ void testAutomationSliceBlockDoesNotAllocate() {
   output.channelBuffers32 = outputChannels;
   ProcessData data{};
   data.symbolicSampleSize = kSample32;
-  data.numSamples = 64;
+  data.numSamples = 1024;
   data.numInputs = 1;
   data.numOutputs = 1;
   data.inputs = &input;
@@ -3851,11 +4012,11 @@ void testAutomationSliceBlockDoesNotAllocate() {
          "create the sliced automation and bypass queues");
   int32 pointIndex = 0;
   expect(offsetQueue->addPoint(0, 0.625, pointIndex) == kResultTrue &&
-             offsetQueue->addPoint(16, 0.75, pointIndex) == kResultTrue &&
-             offsetQueue->addPoint(48, 0.25, pointIndex) == kResultTrue,
+             offsetQueue->addPoint(128, 0.75, pointIndex) == kResultTrue &&
+             offsetQueue->addPoint(512, 0.25, pointIndex) == kResultTrue,
          "schedule mid-block automation points");
   expect(bypassQueue->addPoint(0, 0.0, pointIndex) == kResultTrue &&
-             bypassQueue->addPoint(32, 1.0, pointIndex) == kResultTrue,
+             bypassQueue->addPoint(1000, 1.0, pointIndex) == kResultTrue,
          "schedule a mid-block master-bypass point");
   data.inputParameterChanges = &changes;
   const auto renderSlicedBlock = [&] { return processor->process(data); };
@@ -3879,6 +4040,12 @@ void testAutomationSliceBlockDoesNotAllocate() {
   effetune::allocation_guard::setAbortOnViolationForTesting(true);
   expect(processResult == kResultOk,
          "render the sliced automation and bypass block");
+  expect(std::abs(outputLeft[0] - 0.25f) < 1.0e-6f &&
+             std::abs(outputLeft[128] - 0.5f) < 1.0e-6f &&
+             std::abs(outputLeft[512] + 0.5f) < 1.0e-6f &&
+             std::abs(outputLeft[999] + 0.5f) < 1.0e-6f &&
+             outputLeft[1000] == 0.0f && outputLeft[1023] == 0.0f,
+         "large-block automation and bypass retain their sample boundaries");
   expect(effetune::allocation_guard::violationCount() == allocationsBefore,
          "a sliced automation block reads the apply table and the block epoch "
          "without allocating");
@@ -4220,7 +4387,7 @@ void testNativeControlServiceHandlesAssetReadyAndClear() {
   auto processor = std::make_unique<EffeTuneProcessor>();
   expect(processor->initialize(nullptr) == kResultOk,
          "initialize native asset control-service test");
-  auto processSetup = setup(48000.0, 64);
+  auto processSetup = setup(48000.0, 128);
   expect(processor->setupProcessing(processSetup) == kResultOk,
          "prepare native asset control-service test");
   installIrReverbPipeline(*processor);
@@ -4241,10 +4408,10 @@ void testNativeControlServiceHandlesAssetReadyAndClear() {
              revisionBeforeStage,
          "asset commit publishes its compensation revision without waiting for audio");
 
-  std::array<float, 64> inputLeft{};
-  std::array<float, 64> inputRight{};
-  std::array<float, 64> outputLeft{};
-  std::array<float, 64> outputRight{};
+  std::array<float, 1024> inputLeft{};
+  std::array<float, 1024> inputRight{};
+  std::array<float, 1024> outputLeft{};
+  std::array<float, 1024> outputRight{};
   Sample32 *inputChannels[]{inputLeft.data(), inputRight.data()};
   Sample32 *outputChannels[]{outputLeft.data(), outputRight.data()};
   AudioBusBuffers input{};
@@ -4255,7 +4422,7 @@ void testNativeControlServiceHandlesAssetReadyAndClear() {
   output.channelBuffers32 = outputChannels;
   ProcessData data{};
   data.symbolicSampleSize = kSample32;
-  data.numSamples = 64;
+  data.numSamples = 128;
   data.numInputs = 1;
   data.numOutputs = 1;
   data.inputs = &input;
@@ -4300,7 +4467,36 @@ void testNativeControlServiceHandlesAssetReadyAndClear() {
              std::to_string(revisionBeforeReady) + ", plan=" +
              std::to_string(readyPlanRevision) + ", serviced=" +
              std::to_string(readyServicedRevision) + ")");
-  const auto readyRevision = readyPlanRevision;
+  expect(processor->setActive(false) == kResultOk,
+         "deactivate the active asset before capacity growth");
+  auto largerSetup = setup(48000.0, 1024);
+  expect(processor->setupProcessing(largerSetup) == kResultOk &&
+             processor->setActive(true) == kResultOk,
+         "reprepare the cached active IR asset for larger host blocks");
+  data.numSamples = 1024;
+  for (std::uint32_t block = 0; block < 512u &&
+       ((PluginProcessorTestAccess::assetState(*processor, 91, 0) & 0xffu) !=
+            ET_ASSET_STATE_ACTIVE ||
+        PluginProcessorTestAccess::hasPendingControlWork(*processor)); ++block) {
+    expect(processor->process(data) == kResultOk,
+           "prepare the retained IR asset with a large host block");
+    PluginProcessorTestAccess::serviceLatencyUpdates(*processor);
+  }
+  expect((PluginProcessorTestAccess::assetState(*processor, 91, 0) & 0xffu) ==
+             ET_ASSET_STATE_ACTIVE && processor->getLatencySamples() == 128u,
+         "capacity growth restores the cached IR asset and its latency");
+  for (const auto frames : {1024, 257}) {
+    data.numSamples = frames;
+    inputLeft.fill(0.0f);
+    inputLeft[0] = 0.5f;
+    expect(processor->process(data) == kResultOk &&
+               std::abs(outputLeft[128] - 0.5f) < 1.0e-6f &&
+               std::abs(outputLeft[0]) < 1.0e-6f &&
+               processor->getLatencySamples() == 128u,
+           "the reconfigured asset processes large and partial blocks with delayed wet output");
+  }
+  inputLeft.fill(0.0f);
+  const auto readyRevision = PluginProcessorTestAccess::pipelinePlanRevision(*processor);
 
   expect(PluginProcessorTestAccess::clearAsset(*processor, 91, 0),
          "clear native IR asset without an editor");
@@ -10559,6 +10755,7 @@ int main() {
     testOversamplingFailureRestoresPreviousPlayableGeneration();
     testStoppedTransportFallbackAndDiscontinuities();
     testAutomationCatalogProjectionIsOneControlTransaction();
+    testVariableHostBlocksAndOversampledLatency();
     testClosedEditorHostAutomationUpdatesStateAndAudio();
     testBoundTargetGestureReachesAudioWithoutHostEcho();
     testNamedBulkAutomationEditsReachAudioAndUnnamedOnesStayOverlaid();

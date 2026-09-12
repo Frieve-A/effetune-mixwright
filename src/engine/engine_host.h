@@ -57,7 +57,6 @@ struct RuntimeAsset {
 class EngineHost {
 public:
   static constexpr std::uint32_t kMaxChannels = 8;
-  static constexpr std::uint32_t kMaxProcessFrames = 128;
   static constexpr std::uint32_t kDefaultTelemetryBytes = 256u * 1024u;
   static constexpr std::uint32_t kMaximumAssetPayloadBytes = 32u * 1024u * 1024u;
   static constexpr std::uint32_t kAggregateAssetBudgetBytes = 128u * 1024u * 1024u;
@@ -120,6 +119,11 @@ public:
                                     std::uint32_t frameCount,
                                     double timeSeconds,
                                     bool masterBypass) noexcept;
+    [[nodiscard]] bool processChunk(const float *const *input, float *const *output,
+                                    std::uint32_t channelCount,
+                                    std::uint32_t frameCount,
+                                    double timeSeconds,
+                                    bool masterBypass) noexcept;
     [[nodiscard]] bool finish(bool refreshLatency = false) noexcept;
     [[nodiscard]] bool active() const noexcept { return host_ != nullptr; }
     [[nodiscard]] bool failed() const noexcept { return failed_; }
@@ -141,6 +145,7 @@ public:
   EngineHost &operator=(const EngineHost &) = delete;
 
   [[nodiscard]] bool prepare(double sampleRate, std::uint32_t channels,
+                             std::uint32_t maxFrames,
                              std::uint32_t telemetryBytes = kDefaultTelemetryBytes,
                              std::string *error = nullptr);
   void reset();
@@ -242,12 +247,14 @@ private:
   static void setError(std::string *destination, std::string message);
 
   std::unique_ptr<effetune::Engine> engine_;
+  static constexpr std::uint32_t kMinimumArenaFrames = 32;
   struct LatencyUpdateStorage;
   std::unique_ptr<LatencyUpdateStorage> latencyUpdate_;
   float *combined_ = nullptr;
   double sampleRate_ = 0.0;
   double processedFrames_ = 0.0;
   std::uint32_t channels_ = 0;
+  std::uint32_t maxProcessFrames_ = 0;
   bool prepared_ = false;
   std::array<std::uint8_t, AudioCommand::kMaxDescriptorBytes> activeDescriptor_{};
   std::uint32_t activeDescriptorByteCount_ = 0;

@@ -77,6 +77,7 @@ constexpr std::string_view kWebViewHomeUri =
   constexpr std::array required{
       "effetune.html",
       "effetune.css",
+      "effetune-theme.css",
       "vst-bootstrap.js",
       "js/startup.js",
       "js/app.js",

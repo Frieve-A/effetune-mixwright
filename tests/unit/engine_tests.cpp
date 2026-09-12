@@ -2,7 +2,6 @@
 #include "bridge/message_router.h"
 #include "bridge/config_store.h"
 #include "bridge/preset_store.h"
-#include "engine/block_adapter.h"
 #include "engine/automation_catalog.h"
 #include "engine/command_queue.h"
 #include "engine/dry_delay.h"
@@ -32,6 +31,8 @@
 #include "../support/crt_dialog_suppression.h"
 
 namespace {
+
+constexpr std::uint32_t kTestBlockFrames = 128;
 
 using namespace effetune::vst;
 
@@ -311,83 +312,70 @@ void testConfigStore() {
   std::filesystem::remove(path, ignored);
 }
 
-void testBlockAdapter() {
-  BlockAdapter adapter;
-  adapter.prepare(1, 4);
-  std::array<float, 4> input{1.0f, 2.0f, 3.0f, 4.0f};
-  std::array<float, 4> output{};
-  const float *inputs[] = {input.data()};
-  float *outputs[] = {output.data()};
-  std::uint32_t receivedFrames = 0;
-  const auto ok = adapter.process(
-      inputs, outputs, 4,
-      [&receivedFrames](float *const *channels, const std::uint32_t channelCount,
-                        const std::uint32_t frames) {
-        receivedFrames = frames;
-        for (std::uint32_t channel = 0; channel < channelCount; ++channel) {
-          for (std::uint32_t frame = 0; frame < frames; ++frame) {
-            channels[channel][frame] *= 2.0f;
-          }
+void testVariableEngineBlocks() {
+  constexpr std::array blockSizes{1u, 4u, 127u, 128u, 257u, 512u, 1024u};
+  for (const auto capacity : blockSizes) {
+    EngineHost engine;
+    std::string error;
+    expect(engine.prepare(48000.0, 2, capacity, EngineHost::kDefaultTelemetryBytes, &error),
+           "variable-block engine prepare: " + error);
+    const auto kernel = engine.kernels().find("TestGainPlugin");
+    expect(kernel != engine.kernels().end(), "variable-block gain kernel registration");
+    PipelineState pipeline;
+    pipeline.plugins = {PluginState{1, "TestGainPlugin", true}};
+    RuntimePlugin runtime;
+    runtime.logicalId = 1;
+    runtime.type = "TestGainPlugin";
+    runtime.packedParameters = {0.5f};
+    runtime.paramsHash = kernel->second.paramsHash;
+    expect(engine.rebuild(pipeline, {runtime}, &error),
+           "variable-block pipeline rebuild: " + error);
+
+    std::array<std::vector<float>, 2> input;
+    std::array<std::vector<float>, 2> output;
+    for (std::size_t channel = 0; channel < input.size(); ++channel) {
+      input[channel].resize(capacity + 1u);
+      output[channel].assign(capacity + 1u, -99.0f);
+      for (std::uint32_t frame = 0; frame <= capacity; ++frame) {
+        input[channel][frame] = static_cast<float>((channel + 1u) * (frame + 1u));
+      }
+    }
+    const auto original = input;
+    const float *inputs[]{input[0].data(), input[1].data()};
+    float *outputs[]{output[0].data(), output[1].data()};
+    for (const auto frames : {1u, capacity}) {
+      EngineHost::ProcessBatch batch;
+      expect(engine.beginProcessBatch(batch) &&
+                 batch.processChunk(inputs, outputs, 2, frames, 0.0, false) && batch.finish(),
+             "process separate variable-block buffers");
+      expect(input == original, "separate-output processing preserves every input sample");
+      for (std::size_t channel = 0; channel < input.size(); ++channel) {
+        for (std::uint32_t frame = 0; frame < frames; ++frame) {
+          expect(output[channel][frame] == input[channel][frame] * 0.5f,
+                 "variable-block output keeps channel boundaries");
         }
-        return true;
-      });
-  expect(ok && receivedFrames == 4, "sub-128 host block is processed at its original size");
-  expect(output == std::array<float, 4>{2.0f, 4.0f, 6.0f, 8.0f},
-         "sub-128 host block returns without adapter delay");
-  expect(adapter.latencyFrames() == 0, "direct block adapter has no latency");
-
-  BlockAdapter failed;
-  failed.prepare(1, BlockAdapter::kMaxChunkFrames);
-  std::array<float, BlockAdapter::kMaxChunkFrames> failedInput{};
-  std::array<float, BlockAdapter::kMaxChunkFrames> failedOutput{};
-  const float *failedInputs[] = {failedInput.data()};
-  float *failedOutputs[] = {failedOutput.data()};
-  expect(!failed.process(failedInputs, failedOutputs, BlockAdapter::kMaxChunkFrames,
-                         [](float *const *, std::uint32_t, std::uint32_t) { return false; }),
-         "block adapter propagates a failed DSP chunk");
-}
-
-void testBlockSizeMatrix() {
-  constexpr std::array blockSizes{1u, 4u, 32u, 64u, 127u, 128u, 255u, 512u, 4096u};
-  for (const auto blockSize : blockSizes) {
-    BlockAdapter adapter;
-    adapter.prepare(1, blockSize);
-    std::vector<float> input(blockSize);
-    std::vector<float> output(blockSize);
-    for (std::uint32_t frame = 0; frame < blockSize; ++frame) {
-      input[frame] = static_cast<float>(frame + 1u);
+        expect(output[channel][capacity] == -99.0f,
+               "variable-block output stays within prepared capacity");
+      }
     }
-    const float *inputs[] = {input.data()};
-    float *outputs[] = {output.data()};
-    std::vector<std::uint32_t> chunks;
-    expect(adapter.process(
-               inputs, outputs, blockSize,
-               [&chunks](float *const *channels, const std::uint32_t channelCount,
-                         const std::uint32_t frames) {
-                 chunks.push_back(frames);
-                 for (std::uint32_t channel = 0; channel < channelCount; ++channel) {
-                   for (std::uint32_t frame = 0; frame < frames; ++frame) {
-                     channels[channel][frame] *= 2.0f;
-                   }
-                 }
-                 return true;
-               }),
-           "block-size matrix processing");
-    for (std::uint32_t frame = 0; frame < blockSize; ++frame) {
-      expect(output[frame] == static_cast<float>(frame + 1u) * 2.0f,
-             "block-size matrix immediate output for " + std::to_string(blockSize));
-    }
-    expect(chunks.size() ==
-               (blockSize + BlockAdapter::kMaxChunkFrames - 1u) /
-                   BlockAdapter::kMaxChunkFrames,
-           "block-size matrix chunk count for " + std::to_string(blockSize));
-    for (std::size_t chunk = 0; chunk < chunks.size(); ++chunk) {
-      const auto offset = static_cast<std::uint32_t>(chunk) * BlockAdapter::kMaxChunkFrames;
-      expect(chunks[chunk] ==
-                 std::min(BlockAdapter::kMaxChunkFrames, blockSize - offset),
-             "block-size matrix chunk length for " + std::to_string(blockSize));
+    EngineHost::ProcessBatch rejected;
+    expect(engine.beginProcessBatch(rejected) &&
+               !rejected.processChunk(inputs, outputs, 2, capacity + 1u, 0.0, false) &&
+               !rejected.finish(),
+           "separate-output processing rejects a block beyond requested capacity");
+    expect(!engine.tryProcessBlock(outputs, 2, capacity + 1u, 0.0, false),
+           "in-place processing uses the same prepared capacity");
+    expect(engine.tryProcessBlock(outputs, 2, capacity, 0.0, false),
+           "in-place processing shares the variable-block path");
+    for (std::size_t channel = 0; channel < input.size(); ++channel) {
+      for (std::uint32_t frame = 0; frame < capacity; ++frame) {
+        expect(output[channel][frame] == input[channel][frame] * 0.25f,
+               "in-place variable-block gain output");
+      }
     }
   }
+  EngineHost invalid;
+  expect(!invalid.prepare(48000.0, 2, 0), "zero requested capacity is rejected");
 }
 
 void testLatency() {
@@ -964,7 +952,7 @@ void testResampler() {
 void testEngineHost() {
   EngineHost engine;
   std::string error;
-  expect(engine.prepare(48000.0, 2, EngineHost::kDefaultTelemetryBytes, &error),
+  expect(engine.prepare(48000.0, 2, kTestBlockFrames, EngineHost::kDefaultTelemetryBytes, &error),
          "engine prepare: " + error);
 
   const auto kernel = engine.kernels().find("TestGainPlugin");
@@ -985,12 +973,12 @@ void testEngineHost() {
   expect(engine.rebuild(pipeline, {runtime}, &error),
          "engine rebuild after duplicate logical IDs: " + error);
 
-  std::array<float, EngineHost::kMaxProcessFrames> left{};
-  std::array<float, EngineHost::kMaxProcessFrames> right{};
+  std::array<float, kTestBlockFrames> left{};
+  std::array<float, kTestBlockFrames> right{};
   left.fill(1.0f);
   right.fill(-1.0f);
   float *channels[] = {left.data(), right.data()};
-  expect(engine.tryProcessBlock(channels, 2, EngineHost::kMaxProcessFrames, 0.0, false),
+  expect(engine.tryProcessBlock(channels, 2, kTestBlockFrames, 0.0, false),
          "engine process");
   for (std::size_t index = 0; index < left.size(); ++index) {
     expect(std::abs(left[index] - 0.5f) < 1.0e-7f &&
@@ -1007,13 +995,13 @@ void testEngineHost() {
              smallRight == std::array<float, 4>{-1.0f, -1.0f, -1.0f, -1.0f},
          "engine processes a four-frame host block immediately");
   expect(!engine.tryProcessBlock(channels, 2, 0, 0.2, false) &&
-             !engine.tryProcessBlock(channels, 2, EngineHost::kMaxProcessFrames + 1u,
+             !engine.tryProcessBlock(channels, 2, kTestBlockFrames + 1u,
                                      0.2, false),
          "engine enforces the variable process-frame bounds");
 
   EngineHost unsupportedWidth;
   expect(!unsupportedWidth.prepare(48000.0, EngineHost::kMaxChannels + 1u,
-                                   EngineHost::kDefaultTelemetryBytes, &error),
+                                   kTestBlockFrames, EngineHost::kDefaultTelemetryBytes, &error),
          "engine preserves the eight-channel bus boundary");
 
   pipeline.plugins[0].enabled = false;
@@ -1026,7 +1014,7 @@ void testEngineHost() {
          "apply section disable descriptor off the audio path: " + error);
   left.fill(1.0f);
   right.fill(-1.0f);
-  expect(engine.tryProcessBlock(channels, 2, EngineHost::kMaxProcessFrames, 0.0, true),
+  expect(engine.tryProcessBlock(channels, 2, kTestBlockFrames, 0.0, true),
          "disabled section command under master bypass");
   expect(left[0] == 1.0f && right[0] == -1.0f,
          "descriptor command preserves master-bypassed audio");
@@ -1038,7 +1026,7 @@ void testEngineHost() {
          "apply section enable descriptor off the audio path: " + error);
   left.fill(1.0f);
   right.fill(-1.0f);
-  expect(engine.tryProcessBlock(channels, 2, EngineHost::kMaxProcessFrames, 0.0, false),
+  expect(engine.tryProcessBlock(channels, 2, kTestBlockFrames, 0.0, false),
          "re-enabled section command");
   expect(std::abs(left[0] - 0.5f) < 1.0e-7f,
          "queued section toggle preserves the native instance");
@@ -1047,7 +1035,7 @@ void testEngineHost() {
   expect(engine.updateDescriptor(pipeline, &error), "direct descriptor update: " + error);
   left.fill(1.0f);
   right.fill(-1.0f);
-  expect(engine.tryProcessBlock(channels, 2, EngineHost::kMaxProcessFrames, 0.0, false),
+  expect(engine.tryProcessBlock(channels, 2, kTestBlockFrames, 0.0, false),
          "direct disabled section process");
   expect(left[0] == 1.0f && right[0] == -1.0f,
          "direct descriptor update remains available off the audio path");
@@ -1056,7 +1044,7 @@ void testEngineHost() {
 void testContextualBypassPreservesCrossBusRouting() {
   EngineHost engine;
   std::string error;
-  expect(engine.prepare(48000.0, 2, EngineHost::kDefaultTelemetryBytes, &error),
+  expect(engine.prepare(48000.0, 2, kTestBlockFrames, EngineHost::kDefaultTelemetryBytes, &error),
          "contextual bypass engine prepare: " + error);
   const auto kernel = engine.kernels().find("TestGainPlugin");
   expect(kernel != engine.kernels().end(), "contextual bypass test-gain kernel");
@@ -1088,13 +1076,13 @@ void testContextualBypassPreservesCrossBusRouting() {
   returnGain.paramsHash = kernel->second.paramsHash;
   std::vector runtimes{constrained, returnGain};
 
-  std::array<float, EngineHost::kMaxProcessFrames> left{};
-  std::array<float, EngineHost::kMaxProcessFrames> right{};
+  std::array<float, kTestBlockFrames> left{};
+  std::array<float, kTestBlockFrames> right{};
   float *channels[] = {left.data(), right.data()};
   const auto render = [&] {
     left.fill(1.0f);
     right.fill(-1.0f);
-    expect(engine.tryProcessBlock(channels, 2, EngineHost::kMaxProcessFrames,
+    expect(engine.tryProcessBlock(channels, 2, kTestBlockFrames,
                                   0.0, false),
            "contextual cross-bus process");
   };
@@ -1121,7 +1109,7 @@ void testContextualBypassPreservesCrossBusRouting() {
              batch.resolveParameterTarget(81, constrained.paramsHash, target) &&
              target.contextuallyBypassed &&
              batch.stageParameters(target, bypassedParameterUpdate) &&
-             batch.processChunk(channels, 2, EngineHost::kMaxProcessFrames,
+             batch.processChunk(channels, 2, kTestBlockFrames,
                                 0.0, false) &&
              batch.finish(),
          "audio-batch automation treats the dormant original image as a successful no-op");
@@ -1138,7 +1126,7 @@ void testContextualBypassPreservesCrossBusRouting() {
   {
     EngineHost dormantEngine;
     expect(dormantEngine.prepare(48000.0, EngineHost::kMaxChannels,
-                                 EngineHost::kDefaultTelemetryBytes, &error),
+                                 kTestBlockFrames, EngineHost::kDefaultTelemetryBytes, &error),
            "dormant wider-route engine prepare: " + error);
     const auto dormantKernel = dormantEngine.kernels().find("TestGainPlugin");
     expect(dormantKernel != dormantEngine.kernels().end(),
@@ -1151,7 +1139,7 @@ void testContextualBypassPreservesCrossBusRouting() {
     dormantRuntime.type = "TestGainPlugin";
     dormantRuntime.packedParameters = {0.5f};
     dormantRuntime.paramsHash = dormantKernel->second.paramsHash;
-    std::array<std::array<float, EngineHost::kMaxProcessFrames>,
+    std::array<std::array<float, kTestBlockFrames>,
                EngineHost::kMaxChannels>
         dormantSamples{};
     std::array<float *, EngineHost::kMaxChannels> dormantChannels{};
@@ -1162,7 +1150,7 @@ void testContextualBypassPreservesCrossBusRouting() {
     expect(dormantEngine.rebuild(dormantPipeline, {dormantRuntime}, &error) &&
                dormantEngine.tryProcessBlock(
                    dormantChannels.data(), EngineHost::kMaxChannels,
-                   EngineHost::kMaxProcessFrames, 0.0, false),
+                   kTestBlockFrames, 0.0, false),
            "upstream range checks keep a restored wider route dormant: " + error);
     for (std::size_t channel = 0; channel < dormantSamples.size(); ++channel) {
       expect(dormantSamples[channel][0] == static_cast<float>(channel + 1u),
@@ -1172,7 +1160,7 @@ void testContextualBypassPreservesCrossBusRouting() {
 
   {
     EngineHost monoEngine;
-    expect(monoEngine.prepare(48000.0, 1, EngineHost::kDefaultTelemetryBytes,
+    expect(monoEngine.prepare(48000.0, 1, kTestBlockFrames, EngineHost::kDefaultTelemetryBytes,
                               &error),
            "mono channel-context engine prepare: " + error);
     const auto monoKernel = monoEngine.kernels().find("TestGainPlugin");
@@ -1195,13 +1183,13 @@ void testContextualBypassPreservesCrossBusRouting() {
     monoSendRuntime.paramsHash = monoKernel->second.paramsHash;
     RuntimePlugin monoReturnRuntime = monoSendRuntime;
     monoReturnRuntime.logicalId = 84;
-    std::array<float, EngineHost::kMaxProcessFrames> mono{};
+    std::array<float, kTestBlockFrames> mono{};
     mono.fill(1.0f);
     float *monoChannels[] = {mono.data()};
     expect(monoEngine.rebuild(
                monoPipeline, {monoSendRuntime, monoReturnRuntime}, &error) &&
                monoEngine.tryProcessBlock(monoChannels, 1,
-                                          EngineHost::kMaxProcessFrames,
+                                          kTestBlockFrames,
                                           0.0, false),
            "mono null-selection cross-bus process: " + error);
     expect(std::abs(mono[0] - 1.25f) < 1.0e-7f,
@@ -1211,7 +1199,7 @@ void testContextualBypassPreservesCrossBusRouting() {
   {
     EngineHost partialPairEngine;
     expect(partialPairEngine.prepare(
-               48000.0, 3, EngineHost::kDefaultTelemetryBytes, &error),
+               48000.0, 3, kTestBlockFrames, EngineHost::kDefaultTelemetryBytes, &error),
            "partial-pair channel-context engine prepare: " + error);
     const auto partialKernel =
         partialPairEngine.kernels().find("TestGainPlugin");
@@ -1238,9 +1226,9 @@ void testContextualBypassPreservesCrossBusRouting() {
     RuntimePlugin partialReturnRuntime = partialSendRuntime;
     partialReturnRuntime.logicalId = 86;
     partialReturnRuntime.contextuallyBypassed = false;
-    std::array<float, EngineHost::kMaxProcessFrames> first{};
-    std::array<float, EngineHost::kMaxProcessFrames> second{};
-    std::array<float, EngineHost::kMaxProcessFrames> third{};
+    std::array<float, kTestBlockFrames> first{};
+    std::array<float, kTestBlockFrames> second{};
+    std::array<float, kTestBlockFrames> third{};
     first.fill(10.0f);
     second.fill(-10.0f);
     third.fill(1.0f);
@@ -1249,7 +1237,7 @@ void testContextualBypassPreservesCrossBusRouting() {
                partialPipeline, {partialSendRuntime, partialReturnRuntime},
                &error) &&
                partialPairEngine.tryProcessBlock(
-                   partialChannels, 3, EngineHost::kMaxProcessFrames, 0.0,
+                   partialChannels, 3, kTestBlockFrames, 0.0,
                    false),
            "contextual partial-pair cross-bus process: " + error);
     expect(first[0] == 10.0f && second[0] == -10.0f &&
@@ -1261,7 +1249,7 @@ void testContextualBypassPreservesCrossBusRouting() {
 void testEngineAssetTransferAndReplay() {
   EngineHost engine;
   std::string error;
-  expect(engine.prepare(48000.0, 2, EngineHost::kDefaultTelemetryBytes, &error),
+  expect(engine.prepare(48000.0, 2, kTestBlockFrames, EngineHost::kDefaultTelemetryBytes, &error),
          "asset engine prepare: " + error);
 
   const auto kernel = engine.kernels().find("IRReverbPlugin");
@@ -1314,8 +1302,8 @@ void testEngineAssetTransferAndReplay() {
   expect(engine.refreshPipelinePlan(refreshedAssetRevision, &error),
          "apply staged asset compensation");
 
-  std::array<float, EngineHost::kMaxProcessFrames> left{};
-  std::array<float, EngineHost::kMaxProcessFrames> right{};
+  std::array<float, kTestBlockFrames> left{};
+  std::array<float, kTestBlockFrames> right{};
   float *channels[] = {left.data(), right.data()};
   const auto prepareAsset = [](EngineHost &target, float *const *targetChannels,
                                const char *context) {
@@ -1323,7 +1311,7 @@ void testEngineAssetTransferAndReplay() {
     for (; quantum < 128u &&
            (target.assetState(91, 0) & 0xffu) == ET_ASSET_STATE_PREPARING;
          ++quantum) {
-      expect(target.tryProcessBlock(targetChannels, 2, EngineHost::kMaxProcessFrames,
+      expect(target.tryProcessBlock(targetChannels, 2, kTestBlockFrames,
                                     static_cast<double>(quantum) / 375.0, false),
              context);
     }
@@ -1336,7 +1324,7 @@ void testEngineAssetTransferAndReplay() {
          "asset readiness preserves the latency already published at commit");
   const auto activeAssetRefreshes = engine.processCounters().latencyRefreshes;
   for (std::uint32_t quantum = 0; quantum < 4u; ++quantum) {
-    expect(engine.tryProcessBlock(channels, 2, EngineHost::kMaxProcessFrames,
+    expect(engine.tryProcessBlock(channels, 2, kTestBlockFrames,
                                   static_cast<double>(quantum) / 375.0, false),
            "active IR reverb latency polling remains idle");
   }
@@ -1365,7 +1353,7 @@ void testEngineAssetTransferAndReplay() {
     if (quantum == 0u) {
       left[0] = 1.0f;
     }
-    expect(engine.tryProcessBlock(channels, 2, EngineHost::kMaxProcessFrames,
+    expect(engine.tryProcessBlock(channels, 2, kTestBlockFrames,
                                   static_cast<double>(quantum) / 375.0, false),
            "preserved IR reverb process");
     wetPeak = std::max(wetPeak, *std::max_element(left.begin(), left.end()));
@@ -1391,7 +1379,7 @@ void testEngineAssetTransferAndReplay() {
 void testRuntimeLatencyAndTelemetryPublication() {
   EngineHost engine;
   std::string error;
-  expect(engine.prepare(48000.0, 2, EngineHost::kDefaultTelemetryBytes, &error),
+  expect(engine.prepare(48000.0, 2, kTestBlockFrames, EngineHost::kDefaultTelemetryBytes, &error),
          "variable-latency engine prepare: " + error);
 
   const auto kernel = engine.kernels().find("BrickwallLimiterPlugin");
@@ -1407,14 +1395,14 @@ void testRuntimeLatencyAndTelemetryPublication() {
          "variable-latency engine rebuild: " + error);
   expect(engine.pipelineLatency() == 144u, "initial limiter lookahead latency");
 
-  std::array<float, EngineHost::kMaxProcessFrames> left{};
-  std::array<float, EngineHost::kMaxProcessFrames> right{};
+  std::array<float, kTestBlockFrames> left{};
+  std::array<float, kTestBlockFrames> right{};
   float *channels[] = {left.data(), right.data()};
   std::vector<std::uint8_t> telemetry(EngineHost::kDefaultTelemetryBytes);
   std::uint32_t droppedFrames = 0;
   std::uint32_t telemetryBytes = 0;
   for (std::uint32_t quantum = 0; quantum < 8 && telemetryBytes == 0; ++quantum) {
-    expect(engine.tryProcessBlock(channels, 2, EngineHost::kMaxProcessFrames,
+    expect(engine.tryProcessBlock(channels, 2, kTestBlockFrames,
                                   static_cast<double>(quantum) / 375.0, false),
            "limiter telemetry process");
     telemetryBytes = engine.readTelemetry(telemetry, droppedFrames);
@@ -1426,7 +1414,7 @@ void testRuntimeLatencyAndTelemetryPublication() {
                                (static_cast<std::uint32_t>(telemetry[10]) << 16u) |
                                (static_cast<std::uint32_t>(telemetry[11]) << 24u);
   for (std::uint32_t quantum = 8; quantum < 32; ++quantum) {
-    expect(engine.tryProcessBlock(channels, 2, EngineHost::kMaxProcessFrames,
+    expect(engine.tryProcessBlock(channels, 2, kTestBlockFrames,
                                   static_cast<double>(quantum) / 375.0, false),
            "queued telemetry process");
   }
@@ -1440,13 +1428,13 @@ void testRuntimeLatencyAndTelemetryPublication() {
   expect(droppedFrames > 0, "skipped telemetry frame count is carried to the delivery");
 
   for (std::uint32_t quantum = 32; quantum < 48; ++quantum) {
-    expect(engine.tryProcessBlock(channels, 2, EngineHost::kMaxProcessFrames,
+    expect(engine.tryProcessBlock(channels, 2, kTestBlockFrames,
                                   static_cast<double>(quantum) / 375.0, false),
            "hidden telemetry process");
   }
   engine.discardTelemetry();
   for (std::uint32_t quantum = 48; quantum < 56; ++quantum) {
-    expect(engine.tryProcessBlock(channels, 2, EngineHost::kMaxProcessFrames,
+    expect(engine.tryProcessBlock(channels, 2, kTestBlockFrames,
                                   static_cast<double>(quantum) / 375.0, false),
            "resumed telemetry process");
   }
@@ -1464,7 +1452,7 @@ void testRuntimeLatencyAndTelemetryPublication() {
   AudioCommandQueue queue;
   expect(queue.push(command), "enqueue variable-latency parameter update");
   const auto previousRevision = engine.latencyRevision();
-  expect(engine.tryProcessBlock(channels, 2, EngineHost::kMaxProcessFrames, 1.0, false, &queue),
+  expect(engine.tryProcessBlock(channels, 2, kTestBlockFrames, 1.0, false, &queue),
          "apply variable-latency parameter update");
   expect(engine.pipelineLatency() == 144u && engine.latencyRevision() == previousRevision,
          "parameter staging preserves the applied limiter latency");
@@ -1494,7 +1482,7 @@ void testRuntimeLatencyAndTelemetryPublication() {
 void testMasterBypassLatencyAlignment() {
   EngineHost engine;
   std::string error;
-  expect(engine.prepare(48000.0, 2, EngineHost::kDefaultTelemetryBytes, &error),
+  expect(engine.prepare(48000.0, 2, kTestBlockFrames, EngineHost::kDefaultTelemetryBytes, &error),
          "master-bypass alignment engine prepare: " + error);
 
   const auto kernel = engine.kernels().find("BrickwallLimiterPlugin");
@@ -1511,12 +1499,10 @@ void testMasterBypassLatencyAlignment() {
          "master-bypass alignment engine rebuild: " + error);
   expect(engine.pipelineLatency() == 480u, "master-bypass limiter latency");
 
-  constexpr std::uint32_t blockFrames = EngineHost::kMaxProcessFrames;
+  constexpr std::uint32_t blockFrames = kTestBlockFrames;
   const auto reportedLatency = calculateTotalLatency(0, 1, engine.pipelineLatency());
   expect(reportedLatency == 480u, "master-bypass reported total latency");
 
-  BlockAdapter adapter;
-  adapter.prepare(2, blockFrames);
   DryDelayLine dryDelay;
   expect(dryDelay.prepare(2, blockFrames, reportedLatency),
          "master-bypass dry delay prepare");
@@ -1536,18 +1522,13 @@ void testMasterBypassLatencyAlignment() {
     if (block == 0) {
       input[0][0] = 0.5f;
     }
-    expect(adapter.process(
-               inputPointers, outputPointers, blockFrames,
-               [&engine, &processedFrames](float *const *channels,
-                                           const std::uint32_t channelCount,
-                                           const std::uint32_t frames) {
-                 const auto ok = engine.tryProcessBlock(
-                     channels, channelCount, frames,
-                     static_cast<double>(processedFrames) / 48000.0, false);
-                 processedFrames += frames;
-                 return ok;
-               }),
+    EngineHost::ProcessBatch batch;
+    expect(engine.beginProcessBatch(batch) &&
+               batch.processChunk(inputPointers, outputPointers, 2, blockFrames,
+                                  static_cast<double>(processedFrames) / 48000.0, false) &&
+               batch.finish(),
            "master-bypass active impulse process");
+    processedFrames += blockFrames;
     processed.insert(processed.end(), processedBlock[0].begin(), processedBlock[0].end());
 
     const auto *delayed = dryDelay.process(inputPointers, 2, blockFrames);
@@ -1586,8 +1567,7 @@ int main() {
     testDryDelayLine();
     testSteppedIntegerAutomationCatalog();
     testConfigStore();
-    testBlockAdapter();
-    testBlockSizeMatrix();
+    testVariableEngineBlocks();
     testLatency();
     testStateCodec();
     testMessageRouter();

@@ -26,6 +26,7 @@ set(effetune_webview_assets "${CMAKE_BINARY_DIR}/webview-assets")
 file(GLOB_RECURSE effetune_ui_source_files CONFIGURE_DEPENDS LIST_DIRECTORIES false
   "${PROJECT_SOURCE_DIR}/external/effetune/effetune.html"
   "${PROJECT_SOURCE_DIR}/external/effetune/effetune.css"
+  "${PROJECT_SOURCE_DIR}/external/effetune/effetune-theme.css"
   "${PROJECT_SOURCE_DIR}/external/effetune/js/*"
   "${PROJECT_SOURCE_DIR}/external/effetune/plugins/*"
   "${PROJECT_SOURCE_DIR}/external/effetune/presets/*"

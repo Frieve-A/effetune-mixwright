@@ -6,7 +6,6 @@
 #include "bridge/state_codec.h"
 #include "bridge/config_store.h"
 #include "bridge/preset_store.h"
-#include "engine/block_adapter.h"
 #include "engine/automation_catalog.h"
 #include "engine/automation_scheduler.h"
 #include "engine/command_queue.h"
@@ -480,6 +479,9 @@ private:
   void closeOpenHostGestures() noexcept;
   [[nodiscard]] std::int64_t automationBlockStart(
       const Steinberg::Vst::ProcessData &data, bool &rebase) noexcept;
+  [[nodiscard]] static double dspTimeSeconds(std::int64_t absoluteStart,
+                                            std::uint32_t hostOffset,
+                                            double hostSampleRate) noexcept;
 
   struct PendingAssetTransfer {
     RuntimeAsset asset;
@@ -490,7 +492,6 @@ private:
   struct ControlServiceTimer;
 
   EngineHost engine_;
-  BlockAdapter blockAdapter_;
   Oversampler oversampler_;
   DryDelayLine dryDelay_;
   enum class LatencyUpdateState : std::uint8_t { idle, captured, prepared, retired };

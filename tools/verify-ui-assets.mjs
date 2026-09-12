@@ -28,6 +28,8 @@ const pipelineAiDialog = await readFile(
   path.join(assets, 'js', 'ui', 'pipeline', 'pipeline-ai-dialog.js'), 'utf8');
 const browserAudioManager = await readFile(path.join(assets, 'js', 'audio-manager.js'), 'utf8');
 const pipelineManager = await readFile(path.join(assets, 'js', 'ui', 'pipeline-manager.js'), 'utf8');
+const uiEventHandler = await readFile(
+  path.join(assets, 'js', 'ui', 'pipeline', 'ui-event-handler.js'), 'utf8');
 const routingDialog = await readFile(
   path.join(assets, 'js', 'ui', 'pipeline', 'pipeline-routing-dialog.js'), 'utf8');
 const pluginPresetStore = await readFile(
@@ -58,6 +60,7 @@ const japaneseLocale = await readFile(path.join(assets, 'js', 'locales', 'ja.jso
 const requiredFiles = [
   'vst-bootstrap.js',
   'vst-audio-manager.js',
+  'effetune-theme.css',
   'js/startup.js',
   'THIRD-PARTY-NOTICES.txt',
   'plugins/plugins.txt',
@@ -336,7 +339,9 @@ if (uiManager.includes('double-blind-test/double-blind-test.js') ||
 if (pipelineManager.includes("from './pipeline/file-processor.js'") ||
     pipelineManager.includes('new FileProcessor(') ||
     pipelineManager.includes('this.fileProcessor.processDroppedAudioFiles(') ||
-    !pipelineManager.includes('this.fileProcessor = null;')) {
+    !pipelineManager.includes('this.fileProcessor = null;') ||
+    !uiManager.includes('new PipelineManager(audioManager, pluginManager, this.expandedPlugins, this.pluginListManager, { enableFileProcessing: false })') ||
+    !uiEventHandler.includes('if (this.pipelineManager.fileProcessingEnabled)')) {
   throw new Error('The offline file-processing UI remains reachable');
 }
 if (!audioAdapter.includes('name: plugin.name || logical?.name') ||
@@ -734,11 +739,10 @@ if (!fifteenBandGeq.includes(
   'if (this.isHeldByUser(slider) || this.isHeldByUser(valueDisplay)) continue;')) {
   throw new Error('Fifteen Band GEQ refresh does not preserve each slider/readout pair while held');
 }
-if (!narrowRange.includes('const hpfFrequencyHeld = [...hpfInputs].some(input => this.isHeldByUser(input));') ||
-    !narrowRange.includes('const lpfFrequencyHeld = [...lpfInputs].some(input => this.isHeldByUser(input));') ||
-    !narrowRange.includes('if (!hpfFrequencyHeld) {') ||
-    !narrowRange.includes('if (!lpfFrequencyHeld) {')) {
-  throw new Error('Narrow Range refresh does not preserve frequency pairs while held');
+if (!narrowRange.includes("}, 'Hz', 'hf');") ||
+    !narrowRange.includes("}, 'Hz', 'lf');") ||
+    !pluginBase.includes('if (control.elements.some(heldByUser)) continue;')) {
+  throw new Error('Narrow Range frequency pairs do not use the shared held-control sync contract');
 }
 if (!tiltEq.includes('const pivotFrequencyHeld =') ||
     !tiltEq.includes('this.isHeldByUser(pivotLogSlider) || this.isHeldByUser(pivotHzInput)') ||

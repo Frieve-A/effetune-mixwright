@@ -208,16 +208,19 @@ void EngineHost::discoverKernels() {
 }
 
 bool EngineHost::prepare(const double sampleRate, const std::uint32_t channels,
+                         const std::uint32_t maxFrames,
                          const std::uint32_t telemetryBytes, std::string *error) {
   if (!std::isfinite(sampleRate) || sampleRate <= 0.0 || channels == 0 ||
-      channels > kMaxChannels || telemetryBytes == 0) {
+      channels > kMaxChannels || maxFrames == 0 || telemetryBytes == 0) {
     setError(error, "Invalid DSP prepare configuration");
     return false;
   }
   std::scoped_lock lock(engineMutex_);
   clearInstancesUnlocked();
   const auto status =
-      engine_->prepare(static_cast<float>(sampleRate), channels, kMaxProcessFrames, telemetryBytes);
+      engine_->prepare(static_cast<float>(sampleRate), channels,
+                        std::max(maxFrames, kMinimumArenaFrames),
+                        telemetryBytes);
   if (status != ET_OK) {
     prepared_ = false;
     setError(error, "et_engine_prepare failed with status " + std::to_string(status));
@@ -236,6 +239,7 @@ bool EngineHost::prepare(const double sampleRate, const std::uint32_t channels,
   }
   sampleRate_ = sampleRate;
   channels_ = channels;
+  maxProcessFrames_ = maxFrames;
   processedFrames_ = 0.0;
   prepared_ = true;
   activeDescriptorByteCount_ = 0;
@@ -806,7 +810,7 @@ bool EngineHost::tryProcessBlock(float *const *channels, const std::uint32_t cha
                                  AudioCommandQueue *commands,
                                  LatestParameterMailbox *parameterMailbox) noexcept {
   if (channels == nullptr || channelCount == 0 || channelCount > channels_ ||
-      frameCount == 0 || frameCount > kMaxProcessFrames ||
+      frameCount == 0 || frameCount > maxProcessFrames_ ||
       !std::isfinite(timeSeconds)) {
     return false;
   }
@@ -898,9 +902,17 @@ bool EngineHost::ProcessBatch::processChunk(float *const *channels,
                                             const std::uint32_t frameCount,
                                             const double timeSeconds,
                                             const bool masterBypass) noexcept {
-  if (host_ == nullptr || failed_ || channels == nullptr || channelCount == 0 ||
+  return processChunk(channels, channels, channelCount, frameCount, timeSeconds, masterBypass);
+}
+
+bool EngineHost::ProcessBatch::processChunk(const float *const *input, float *const *output,
+                                            const std::uint32_t channelCount,
+                                            const std::uint32_t frameCount,
+                                            const double timeSeconds,
+                                            const bool masterBypass) noexcept {
+  if (host_ == nullptr || failed_ || input == nullptr || output == nullptr || channelCount == 0 ||
       channelCount > host_->channels_ || frameCount == 0 ||
-      frameCount > kMaxProcessFrames || !std::isfinite(timeSeconds)) {
+      frameCount > host_->maxProcessFrames_ || !std::isfinite(timeSeconds)) {
     if (host_ != nullptr) {
       host_->processCounterAtoms_.processFailures.fetch_add(1,
                                                             std::memory_order_relaxed);
@@ -910,7 +922,7 @@ bool EngineHost::ProcessBatch::processChunk(float *const *channels,
     return false;
   }
   for (std::uint32_t channel = 0; channel < channelCount; ++channel) {
-    if (channels[channel] == nullptr) {
+    if (input[channel] == nullptr || output[channel] == nullptr) {
       host_->processCounterAtoms_.processFailures.fetch_add(1,
                                                             std::memory_order_relaxed);
       host_->recordProcessFailure(ProcessError::invalidProcessChunk);
@@ -918,7 +930,7 @@ bool EngineHost::ProcessBatch::processChunk(float *const *channels,
       return false;
     }
     std::memcpy(host_->combined_ + static_cast<std::size_t>(channel) * frameCount,
-                channels[channel], sizeof(float) * frameCount);
+                input[channel], sizeof(float) * frameCount);
   }
   et_status status = ET_ERR_STATE;
   {
@@ -936,7 +948,7 @@ bool EngineHost::ProcessBatch::processChunk(float *const *channels,
     return false;
   }
   for (std::uint32_t channel = 0; channel < channelCount; ++channel) {
-    std::memcpy(channels[channel],
+    std::memcpy(output[channel],
                 host_->combined_ + static_cast<std::size_t>(channel) * frameCount,
                 sizeof(float) * frameCount);
   }

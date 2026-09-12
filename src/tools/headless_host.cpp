@@ -20,6 +20,8 @@
 
 namespace {
 
+constexpr std::uint32_t kBlockFrames = 128;
+
 struct Options {
   std::filesystem::path input;
   std::filesystem::path output;
@@ -106,7 +108,7 @@ void process(const Options &options) {
   effetune::vst::EngineHost engine;
   std::string error;
   if (!engine.prepare(properties.sampleRate, properties.numChannels,
-                      effetune::vst::EngineHost::kDefaultTelemetryBytes, &error)) {
+                      kBlockFrames, effetune::vst::EngineHost::kDefaultTelemetryBytes, &error)) {
     throw std::runtime_error(error);
   }
 
@@ -128,7 +130,7 @@ void process(const Options &options) {
 
   choc::buffer::ChannelArrayBuffer<float> output(properties.numChannels,
                                                   input.getNumFrames());
-  std::array<std::array<float, effetune::vst::EngineHost::kMaxProcessFrames>,
+  std::array<std::array<float, kBlockFrames>,
              effetune::vst::EngineHost::kMaxChannels>
       block{};
   std::array<float *, effetune::vst::EngineHost::kMaxChannels> pointers{};
@@ -138,8 +140,8 @@ void process(const Options &options) {
 
   const auto frameCount = static_cast<std::uint32_t>(input.getNumFrames());
   for (std::uint32_t offset = 0; offset < frameCount;
-       offset += effetune::vst::EngineHost::kMaxProcessFrames) {
-    const auto validFrames = std::min(effetune::vst::EngineHost::kMaxProcessFrames,
+       offset += kBlockFrames) {
+    const auto validFrames = std::min(kBlockFrames,
                                       frameCount - offset);
     for (std::uint32_t channel = 0; channel < properties.numChannels; ++channel) {
       for (std::uint32_t frame = 0; frame < validFrames; ++frame) {

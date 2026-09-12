@@ -50,7 +50,7 @@ await mkdir(output, { recursive: true });
 for (const entry of ['js', 'plugins', 'presets', 'images']) {
   await cp(path.join(source, entry), path.join(output, entry), { recursive: true });
 }
-for (const entry of ['effetune.css']) {
+for (const entry of ['effetune.css', 'effetune-theme.css']) {
   await cp(path.join(source, entry), path.join(output, entry));
 }
 await cp(path.join(projectRoot, 'ui-shim', 'vst-bootstrap.js'),
@@ -295,37 +295,6 @@ fifteenBandGeq = fifteenBandGeq.replace(fifteenBandGeqRefresh, `            cons
             }`);
 await writeFile(fifteenBandGeqPath, fifteenBandGeq, 'utf8');
 
-const narrowRangePath = path.join(output, 'plugins', 'eq', 'narrow_range.js');
-let narrowRange = await readFile(narrowRangePath, 'utf8');
-const narrowRangeFrequencyRefresh = `      hpfInputs.forEach(input => {
-        input.value = this.hf;
-        // Only the range of the pair carries a track fill to repaint.
-        if (input.type === "range") window.uiManager?.refreshRangeFillStyling?.(input);
-      });
-      lpfInputs.forEach(input => {
-        input.value = this.lf;
-        if (input.type === "range") window.uiManager?.refreshRangeFillStyling?.(input);
-      });`;
-if (narrowRange.split(narrowRangeFrequencyRefresh).length - 1 !== 1) {
-  throw new Error('Unable to locate the Narrow Range frequency refresh pairs');
-}
-narrowRange = narrowRange.replace(narrowRangeFrequencyRefresh, `      const hpfFrequencyHeld = [...hpfInputs].some(input => this.isHeldByUser(input));
-      if (!hpfFrequencyHeld) {
-        hpfInputs.forEach(input => {
-          input.value = this.hf;
-          // Only the range of the pair carries a track fill to repaint.
-          if (input.type === "range") window.uiManager?.refreshRangeFillStyling?.(input);
-        });
-      }
-      const lpfFrequencyHeld = [...lpfInputs].some(input => this.isHeldByUser(input));
-      if (!lpfFrequencyHeld) {
-        lpfInputs.forEach(input => {
-          input.value = this.lf;
-          if (input.type === "range") window.uiManager?.refreshRangeFillStyling?.(input);
-        });
-      }`);
-await writeFile(narrowRangePath, narrowRange, 'utf8');
-
 const tiltEqPath = path.join(output, 'plugins', 'eq', 'tilt_eq.js');
 let tiltEq = await readFile(tiltEqPath, 'utf8');
 const tiltEqPivotRefresh = `            pivotLogSlider.value = this.f0;
@@ -387,7 +356,7 @@ await writeFile(historyPath, history, 'utf8');
 const pipelineManagerPath = path.join(output, 'js', 'ui', 'pipeline-manager.js');
 let pipelineManager = await readFile(pipelineManagerPath, 'utf8');
 const fileProcessorImport = `import { FileProcessor } from './pipeline/file-processor.js';\n`;
-const fileProcessorConstruction = `        this.fileProcessor = new FileProcessor(this);`;
+const fileProcessorConstruction = `        this.fileProcessor = enableFileProcessing ? new FileProcessor(this) : null;`;
 const droppedAudioMethod = `    /**
      * Process dropped audio files
      * Delegates to FileProcessor
@@ -409,6 +378,12 @@ await writeFile(pipelineManagerPath, pipelineManager, 'utf8');
 
 const uiManagerPath = path.join(output, 'js', 'ui-manager.js');
 let uiManager = await readFile(uiManagerPath, 'utf8');
+const pipelineManagerConstruction = `        this.pipelineManager = new PipelineManager(audioManager, pluginManager, this.expandedPlugins, this.pluginListManager);`;
+if (uiManager.split(pipelineManagerConstruction).length - 1 !== 1) {
+  throw new Error('Unable to locate the PipelineManager construction');
+}
+uiManager = uiManager.replace(pipelineManagerConstruction,
+  `        this.pipelineManager = new PipelineManager(audioManager, pluginManager, this.expandedPlugins, this.pluginListManager, { enableFileProcessing: false });`);
 const pipelinePerformanceRefresh = `        this.updatePipelineLatency(this.audioManager?.dspPipelineLatencySamples ?? 0);
         this.updatePipelineCpuUsage(this.pipelineCpuAveragePercent);`;
 if (uiManager.split(pipelinePerformanceRefresh).length - 1 !== 1) {

@@ -18,6 +18,8 @@ using namespace effetune::vst;
 
 namespace {
 
+constexpr std::uint32_t kTestBlockFrames = 128;
+
 void expect(const bool condition, const std::string &message) {
   if (!condition) {
     throw std::runtime_error(message);
@@ -71,7 +73,7 @@ private:
 void testProcessChunkRestoresMxcsr() {
   EngineHost engine;
   std::string error;
-  expect(engine.prepare(48000.0, 1, EngineHost::kDefaultTelemetryBytes, &error),
+  expect(engine.prepare(48000.0, 1, kTestBlockFrames, EngineHost::kDefaultTelemetryBytes, &error),
          "MXCSR engine prepare: " + error);
   const auto kernel = engine.kernels().find("TestGainPlugin");
   expect(kernel != engine.kernels().end(), "MXCSR test kernel registration");
@@ -101,7 +103,7 @@ void testProcessChunkRestoresMxcsr() {
 void testSingleTransactionAndBoundaryStaging() {
   EngineHost engine;
   std::string error;
-  expect(engine.prepare(48000.0, 2, EngineHost::kDefaultTelemetryBytes, &error),
+  expect(engine.prepare(48000.0, 2, kTestBlockFrames, EngineHost::kDefaultTelemetryBytes, &error),
          "batch engine prepare: " + error);
   const auto kernel = engine.kernels().find("TestGainPlugin");
   expect(kernel != engine.kernels().end(), "batch test kernel registration");
@@ -160,7 +162,7 @@ void testSingleTransactionAndBoundaryStaging() {
 void testFailureCounters() {
   EngineHost engine;
   std::string error;
-  expect(engine.prepare(48000.0, 1, EngineHost::kDefaultTelemetryBytes, &error),
+  expect(engine.prepare(48000.0, 1, kTestBlockFrames, EngineHost::kDefaultTelemetryBytes, &error),
          "failure engine prepare: " + error);
   const auto kernel = engine.kernels().find("TestGainPlugin");
   expect(kernel != engine.kernels().end(), "failure test kernel registration");
@@ -206,7 +208,7 @@ void testFailureCounters() {
 void testChannelAwarePipelineLatencyRouting() {
   EngineHost engine;
   std::string error;
-  expect(engine.prepare(48000.0, 2, EngineHost::kDefaultTelemetryBytes, &error),
+  expect(engine.prepare(48000.0, 2, kTestBlockFrames, EngineHost::kDefaultTelemetryBytes, &error),
          "latency routing engine prepare: " + error);
   const auto limiter = engine.kernels().find("BrickwallLimiterPlugin");
   const auto gain = engine.kernels().find("TestGainPlugin");
@@ -282,7 +284,7 @@ void testChannelAwarePipelineLatencyRouting() {
   expect(engine.pipelineLatency() == 624u,
          "bus routing and merge preserve independent channel path latency");
 
-  expect(engine.prepare(48000.0, 4, EngineHost::kDefaultTelemetryBytes, &error),
+  expect(engine.prepare(48000.0, 4, kTestBlockFrames, EngineHost::kDefaultTelemetryBytes, &error),
          "paired latency engine prepare: " + error);
   PipelineState paired;
   paired.plugins = {makeNode(401, "BrickwallLimiterPlugin", "34"),
@@ -300,7 +302,7 @@ void testLiveLatencyHandoffForParallelAndBusMerges() {
   for (const bool useBus : {false, true}) {
     EngineHost engine;
     std::string error;
-    expect(engine.prepare(48000, 2, EngineHost::kDefaultTelemetryBytes, &error),
+    expect(engine.prepare(48000, 2, kTestBlockFrames, EngineHost::kDefaultTelemetryBytes, &error),
            "prepare live latency routing");
     const auto hash = engine.kernels().at("BrickwallLimiterPlugin").paramsHash;
     PipelineState pipeline;
