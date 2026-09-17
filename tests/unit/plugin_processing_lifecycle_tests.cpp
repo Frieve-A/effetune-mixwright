@@ -1248,6 +1248,81 @@ void expectGainProcessing(EffeTuneProcessor &processor, const int32 frames) {
   }
 }
 
+void testFrequencyPreviewReachesPipelineAndStopsWithEditor() {
+  auto processor = std::make_unique<EffeTuneProcessor>();
+  expect(processor->initialize(nullptr) == kResultOk, "initialize frequency preview");
+  auto processSetup = setup(48000.0, 512);
+  expect(processor->setupProcessing(processSetup) == kResultOk, "prepare preview");
+  installGainPipeline(*processor);
+  expect(processor->setActive(true) == kResultOk, "activate preview");
+  std::array<float, 512> inputLeft{}, inputRight{}, outputLeft{}, outputRight{};
+  Sample32 *inputs[]{inputLeft.data(), inputRight.data()};
+  Sample32 *outputs[]{outputLeft.data(), outputRight.data()};
+  AudioBusBuffers input{}, output{};
+  input.numChannels = output.numChannels = 2;
+  input.channelBuffers32 = inputs;
+  output.channelBuffers32 = outputs;
+  ProcessData data{};
+  data.symbolicSampleSize = kSample32;
+  data.numSamples = 512;
+  data.numInputs = data.numOutputs = 1;
+  data.inputs = &input;
+  data.outputs = &output;
+  const auto process = [&] {
+    tresult result;
+    {
+      effetune::allocation_guard::Scope noAudioAllocation;
+      result = processor->process(data);
+    }
+    expect(result == kResultOk, "process preview without allocations");
+  };
+  const auto send = [&](const std::string &frequency) {
+    const auto response = choc::json::parse(processor->handleUiMessage(
+        "{\"type\":\"audio/frequencyPreview\",\"payload\":{\"frequency\":" + frequency + "}}"));
+    expect(response["ok"].getWithDefault<bool>(false), "route preview control");
+  };
+  process();
+  send("1000");
+  process();
+  process();
+  const auto peak = *std::max_element(outputLeft.begin(), outputLeft.end());
+  expect(std::abs(peak - 0.251188643150958f * 0.5011872336f) < 1.0e-6f,
+         "preview is mixed before the gain pipeline at upstream amplitude");
+  expect(outputLeft == outputRight && inputLeft[100] == 0.0f,
+         "preview shares L/R phase and leaves host input untouched");
+  send("2000");
+  process();
+  int crossings = 0;
+  for (std::size_t frame = 1; frame < outputLeft.size(); ++frame) {
+    if (outputLeft[frame - 1] <= 0.0f && outputLeft[frame] > 0.0f) ++crossings;
+  }
+  expect(crossings >= 21 && crossings <= 22, "retune follows the live frequency");
+  const auto expectStopped = [&] {
+    process();
+    process();
+    expect(std::all_of(outputLeft.begin(), outputLeft.end(),
+                      [](float sample) { return sample == 0.0f; }),
+           "preview release reaches silence");
+  };
+  send("null");
+  expectStopped();
+  send("1000");
+  process();
+  processor->detachEditor(nullptr);
+  expectStopped();
+  send("1000");
+  process();
+  (void)processor->handleUiMessage(R"({"type":"host/getInfo","payload":{"startup":true}})");
+  expectStopped();
+  send("1000");
+  process();
+  expect(processor->setActive(false) == kResultOk, "suspend preview");
+  expect(processor->setActive(true) == kResultOk, "resume without stale preview");
+  expectStopped();
+  expect(processor->setActive(false) == kResultOk, "deactivate preview");
+  expect(processor->terminate() == kResultOk, "terminate preview");
+}
+
 void testVariableHostBlocksAndOversampledLatency() {
   auto processor = std::make_unique<EffeTuneProcessor>();
   expect(processor->initialize(nullptr) == kResultOk, "initialize variable host blocks");
@@ -10756,6 +10831,7 @@ int main() {
     testStoppedTransportFallbackAndDiscontinuities();
     testAutomationCatalogProjectionIsOneControlTransaction();
     testVariableHostBlocksAndOversampledLatency();
+    testFrequencyPreviewReachesPipelineAndStopsWithEditor();
     testClosedEditorHostAutomationUpdatesStateAndAudio();
     testBoundTargetGestureReachesAudioWithoutHostEcho();
     testNamedBulkAutomationEditsReachAudioAndUnnamedOnesStayOverlaid();

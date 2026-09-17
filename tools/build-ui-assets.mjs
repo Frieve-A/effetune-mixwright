@@ -384,13 +384,11 @@ if (uiManager.split(pipelineManagerConstruction).length - 1 !== 1) {
 }
 uiManager = uiManager.replace(pipelineManagerConstruction,
   `        this.pipelineManager = new PipelineManager(audioManager, pluginManager, this.expandedPlugins, this.pluginListManager, { enableFileProcessing: false });`);
-const pipelinePerformanceRefresh = `        this.updatePipelineLatency(this.audioManager?.dspPipelineLatencySamples ?? 0);
-        this.updatePipelineCpuUsage(this.pipelineCpuAveragePercent);`;
+const pipelinePerformanceRefresh = `        this.updatePipelineCpuUsage(this.pipelineCpuAveragePercent);`;
 if (uiManager.split(pipelinePerformanceRefresh).length - 1 !== 1) {
   throw new Error('Unable to locate the pipeline performance status refresh');
 }
-uiManager = uiManager.replace(pipelinePerformanceRefresh, `        this.updatePipelineLatency(this.audioManager?.dspPipelineLatencySamples ?? 0);
-        this.updatePipelineCpuUsage(
+uiManager = uiManager.replace(pipelinePerformanceRefresh, `        this.updatePipelineCpuUsage(
             this.audioManager?.pipelineCpuAveragePercent ?? this.pipelineCpuAveragePercent
         );`);
 const pipelineAnalyzerInitialization = `        this.initPipelineAnalyzerBootstrap();

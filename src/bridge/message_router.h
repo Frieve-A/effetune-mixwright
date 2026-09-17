@@ -10,6 +10,7 @@ namespace effetune::vst {
 
 enum class UiAction {
   hostInfo,
+  frequencyPreview,
   openExternalUrl,
   rebuildPipeline,
   restoreHistory,
@@ -93,6 +94,7 @@ struct RoutedUiMessage {
   std::uint32_t pluginId = 0;
   std::uint32_t elementIndex = 0;
   double normalizedValue = 0.0;
+  double previewFrequency = 0.0;
   std::string pluginType;
   std::string parameterKey;
   OversamplingSettings oversampling;

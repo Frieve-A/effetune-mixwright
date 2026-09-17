@@ -168,6 +168,7 @@ class NativePort {
     // to. The close publishes first, so the order is the same one a release
     // inside the editor produces.
     this.flushOnEditorTeardown = () => {
+      this.stopFrequencyPreview();
       this.closePointerGesture();
       this.flushPluginUpdates();
     };
@@ -365,6 +366,12 @@ class NativePort {
 
   postMessage(message, reason = '') {
     if (!message || typeof message !== 'object') return;
+    if (message.type === 'frequencyPreview') {
+      this.frequencyPreviewActive = Number.isFinite(message.frequency) && message.frequency > 0;
+      return window.__effetuneHostCall('audio/frequencyPreview', {
+        frequency: this.frequencyPreviewActive ? message.frequency : null
+      }).catch(error => console.error('[EffeTune Mixwright] frequency preview failed', error));
+    }
     // Everything except a coalesced plug-in image keeps its issue order across
     // the bridge, so a deferred update can never land after the rebuild, master
     // bypass, or asset operation that replaced it.
@@ -788,9 +795,15 @@ class NativePort {
     if (type === 'message') this.listeners.delete(listener);
   }
   start() {}
+  stopFrequencyPreview() {
+    if (this.frequencyPreviewActive) {
+      this.postMessage({ type: 'frequencyPreview', frequency: null });
+    }
+  }
   // Closing the port ends the only path a queued image can still leave through,
   // so it publishes before it releases the listeners that would have done it.
   close() {
+    this.stopFrequencyPreview();
     // The port is the only route the close itself can leave through, and the
     // listeners that would have derived it are released just below, so a touch
     // still open here has to end now or never: the host would keep believing
@@ -976,6 +989,7 @@ export class AudioManager extends BrowserAudioManager {
       this.dispatchEvent('dspLatency', {
         type: 'dspLatency',
         samples: latencySamples,
+        totalSamples: this.getTotalPipelineLatencySamples(),
         sampleRate: this.audioContext?.sampleRate,
         compensated: latencyCompensated
       });
@@ -1012,6 +1026,7 @@ export class AudioManager extends BrowserAudioManager {
   }
 
   async rebuildPipeline() {
+    window.FrequencyPreview?.stop?.();
     this.pipeline = this.getCurrentPipeline();
     window.pipeline = this.pipeline;
     // The upstream execution-state validator matches notifications against

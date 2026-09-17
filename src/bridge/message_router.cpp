@@ -425,6 +425,12 @@ bool MessageRouter::decode(const std::string_view json, RoutedUiMessage &message
     if (type == "host/getInfo") {
       decoded.action = UiAction::hostInfo;
       decoded.startupHandshake = payload["startup"].getWithDefault<bool>(false);
+    } else if (type == "audio/frequencyPreview") {
+      decoded.action = UiAction::frequencyPreview;
+      decoded.previewFrequency = payload["frequency"].getWithDefault<double>(0.0);
+      if (!std::isfinite(decoded.previewFrequency) || decoded.previewFrequency <= 0.0) {
+        decoded.previewFrequency = 0.0;
+      }
     } else if (type == "host/openExternal") {
       decoded.action = UiAction::openExternalUrl;
       decoded.url = payload["url"].getWithDefault<std::string>({});

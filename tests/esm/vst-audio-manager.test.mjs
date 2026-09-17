@@ -139,6 +139,24 @@ function createNativePort() {
   return { context, hostCalls, node, port };
 }
 
+test('frequency audition forwards start, retune and stop and ends on editor teardown', async () => {
+  const { context, hostCalls, port } = createNativePort();
+  for (const frequency of [440, 880, null]) {
+    await port.postMessage({ type: 'frequencyPreview', frequency });
+    assert.equal(hostCalls.at(-1).type, 'audio/frequencyPreview');
+    assert.equal(hostCalls.at(-1).payload.frequency, frequency);
+  }
+  for (const teardown of [
+    () => context.window.dispatch('pagehide'),
+    () => context.document.dispatch('visibilitychange'),
+    () => port.close()
+  ]) {
+    await port.postMessage({ type: 'frequencyPreview', frequency: 1000 });
+    teardown();
+    assert.equal(hostCalls.at(-1).payload.frequency, null);
+  }
+});
+
 test('native payload carries upstream execution capabilities without persisting context', () => {
   const { context } = createNativePort();
   class ConstrainedPlugin {
@@ -270,6 +288,7 @@ test('native performance status drives the upstream latency and CPU events', () 
   const manager = new context.Manager();
   Object.assign(manager, {
     audioContext: { sampleRate: 48000 },
+    getTotalPipelineLatencySamples() { return this.dspPipelineLatencySamples; },
     lastDispatchedNativeLatencySamples: null,
     lastDispatchedNativeLatencyCompensated: null,
     lastDispatchedPipelineCpuAveragePercent: null,
@@ -297,7 +316,8 @@ test('native performance status drives the upstream latency and CPU events', () 
   assert.equal(events.length, 2);
   assert.equal(events[0].type, 'dspLatency');
   assert.deepEqual({ ...events[0].payload }, {
-    type: 'dspLatency', samples: 8320, sampleRate: 48000, compensated: false
+    type: 'dspLatency', samples: 8320, totalSamples: 8320,
+    sampleRate: 48000, compensated: false
   });
   assert.equal(events[1].type, 'pipelineCpuUsage');
   assert.deepEqual({ ...events[1].payload }, { average: 12.5 });
@@ -315,6 +335,8 @@ test('native performance status drives the upstream latency and CPU events', () 
     'older native responses still fall back to their reported latency');
   assert.equal(manager.dspPipelineLatencyCompensated, true);
   assert.equal(events.length, 3);
+  assert.equal(events[2].payload.totalSamples, 384,
+    'legacy native responses publish the total latency consumed by the upstream UI');
 });
 
 test('native execution states use the upstream validated worklet route', () => {

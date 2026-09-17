@@ -399,6 +399,7 @@ tresult PLUGIN_API EffeTuneProcessor::initialize(FUnknown *context) {
 }
 
 tresult PLUGIN_API EffeTuneProcessor::terminate() {
+  frequencyPreview_.setFrequency(0.0);
   // Before the component handler goes away with the base class: an edit left
   // open past it can never be ended at all.
   closeOpenHostGestures();
@@ -426,6 +427,7 @@ tresult PLUGIN_API EffeTuneProcessor::terminate() {
 
 tresult PLUGIN_API EffeTuneProcessor::setActive(const TBool state) {
   if (!state) {
+    frequencyPreview_.setFrequency(0.0);
     componentActive_.store(false, std::memory_order_release);
     // A suspended component renders nothing and answers no more edits, so a
     // touch that is still open here would never be closed by the editor either.
@@ -455,6 +457,7 @@ tresult PLUGIN_API EffeTuneProcessor::setActive(const TBool state) {
     previousCycleActive_ = false;
     automationScheduler_.reset();
     outputTransition_.reset();
+    frequencyPreview_.resetAudio();
   }
   const auto result = SingleComponentEffect::setActive(state);
   if (state && (result == kResultOk || result == kResultTrue)) {
@@ -2768,6 +2771,9 @@ tresult PLUGIN_API EffeTuneProcessor::process(ProcessData &data) {
   // topology until then, so audio continues to be processed instead of falling
   // back to the input signal.
   copyDryToScratch(input, data.numSamples);
+  frequencyPreview_.mix(dryTransitionPointers_.data(),
+                        static_cast<std::uint32_t>(input.numChannels),
+                        static_cast<std::uint32_t>(data.numSamples), hostSampleRate);
   for (int32 channel = 0; channel < output.numChannels; ++channel) {
     dryPointers[static_cast<std::size_t>(channel)] =
         dryTransitionPointers_[static_cast<std::size_t>(channel)];
@@ -2776,7 +2782,7 @@ tresult PLUGIN_API EffeTuneProcessor::process(ProcessData &data) {
   const auto oversamplingFactor = activeOversamplingFactor_.load(std::memory_order_acquire);
 
   const auto *upsampled = oversampler_.upsample(
-      const_cast<const float *const *>(input.channelBuffers32),
+      dryPointers.data(),
       static_cast<std::uint32_t>(data.numSamples));
   if (upsampled == nullptr) {
     finishDry();
@@ -2889,7 +2895,7 @@ tresult PLUGIN_API EffeTuneProcessor::process(ProcessData &data) {
       // may stage newer parameters; their plan is captured at block end.
       (void)applyPreparedLatencyUpdate();
       delayedDry = dryDelay_.process(
-          const_cast<const float *const *>(input.channelBuffers32),
+          dryPointers.data(),
           static_cast<std::uint32_t>(input.numChannels),
           static_cast<std::uint32_t>(data.numSamples));
       if (delayedDry == nullptr) {
@@ -3453,6 +3459,7 @@ void EffeTuneProcessor::serviceLatencyUpdates(const bool restartDebounce) {
 }
 
 tresult PLUGIN_API EffeTuneProcessor::setState(IBStream *stream) {
+  frequencyPreview_.setFrequency(0.0);
   std::string json;
   PluginStateDocument decoded;
   if (!readStream(stream, json) || !StateCodec::decode(json, decoded)) {
@@ -3614,6 +3621,7 @@ bool EffeTuneProcessor::attachEditor(void *owner, void *parent,
 }
 
 void EffeTuneProcessor::detachEditor(void *owner) noexcept {
+  frequencyPreview_.setFrequency(0.0);
   std::shared_ptr<WebViewHost> webView;
   {
     std::scoped_lock editorLock(editorMutex_);
@@ -3698,6 +3706,10 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
   if (!MessageRouter::decode(request, message, &error)) {
     return bridgeResult(false, error);
   }
+  if (message.action == UiAction::frequencyPreview) {
+    frequencyPreview_.setFrequency(message.previewFrequency);
+    return bridgeResult(true);
+  }
   drainAutomationValues();
 
   const auto pauseBulkRequestBeforeCommitForTesting = [&] {
@@ -3750,6 +3762,7 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     // no page has been touched before its own first call -- so ending it here
     // is unconditional and cannot be missed by a race between the two.
     if (message.startupHandshake) {
+      frequencyPreview_.setFrequency(0.0);
       closeOpenHostGestures();
       std::scoped_lock resources(processingResourcesMutex_);
       const auto pageGeneration =

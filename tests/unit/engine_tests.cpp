@@ -6,6 +6,7 @@
 #include "engine/command_queue.h"
 #include "engine/dry_delay.h"
 #include "engine/engine_host.h"
+#include "engine/frequency_preview.h"
 #include "engine/latency.h"
 #include "engine/output_transition.h"
 #include "engine/pipeline_model.h"
@@ -1558,10 +1559,41 @@ void testMasterBypassLatencyAlignment() {
 
 } // namespace
 
+void testFrequencyPreviewChannelsAndEnvelope() {
+  for (const auto channels : {1u, 2u, 8u}) {
+    effetune::vst::FrequencyPreview preview;
+    std::array<std::array<float, 480>, 8> samples{};
+    std::array<float *, 8> pointers{};
+    for (std::size_t channel = 0; channel < pointers.size(); ++channel) {
+      samples[channel].fill(0.1f);
+      pointers[channel] = samples[channel].data();
+    }
+    preview.setFrequency(1000.0);
+    preview.mix(pointers.data(), channels, 480, 48000.0);
+    for (std::uint32_t channel = 0; channel < channels; ++channel) {
+      for (std::size_t frame = 0; frame < 480; ++frame) {
+        const auto gain = std::min(1.0, (static_cast<double>(frame) + 1.0) / 240.0);
+        const auto tone = channel < 2
+            ? std::sin(6.283185307179586 * static_cast<double>(frame) / 48.0) *
+                  0.251188643150958 * gain : 0.0;
+        expect(std::abs(samples[channel][frame] - 0.1 - tone) < 1.0e-6,
+               "preview matches upstream ramp and only mixes the first two channels");
+      }
+    }
+    preview.setFrequency(24000.0);
+    for (auto &channel : samples) channel.fill(0.0f);
+    preview.mix(pointers.data(), channels, 480, 48000.0);
+    expect(std::all_of(samples[0].begin() + 240, samples[0].end(),
+                      [](float sample) { return sample == 0.0f; }),
+           "Nyquist or stop requests release within five milliseconds");
+  }
+}
+
 int main() {
   effetune::vst::testing::suppressCrtModalDialogs();
   try {
     testDescriptor();
+    testFrequencyPreviewChannelsAndEnvelope();
     testQueue();
     testOutputTransition();
     testDryDelayLine();

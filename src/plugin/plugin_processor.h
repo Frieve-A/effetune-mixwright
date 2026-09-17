@@ -11,6 +11,7 @@
 #include "engine/command_queue.h"
 #include "engine/dry_delay.h"
 #include "engine/engine_host.h"
+#include "engine/frequency_preview.h"
 #include "engine/output_transition.h"
 #include "engine/resampler.h"
 #include "plugin/automation_parameters.h"
@@ -622,6 +623,7 @@ private:
   std::vector<std::uint8_t> telemetryScratch_;
   std::unordered_map<std::uint64_t, PendingAssetTransfer> pendingAssetTransfers_;
   std::vector<float> engineOutputBuffer_;
+  FrequencyPreview frequencyPreview_;
   std::vector<float> dryTransitionBuffer_;
   std::vector<std::uint8_t> hostBypassMask_;
   std::array<float *, EngineHost::kMaxChannels> engineOutputPointers_{};
