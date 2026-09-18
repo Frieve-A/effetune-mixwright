@@ -1410,23 +1410,25 @@ void testRuntimeLatencyAndTelemetryPublication() {
   }
   expect(telemetryBytes > 0,
          "audio-thread telemetry publication must expose a non-empty packet");
+  const auto initialTelemetryBytes = telemetryBytes;
   const auto initialSequence = static_cast<std::uint32_t>(telemetry[8]) |
                                (static_cast<std::uint32_t>(telemetry[9]) << 8u) |
                                (static_cast<std::uint32_t>(telemetry[10]) << 16u) |
                                (static_cast<std::uint32_t>(telemetry[11]) << 24u);
-  for (std::uint32_t quantum = 8; quantum < 32; ++quantum) {
+  for (std::uint32_t quantum = 8; quantum < 20; ++quantum) {
     expect(engine.tryProcessBlock(channels, 2, kTestBlockFrames,
                                   static_cast<double>(quantum) / 375.0, false),
            "queued telemetry process");
   }
   telemetryBytes = engine.readTelemetry(telemetry, droppedFrames);
-  const auto latestSequence = static_cast<std::uint32_t>(telemetry[8]) |
-                              (static_cast<std::uint32_t>(telemetry[9]) << 8u) |
-                              (static_cast<std::uint32_t>(telemetry[10]) << 16u) |
-                              (static_cast<std::uint32_t>(telemetry[11]) << 24u);
-  expect(telemetryBytes > 0 && latestSequence > initialSequence,
-         "telemetry consumer returns the latest queued frame");
-  expect(droppedFrames > 0, "skipped telemetry frame count is carried to the delivery");
+  const auto firstQueuedSequence = static_cast<std::uint32_t>(telemetry[8]) |
+                                   (static_cast<std::uint32_t>(telemetry[9]) << 8u) |
+                                   (static_cast<std::uint32_t>(telemetry[10]) << 16u) |
+                                   (static_cast<std::uint32_t>(telemetry[11]) << 24u);
+  expect(telemetryBytes > initialTelemetryBytes && firstQueuedSequence == initialSequence + 1u,
+         "telemetry consumer preserves queued frames in order");
+  expect(droppedFrames == 0,
+         "delivery does not report queued telemetry frames as dropped");
 
   for (std::uint32_t quantum = 32; quantum < 48; ++quantum) {
     expect(engine.tryProcessBlock(channels, 2, kTestBlockFrames,

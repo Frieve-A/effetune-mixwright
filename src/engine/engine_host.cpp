@@ -1222,25 +1222,24 @@ std::uint32_t EngineHost::readTelemetry(const std::span<std::uint8_t> destinatio
     droppedFrames = 0;
     return 0;
   }
-  const auto latest = (write + TelemetryStorage::kSlotCount - 1u) %
-                      TelemetryStorage::kSlotCount;
   std::uint64_t dropped = telemetry_->producerDroppedFrames.exchange(
       0, std::memory_order_acq_rel);
   dropped += telemetry_->deliveryDroppedFrames.exchange(0, std::memory_order_acq_rel);
   auto index = read;
-  while (index != latest) {
-    const auto &skipped = telemetry_->slots[index];
-    dropped += skipped.droppedFrames;
-    dropped += countTelemetryFrames(skipped.bytes.data(), skipped.byteCount);
+  std::size_t bytes = 0;
+  while (index != write) {
+    const auto &slot = telemetry_->slots[index];
+    if (slot.byteCount > destination.size() - bytes) {
+      break;
+    }
+    std::memcpy(destination.data() + bytes, slot.bytes.data(), slot.byteCount);
+    bytes += slot.byteCount;
+    dropped += slot.droppedFrames;
     index = (index + 1u) % TelemetryStorage::kSlotCount;
   }
-  const auto &slot = telemetry_->slots[latest];
-  const auto bytes = std::min<std::size_t>(slot.byteCount, destination.size());
-  std::memcpy(destination.data(), slot.bytes.data(), bytes);
-  dropped += slot.droppedFrames;
   droppedFrames = static_cast<std::uint32_t>(std::min<std::uint64_t>(
       dropped, std::numeric_limits<std::uint32_t>::max()));
-  telemetry_->read.store(write, std::memory_order_release);
+  telemetry_->read.store(index, std::memory_order_release);
   return static_cast<std::uint32_t>(bytes);
 }
 
