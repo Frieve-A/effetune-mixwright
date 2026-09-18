@@ -656,6 +656,44 @@ void testMessageRouter() {
   expect(plugin.logical.extraJson.find("TestGainPlugin") != std::string::npos,
          "bridge runtime type preservation");
 
+  std::string spatialMapperParams{"["};
+  for (std::size_t index = 0; index < 776u; ++index) {
+    if (index != 0) spatialMapperParams += ',';
+    spatialMapperParams += '0';
+  }
+  spatialMapperParams += ']';
+  const auto spatialMapperRebuild =
+      std::string{R"({"type":"pipeline/rebuild","payload":{"pipeline":"A","plugins":[{"id":3,"type":"SpatialMapperPlugin","wasmParams":)"} +
+      spatialMapperParams + R"(,"wasmParamsHash":1}]}})";
+  const auto decodedSpatialMapper = MessageRouter::decode(spatialMapperRebuild, message, &error);
+  const auto decodedSpatialMapperFloats =
+      message.plugins.empty() ? 0u : message.plugins[0].runtime.packedParameters.size();
+  expect(decodedSpatialMapper && message.plugins.size() == 1u &&
+             decodedSpatialMapperFloats == 776u,
+         "bridge accepts Spatial Mapper's complete packed parameter image: " + error +
+             " plugins=" + std::to_string(message.plugins.size()) +
+             " floats=" + std::to_string(decodedSpatialMapperFloats));
+
+  auto packedParameterRebuild = [](const std::size_t count) {
+    std::string params{"["};
+    for (std::size_t index = 0; index < count; ++index) {
+      if (index != 0) params += ',';
+      params += '0';
+    }
+    params += ']';
+    return std::string{R"({"type":"pipeline/rebuild","payload":{"plugins":[{"id":4,"type":"FutureMatrixPlugin","wasmParams":)"} +
+           params + R"(,"wasmParamsHash":1}]}})";
+  };
+  expect(MessageRouter::decode(
+             packedParameterRebuild(AudioCommand::kMaxPackedFloats), message, &error) &&
+             message.plugins[0].runtime.packedParameters.size() ==
+                 AudioCommand::kMaxPackedFloats,
+         "bridge accepts every packed DSP image within the common parameter envelope");
+  expect(!MessageRouter::decode(
+             packedParameterRebuild(AudioCommand::kMaxPackedFloats + 1u), message, &error) &&
+             error == "Packed DSP parameter block exceeds the bridge limit",
+         "bridge rejects packed DSP images beyond the common parameter envelope");
+
   expect(MessageRouter::decode(
              R"({"type":"pipeline/rebuild","payload":{"pipeline":"A","plugins":[{"id":9,"type":"TestGainPlugin","name":"Constrained here","parameters":{"gain":0.75},"wasmParams":[0.75],"wasmParamsHash":123,"executionCapabilities":{"requiresWasm":true,"supportedSampleRates":[48000,96000],"supportedChannelModes":["mono","stereo-pair"]},"futurePayload":{"v":2}}]}})",
              message, &error) && message.plugins.size() == 1 &&

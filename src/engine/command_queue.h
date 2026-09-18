@@ -66,8 +66,10 @@ private:
 enum class AudioCommandType : std::uint8_t { setParameters, setDescriptor, reset };
 
 struct AudioCommand {
-  static constexpr std::size_t kMaxPackedFloats = 512;
   static constexpr std::size_t kMaxParameterBytes = 8192;
+  // One common bounded transport covers every upstream packed DSP layout,
+  // including large matrix effects, without allocating on the real-time path.
+  static constexpr std::size_t kMaxPackedFloats = 1024;
   static constexpr std::size_t kMaxDescriptorBytes =
       kPipelineDescriptorHeaderBytes + kMaxPipelineNodes * kPipelineDescriptorNodeBytes;
 

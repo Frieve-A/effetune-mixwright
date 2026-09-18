@@ -15,6 +15,9 @@ namespace {
 
 using choc::value::ValueView;
 
+static_assert(AudioCommand::kMaxPackedFloats * sizeof(float) <=
+              AudioCommand::kMaxParameterBytes);
+
 constexpr std::size_t kMaximumExternalUrlBytes = 4096;
 constexpr std::size_t kMaximumAssetChunkBase64Bytes = 256u * 1024u;
 
