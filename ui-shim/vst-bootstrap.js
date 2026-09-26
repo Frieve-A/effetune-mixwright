@@ -24,7 +24,7 @@
     html { background-color: #1e1e1e; }
     html.effetune-vst-host, html.effetune-vst-host body { min-width: 720px !important; }
     .subtitle-container,
-    #openMusicButton, #effectPipelineButton, #openLibraryButton, #whatsThisLink,
+    #openMusicButton, #openLibraryButton, #whatsThisLink,
     #audioConfigSettingsButton, #benchmarkSettingsButton,
     #measurementSettingsButton, #resetAudioSettingsButton,
     #installAppButton, #installAppElement, #doubleBlindTestButton { display: none !important; }
@@ -188,6 +188,44 @@
   const noop = () => {};
   const asyncNoop = async () => ({ success: true });
   const eventNoop = () => noop;
+  let backupExportActive = false;
+  window.__effetuneExportBackup = async (blob, fileName, signal) => {
+    if (backupExportActive) throw new Error('A backup export is already running.');
+    if (!blob || blob.size <= 0 || blob.size > 256 * 1024 * 1024) {
+      throw new Error('The backup file exceeds the supported size.');
+    }
+    const checkCancelled = () => {
+      if (signal?.aborted) throw new DOMException('Backup export cancelled.', 'AbortError');
+    };
+    backupExportActive = true;
+    try {
+      checkCancelled();
+      const result = await window.__effetuneHostCall('backup/exportBegin', {
+        defaultName: fileName, totalBytes: blob.size
+      });
+      if (result.cancelled) throw new DOMException('Backup export cancelled.', 'AbortError');
+      for (let offset = 0; offset < blob.size; offset += 192 * 1024) {
+        checkCancelled();
+        const bytes = new Uint8Array(await blob.slice(offset, offset + 192 * 1024).arrayBuffer());
+        let binary = '';
+        for (let start = 0; start < bytes.length; start += 8192) {
+          binary += String.fromCharCode(...bytes.subarray(start, start + 8192));
+        }
+        checkCancelled();
+        await window.__effetuneHostCall('backup/exportChunk', { offset, data: btoa(binary) });
+      }
+      checkCancelled();
+      await window.__effetuneHostCall('backup/exportCommit');
+    } catch (error) {
+      await window.__effetuneHostCall('backup/exportCancel').catch(() => {});
+      throw error;
+    } finally {
+      backupExportActive = false;
+    }
+  };
+  window.addEventListener('pagehide', () => {
+    if (backupExportActive) void window.__effetuneHostCall('backup/exportCancel').catch(() => {});
+  });
   const productionUrl = new URL('https://effetune.frieve.com/');
   const githubUrl = new URL('https://github.com/Frieve-A/effetune-mixwright');
   const normalizeExternalUrl = value => {
@@ -322,6 +360,7 @@
     onRequestPipelineStateForClose: eventNoop,
     onConfigApp: eventNoop,
     onConfigAudio: eventNoop,
+    onBackupRestore: eventNoop,
     onLoadUserPreset: eventNoop,
     onSavePreset: eventNoop,
     onSavePresetAs: eventNoop,

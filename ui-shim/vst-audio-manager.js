@@ -167,8 +167,11 @@ class NativePort {
     // deadline that publishes the queued values also ends the touch they belong
     // to. The close publishes first, so the order is the same one a release
     // inside the editor produces.
-    this.flushOnEditorTeardown = () => {
+    this.flushOnEditorTeardown = event => {
       this.stopFrequencyPreview();
+      if (event?.type === 'pagehide' || document.hidden) {
+        void this.postMessage({ type: 'setVisualizerSources', sources: [] });
+      }
       this.closePointerGesture();
       this.flushPluginUpdates();
     };
@@ -376,6 +379,18 @@ class NativePort {
     // the bridge, so a deferred update can never land after the rebuild, master
     // bypass, or asset operation that replaced it.
     if (message.type !== 'updatePlugin') this.flushPluginUpdates();
+    if (message.type === 'setVisualizerSources') {
+      return window.__effetuneHostCall('visualizer/setSources', {
+        sources: (message.sources || []).map(source => ({
+          ...source,
+          params: Array.from(source.params || [])
+        }))
+      }).catch(error => {
+        console.error('[EffeTune Mixwright] visualizer source update failed', error);
+        window.uiManager?.setError?.(
+          'Visualizer audio could not be updated. Reopen the Visualizer and try again.', false);
+      });
+    }
     if (message.type === 'setPluginAsset') {
       this.queueAssetOperation(message, () => this.setPluginAsset(message));
       return;
@@ -804,6 +819,7 @@ class NativePort {
   // so it publishes before it releases the listeners that would have done it.
   close() {
     this.stopFrequencyPreview();
+    void this.postMessage({ type: 'setVisualizerSources', sources: [] });
     // The port is the only route the close itself can leave through, and the
     // listeners that would have derived it are released just below, so a touch
     // still open here has to end now or never: the host would keep believing
@@ -848,6 +864,7 @@ export class AudioManager extends BrowserAudioManager {
     super(...args);
     this.nativePort = new NativePort(this);
     this.nativeNode = fakeNode(this.nativePort);
+    this.telemetryHub.setPort(this.nativePort);
     this.nativePort.onmessage = event => this.handleWorkletMessage(event, this.nativeNode);
     window.workletNode = this.nativeNode;
     this.contextManager.workletNode = this.nativeNode;
@@ -971,6 +988,7 @@ export class AudioManager extends BrowserAudioManager {
   }
 
   applyNativePerformanceStatus(info, dispatch = true) {
+    this.applyNativeReadiness(info);
     const currentLatency = Number.isInteger(info?.processingLatencySamples) &&
       info.processingLatencySamples >= 0
       ? info.processingLatencySamples
@@ -1436,6 +1454,7 @@ export class AudioManager extends BrowserAudioManager {
       // to move values, a rate change only re-expresses them.
       this.seedRestoredAutomationBaseline();
       await this.rebuildPipeline();
+      this.applyNativeReadiness(latest);
       window.uiManager?.updateSampleRateDisplay?.();
     })().finally(() => { this.nativeContextSync = null; });
     return this.nativeContextSync;
@@ -1449,5 +1468,20 @@ export class AudioManager extends BrowserAudioManager {
         .then(info => this.applyNativePerformanceStatus(info))
         .catch(() => {});
     }, 250);
+  }
+
+  applyNativeReadiness(info) {
+    if (!this.nativeNode || !this._dspCapabilitiesByNode ||
+        typeof info?.dspReady !== 'boolean') return;
+    if (!info.dspReady) {
+      this._dspCapabilitiesByNode.delete(this.nativeNode);
+      return;
+    }
+    const generation = info.contextGeneration || 0;
+    if (generation !== this.nativeContextGeneration) return;
+    if (this._dspCapabilitiesByNode.get(this.nativeNode)?.generation === generation) return;
+    const ready = { type: 'dspReady', generation };
+    this._dspCapabilitiesByNode.set(this.nativeNode, ready);
+    this.dispatchEvent('dspReady', ready);
   }
 }

@@ -31,6 +31,20 @@ Copyright (c) 2025-2026, Yoshiyuki Kobayashi
 
 Licensed under the MIT License reproduced above.
 
+JSZip v3.10.2 and its bundled pako compression library
+----------------------------------------------------
+JSZip: Copyright (c) 2009-2016 Stuart Knightley, David Duponchel,
+Franz Buchinger, António Afonso
+pako: Copyright (C) 2014-2017 by Vitaly Puzrin and Andrei Tuputcyn
+
+Both are distributed under the MIT License reproduced above.
+JSZip's MIT license option is selected for this distribution.
+License sources:
+https://github.com/Stuk/jszip/blob/020fa3384c994f923123141bbeebae0c3a44dd0d/LICENSE.markdown
+https://github.com/nodeca/pako/blob/1.0.11/LICENSE
+Unmodified JSZip distribution source:
+https://github.com/Stuk/jszip/blob/020fa3384c994f923123141bbeebae0c3a44dd0d/dist/jszip.min.js
+
 CHOC
 ----
 Copyright (c) 2025 Tracktion Corporation

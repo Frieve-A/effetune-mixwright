@@ -10,6 +10,20 @@ endif()
 
 add_test(NAME effetune_vst_unit_tests COMMAND effetune_vst_unit_tests)
 
+add_executable(effetune_upstream_integration_tests unit/upstream_integration_tests.cpp)
+target_link_libraries(effetune_upstream_integration_tests PRIVATE effetune_engine)
+target_include_directories(effetune_upstream_integration_tests PRIVATE
+  "${PROJECT_SOURCE_DIR}/external/effetune/dsp/core"
+  "${PROJECT_SOURCE_DIR}/external/effetune/dsp/generated/cpp")
+target_compile_features(effetune_upstream_integration_tests PRIVATE cxx_std_20)
+if(MSVC)
+  target_compile_options(effetune_upstream_integration_tests PRIVATE /W4 /WX /utf-8)
+else()
+  target_compile_options(effetune_upstream_integration_tests PRIVATE -Wall -Wextra -Wpedantic -Werror)
+endif()
+add_test(NAME effetune_upstream_integration_tests COMMAND effetune_upstream_integration_tests)
+set_tests_properties(effetune_upstream_integration_tests PROPERTIES TIMEOUT 600)
+
 add_executable(effetune_automation_binding_tests unit/automation_binding_tests.cpp)
 target_link_libraries(effetune_automation_binding_tests PRIVATE effetune_engine)
 target_compile_features(effetune_automation_binding_tests PRIVATE cxx_std_20)
@@ -147,6 +161,10 @@ if(WIN32 AND TARGET effetune_ui_assets)
 endif()
 
 if(TARGET effetune_ui_assets)
+  add_test(NAME effetune_vst_upstream_ui_tests
+    COMMAND "${EFFETUNE_NODE_EXECUTABLE}"
+            "${PROJECT_SOURCE_DIR}/tests/esm/vst-upstream-ui.test.mjs"
+            --assets "${CMAKE_BINARY_DIR}/webview-assets")
   add_test(NAME effetune_vst_audio_manager_tests
     COMMAND "${EFFETUNE_NODE_EXECUTABLE}" --test
             "${PROJECT_SOURCE_DIR}/tests/esm/vst-audio-manager.test.mjs")

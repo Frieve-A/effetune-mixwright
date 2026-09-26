@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine/engine_host.h"
+#include "engine/output_analyzers.h"
 
 #include <string>
 #include <string_view>
@@ -27,11 +28,16 @@ enum class UiAction {
   setOversampling,
   readTelemetry,
   discardTelemetry,
+  setVisualizerSources,
   storageFileExists,
   storageReadFile,
   storageWriteFile,
   loadConfig,
   saveConfig,
+  beginBackupExport,
+  appendBackupExport,
+  commitBackupExport,
+  cancelBackupExport,
   openPresetDialog,
   savePresetDialog
 };
@@ -74,6 +80,7 @@ struct RoutedUiMessage {
   std::vector<RoutedPlugin> plugins;
   std::vector<RoutedPlugin> pipelineA;
   std::vector<RoutedPlugin> pipelineB;
+  std::vector<OutputAnalyzerSource> visualizerSources;
   // Empty for every message type that carries no explicit automation intent,
   // including plug-in updates and bulk messages sent by an older UI. An
   // beginAutomationGesture and endAutomationGesture messages fill the identity

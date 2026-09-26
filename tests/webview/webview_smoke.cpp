@@ -733,6 +733,8 @@ int main(const int argc, char **argv) {
   bool clipboardReachable = false;
   bool libraryEntriesDisabled = false;
   bool headerControlsAreVstSpecific = false;
+  bool visualizerNavigationWorks = false;
+  std::string visualizerNavigationDiagnostics;
   bool configDialogIsLanguageOnly = false;
   bool languageChangedImmediately = false;
   bool measurementImportAvailable = false;
@@ -1134,10 +1136,52 @@ int main(const int argc, char **argv) {
             "'row' && "
             "getComputedStyle(document.querySelector('.subtitle-container')).display === "
             "'none' && "
-            "getComputedStyle(document.getElementById('effectPipelineButton')).display === "
-            "'none' && getComputedStyle(document.getElementById('whatsThisLink')).display === "
+            "['effectPipelineButton', 'visualizerButton'].every(id => { "
+            "const button = document.getElementById(id); return !!button && !button.disabled && "
+            "getComputedStyle(button).display !== 'none' && "
+            "getComputedStyle(button).visibility === 'visible'; }) && "
+            "['openMusicButton', 'openLibraryButton'].every(id => "
+            "getComputedStyle(document.getElementById(id)).display === 'none') && "
+            "getComputedStyle(document.getElementById('whatsThisLink')).display === "
             "'none'; })()",
             ignored) && ignored == "true";
+
+        const auto visualizerClicked = evaluate(
+            "(() => { document.getElementById('visualizerButton')?.click(); return true; })()",
+            ignored) && ignored == "true";
+        const auto visualizerOpened = visualizerClicked && waitForJavascript(
+            "(() => { const view = document.getElementById('visualizerView'); "
+            "const visualizer = window.uiManager?.visualizerView; "
+            "return !!view?.isConnected && getComputedStyle(view).display !== 'none' && "
+            "document.body.classList.contains('view-visualizer') && "
+            "visualizer?.visible === true && visualizer.sources?.active === true && "
+            "document.getElementById('visualizerButton')?.getAttribute('aria-pressed') === 'true' && "
+            "document.getElementById('effectPipelineButton')?.getAttribute('aria-pressed') === 'false'; })()",
+            kCompletionTimeout);
+        const auto effectsClicked = evaluate(
+            "(() => { document.getElementById('effectPipelineButton')?.click(); return true; })()",
+            ignored) && ignored == "true";
+        const auto effectsRestored = effectsClicked && waitForJavascript(
+            "(() => { const view = document.getElementById('visualizerView'); "
+            "const visualizer = window.uiManager?.visualizerView; "
+            "return !!view?.isConnected && getComputedStyle(view).display === 'none' && "
+            "!document.body.classList.contains('view-visualizer') && "
+            "visualizer?.visible === false && visualizer.sources?.active === false && "
+            "visualizer.frameRequest === null && window.audioManager?.visualizerSources?.length === 0 && "
+            "document.getElementById('visualizerButton')?.getAttribute('aria-pressed') === 'false' && "
+            "document.getElementById('effectPipelineButton')?.getAttribute('aria-pressed') === 'true'; })()",
+            kCompletionTimeout);
+        visualizerNavigationWorks = visualizerOpened && effectsRestored;
+        if (!visualizerNavigationWorks) {
+          (void)evaluate(
+              "JSON.stringify({bodyClasses:document.body.className,"
+              "mounted:!!document.getElementById('visualizerView')?.isConnected,"
+              "visible:window.uiManager?.visualizerView?.visible,"
+              "sourcesActive:window.uiManager?.visualizerView?.sources?.active,"
+              "visualizerPressed:document.getElementById('visualizerButton')?.getAttribute('aria-pressed'),"
+              "effectsPressed:document.getElementById('effectPipelineButton')?.getAttribute('aria-pressed')})",
+              visualizerNavigationDiagnostics);
+        }
 
         const auto languageFixtureStarted = evaluate(
             "(() => { window.__vstLanguageFixtureReady = false; void (async () => { "
@@ -1596,7 +1640,8 @@ int main(const int argc, char **argv) {
     } else if (std::filesystem::create_directories(missingStartupRoot / L"js",
                                                     setupError)) {
       fixtureCreated = true;
-      for (const auto *relative : {"effetune.html", "effetune.css", "effetune-theme.css",
+      std::filesystem::create_directories(missingStartupRoot / L"css", setupError);
+      for (const auto *relative : {"effetune.html", "css/effetune.css", "css/effetune-theme.css",
                                    "vst-bootstrap.js", "js/app.js"}) {
         std::ofstream file(missingStartupRoot / relative, std::ios::binary);
         if (!file) {
@@ -1609,7 +1654,7 @@ int main(const int argc, char **argv) {
     }
     if (!setupError) {
       std::error_code probeError;
-      for (const auto *relative : {"effetune.html", "effetune.css", "effetune-theme.css",
+      for (const auto *relative : {"effetune.html", "css/effetune.css", "css/effetune-theme.css",
                                    "vst-bootstrap.js", "js/app.js"}) {
         if (!std::filesystem::is_regular_file(missingStartupRoot / relative,
                                               probeError)) {
@@ -1981,7 +2026,14 @@ int main(const int argc, char **argv) {
     return 1;
   }
   if (!headerControlsAreVstSpecific) {
-    std::cerr << "The VST upsampling controls or single-view header exclusions are incorrect\n";
+    std::cerr << "The VST upsampling placement/style, Effects/Visualizer buttons, or hidden "
+                 "music/library/documentation header entries are incorrect\n";
+    return 1;
+  }
+  if (!visualizerNavigationWorks) {
+    std::cerr << "Visualizer/Effects button navigation did not open the view and then stop "
+                 "its sources on return; inspect view initialization and button handlers: "
+              << visualizerNavigationDiagnostics << '\n';
     return 1;
   }
   if (!configDialogIsLanguageOnly) {

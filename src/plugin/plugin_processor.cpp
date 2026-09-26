@@ -304,7 +304,7 @@ displayedAutomationValue(const AutomationTargetDescriptor &target,
 } // namespace
 
 EffeTuneProcessor::EffeTuneProcessor()
-    : telemetryScratch_(EngineHost::kDefaultTelemetryBytes) {
+    : telemetryScratch_(EngineHost::kDefaultTelemetryBytes + OutputAnalyzers::kTelemetryBytes) {
   state_.appVersion = EFFETUNE_PLUGIN_VERSION_STR;
 #if defined(EFFETUNE_AUTOMATION_HOST_GATE_FIXTURE)
   state_ = automationHostGateFixtureDocument();
@@ -400,6 +400,7 @@ tresult PLUGIN_API EffeTuneProcessor::initialize(FUnknown *context) {
 
 tresult PLUGIN_API EffeTuneProcessor::terminate() {
   frequencyPreview_.setFrequency(0.0);
+  cancelBackupExport();
   // Before the component handler goes away with the base class: an edit left
   // open past it can never be ended at all.
   closeOpenHostGestures();
@@ -526,6 +527,10 @@ bool EffeTuneProcessor::configureDspLocked(AutomationResourceLock &resources,
     }
     oversampler_.prepare(snapshot.oversampling, static_cast<std::uint32_t>(configuredChannels),
                          static_cast<std::uint32_t>(maxHostFrames));
+    if (!outputAnalyzers_.prepare(hostSampleRate, static_cast<std::uint32_t>(configuredChannels),
+                                  static_cast<std::uint32_t>(maxHostFrames), error)) {
+      return false;
+    }
     if (!waitForUiRepack) {
       const auto &pipeline =
           snapshot.currentPipeline == 'B' ? snapshot.pipelineB : snapshot.pipelineA;
@@ -2719,6 +2724,11 @@ tresult PLUGIN_API EffeTuneProcessor::process(ProcessData &data) {
     outputTransition_.apply(output.channelBuffers32, dry,
                             static_cast<std::uint32_t>(output.numChannels),
                             static_cast<std::uint32_t>(data.numSamples), hostSampleRate, processed);
+    // Only copy final host PCM here. Telemetry polling runs the analyzer DSP
+    // off audio, after downsampling, bypass and the output transition.
+    outputAnalyzers_.process(output.channelBuffers32,
+                             static_cast<std::uint32_t>(output.numChannels),
+                             static_cast<std::uint32_t>(data.numSamples), hostSampleRate);
     output.silenceFlags = 0;
     for (int32 channel = 0; channel < output.numChannels; ++channel) {
       const auto *samples = output.channelBuffers32[channel];
@@ -3620,8 +3630,16 @@ bool EffeTuneProcessor::attachEditor(void *owner, void *parent,
   }
 }
 
+void EffeTuneProcessor::cancelBackupExport() {
+  std::scoped_lock lock(backupExportMutex_);
+  ++backupExportGeneration_;
+  backupExport_.cancel();
+}
+
 void EffeTuneProcessor::detachEditor(void *owner) noexcept {
   frequencyPreview_.setFrequency(0.0);
+  outputAnalyzers_.stopCapture();
+  cancelBackupExport();
   std::shared_ptr<WebViewHost> webView;
   {
     std::scoped_lock editorLock(editorMutex_);
@@ -3763,6 +3781,8 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     // is unconditional and cannot be missed by a race between the two.
     if (message.startupHandshake) {
       frequencyPreview_.setFrequency(0.0);
+      outputAnalyzers_.stopCapture();
+      cancelBackupExport();
       closeOpenHostGestures();
       std::scoped_lock resources(processingResourcesMutex_);
       const auto pageGeneration =
@@ -3842,11 +3862,28 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     return choc::json::toString(result);
   }
 
+  if (message.action == UiAction::setVisualizerSources) {
+    try {
+      const auto succeeded = outputAnalyzers_.setSources(std::move(message.visualizerSources), &error);
+      return bridgeResult(succeeded, error);
+    } catch (const std::exception &) {
+      return bridgeResult(false, "Unable to configure output analysis. Try fewer visualizers.");
+    }
+  }
+
   if (message.action == UiAction::readTelemetry) {
     serviceLatencyUpdates();
     const auto context = readHostContext();
     std::uint32_t droppedFrames = 0;
-    const auto bytes = engine_.readTelemetry(telemetryScratch_, droppedFrames);
+    const auto pipelineBytes = engine_.readTelemetry(
+        std::span<std::uint8_t>(telemetryScratch_).first(EngineHost::kDefaultTelemetryBytes), droppedFrames);
+    std::uint32_t analyzerDropped = 0;
+    const auto analyzerBytes = outputAnalyzers_.readTelemetry(
+        std::span<std::uint8_t>(telemetryScratch_).last(OutputAnalyzers::kTelemetryBytes), analyzerDropped);
+    std::memmove(telemetryScratch_.data() + pipelineBytes,
+                 telemetryScratch_.data() + EngineHost::kDefaultTelemetryBytes, analyzerBytes);
+    const auto bytes = pipelineBytes + analyzerBytes;
+    droppedFrames += analyzerDropped;
     auto result = choc::value::createObject({});
     result.addMember("ok", true);
     result.addMember("bytes", static_cast<std::int64_t>(bytes));
@@ -3879,6 +3916,7 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
 
   if (message.action == UiAction::discardTelemetry) {
     engine_.discardTelemetry();
+    outputAnalyzers_.discardTelemetry();
     return bridgeResult(true);
   }
 
@@ -4103,6 +4141,46 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     }
     result.addMember("filePaths", std::move(paths));
     return choc::json::toString(result);
+  }
+
+  if (message.action == UiAction::beginBackupExport) {
+    std::uint64_t generation;
+    {
+      std::scoped_lock lock(backupExportMutex_);
+      generation = ++backupExportGeneration_;
+      backupExport_.cancel();
+    }
+    // A modal chooser pumps host events and may reenter cancellation, editor
+    // teardown or another begin. Hold no export lock while it is running, and
+    // accept its result only if that same request still owns the generation.
+#if defined(EFFETUNE_PROCESSOR_TEST_HOOKS)
+    const auto selected = backupSaveChooserForTesting_
+        ? backupSaveChooserForTesting_(message.defaultName)
+        : chooseBackupToSave(message.defaultName);
+#else
+    const auto selected = chooseBackupToSave(message.defaultName);
+#endif
+    std::scoped_lock lock(backupExportMutex_);
+    if (!selected || generation != backupExportGeneration_) {
+      auto result = choc::value::createObject({});
+      result.addMember("ok", true);
+      result.addMember("cancelled", true);
+      return choc::json::toString(result);
+    }
+    const auto succeeded = backupExport_.begin(*selected, message.assetByteSize, &error);
+    return bridgeResult(succeeded, error);
+  }
+  if (message.action == UiAction::cancelBackupExport) {
+    cancelBackupExport();
+    return bridgeResult(true);
+  }
+  if (message.action == UiAction::appendBackupExport ||
+      message.action == UiAction::commitBackupExport) {
+    std::scoped_lock lock(backupExportMutex_);
+    const auto succeeded = message.action == UiAction::appendBackupExport
+        ? backupExport_.append(message.assetOffset, message.content, &error)
+        : backupExport_.commit(&error);
+    return bridgeResult(succeeded, error);
   }
 
   if (message.action == UiAction::savePresetDialog) {

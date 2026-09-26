@@ -25,11 +25,12 @@ void setError(std::string *destination, std::string message) {
   }
 }
 
-bool hasPresetExtension(const std::filesystem::path &path) {
+bool hasExchangeExtension(const std::filesystem::path &path,
+                          const std::string_view expected = ".effetune_preset") {
   auto extension = path.extension().string();
   std::transform(extension.begin(), extension.end(), extension.begin(),
                  [](const unsigned char value) { return static_cast<char>(std::tolower(value)); });
-  return extension == ".effetune_preset";
+  return extension == expected;
 }
 
 #if defined(_WIN32)
@@ -48,18 +49,20 @@ private:
 
 template <typename Dialog>
 std::optional<std::filesystem::path> runWindowsDialog(const CLSID &classId,
-                                                      const std::wstring &defaultName) {
+                                                      const std::wstring &defaultName,
+                                                      const bool backup = false) {
   ComScope com;
   Dialog *dialog = nullptr;
   if (FAILED(CoCreateInstance(classId, nullptr, CLSCTX_INPROC_SERVER,
                               __uuidof(Dialog), reinterpret_cast<void **>(&dialog)))) {
     return std::nullopt;
   }
-  constexpr COMDLG_FILTERSPEC filter[] = {
-      {L"EffeTune Mixwright preset", L"*.effetune_preset"}, {L"All files", L"*.*"}};
+  const COMDLG_FILTERSPEC filter[] = {
+      {backup ? L"EffeTune Mixwright backup" : L"EffeTune Mixwright preset",
+       backup ? L"*.effetune_backup" : L"*.effetune_preset"}, {L"All files", L"*.*"}};
   (void)dialog->SetFileTypes(static_cast<UINT>(std::size(filter)), filter);
   (void)dialog->SetFileTypeIndex(1);
-  (void)dialog->SetDefaultExtension(L"effetune_preset");
+  (void)dialog->SetDefaultExtension(backup ? L"effetune_backup" : L"effetune_preset");
   if (!defaultName.empty()) {
     (void)dialog->SetFileName(defaultName.c_str());
   }
@@ -81,7 +84,8 @@ std::optional<std::filesystem::path> runWindowsDialog(const CLSID &classId,
   CoTaskMemFree(value);
   item->Release();
   dialog->Release();
-  if (path.has_value() && !hasPresetExtension(*path)) {
+  if (path.has_value() && !hasExchangeExtension(*path,
+      backup ? ".effetune_backup" : ".effetune_preset")) {
     return std::nullopt;
   }
   return path;
@@ -99,7 +103,8 @@ std::wstring utf8ToWide(const std::string_view value) {
 }
 #elif defined(__APPLE__)
 std::optional<std::filesystem::path> runMacDialog(const bool save,
-                                                  const std::string_view defaultName) {
+                                                  const std::string_view defaultName,
+                                                  const bool backup = false) {
   using SendId = id (*)(id, SEL);
   using SendIdCString = id (*)(id, SEL, const char *);
   using SendVoidId = void (*)(id, SEL, id);
@@ -128,7 +133,8 @@ std::optional<std::filesystem::path> runMacDialog(const bool save,
       pathString, sel_registerName("UTF8String"));
   if (utf8 == nullptr) return std::nullopt;
   auto path = presetPathFromUtf8(utf8);
-  return hasPresetExtension(path) ? std::optional(path) : std::nullopt;
+  return hasExchangeExtension(path, backup ? ".effetune_backup" : ".effetune_preset")
+      ? std::optional(path) : std::nullopt;
 }
 #endif
 
@@ -158,6 +164,18 @@ std::optional<std::filesystem::path> choosePresetToSave(const std::string_view d
 #endif
 }
 
+std::optional<std::filesystem::path> chooseBackupToSave(const std::string_view defaultName) {
+  auto name = std::filesystem::path(defaultName).filename().string();
+  if (!name.ends_with(".effetune_backup")) name += ".effetune_backup";
+#if defined(_WIN32)
+  return runWindowsDialog<IFileSaveDialog>(CLSID_FileSaveDialog, utf8ToWide(name), true);
+#elif defined(__APPLE__)
+  return runMacDialog(true, name, true);
+#else
+  return std::nullopt;
+#endif
+}
+
 std::string presetPathToUtf8(const std::filesystem::path &path) {
   const auto value = path.u8string();
   return {reinterpret_cast<const char *>(value.data()), value.size()};
@@ -172,7 +190,7 @@ std::filesystem::path presetPathFromUtf8(const std::string_view path) {
 bool readPresetExchangeFile(const std::filesystem::path &path, std::string &content,
                             std::string *error) {
   std::error_code statusError;
-  if (!hasPresetExtension(path) || !std::filesystem::is_regular_file(path, statusError)) {
+  if (!hasExchangeExtension(path) || !std::filesystem::is_regular_file(path, statusError)) {
     setError(error, "The selected preset file does not exist");
     return false;
   }
@@ -192,7 +210,7 @@ bool readPresetExchangeFile(const std::filesystem::path &path, std::string &cont
 
 bool writePresetExchangeFile(const std::filesystem::path &path, const std::string_view content,
                              std::string *error) {
-  if (!hasPresetExtension(path) || content.size() > kMaximumPresetBytes) {
+  if (!hasExchangeExtension(path) || content.size() > kMaximumPresetBytes) {
     setError(error, "Preset export must use .effetune_preset and be at most 8 MB");
     return false;
   }

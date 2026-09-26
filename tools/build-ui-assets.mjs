@@ -47,11 +47,11 @@ if (source === output || !source.endsWith(path.join('external', 'effetune'))) {
 await rm(output, { recursive: true, force: true });
 await mkdir(output, { recursive: true });
 
-for (const entry of ['js', 'plugins', 'presets', 'images']) {
+for (const entry of ['js', 'plugins', 'presets', 'images', 'css']) {
   await cp(path.join(source, entry), path.join(output, entry), { recursive: true });
 }
-for (const entry of ['effetune.css', 'effetune-theme.css']) {
-  await cp(path.join(source, entry), path.join(output, entry));
+for (const entry of ['effetune-mobile.css', 'effetune-library.css', 'pipeline-analyzer.css']) {
+  await rm(path.join(output, 'css', entry), { force: true });
 }
 await cp(path.join(projectRoot, 'ui-shim', 'vst-bootstrap.js'),
          path.join(output, 'vst-bootstrap.js'));
@@ -71,6 +71,14 @@ await cp(path.join(projectRoot, 'THIRD-PARTY-NOTICES.txt'),
          path.join(output, 'THIRD-PARTY-NOTICES.txt'));
 
 let html = await readFile(path.join(source, 'effetune.html'), 'utf8');
+// The upstream currently loads JSZip lazily; retain compatibility with a classic-script entry.
+const legacyZipScript = 'src="js/vendor/jszip-3.10.1.min.js"';
+if (html.includes(legacyZipScript)) {
+  if (html.split(legacyZipScript).length - 1 !== 1) {
+    throw new Error('Expected one upstream JSZip script entry');
+  }
+  html = html.replace(legacyZipScript, 'src="js/vendor/jszip-3.10.2.min.js"');
+}
 const upstreamDocumentTitle = '<title>EffeTune</title>';
 const upstreamHeaderTitle = '<h1>Frieve EffeTune<img';
 const upstreamFooterTitle = 'EffeTune version <span id="app-version"></span>';
@@ -80,7 +88,7 @@ if (!html.includes(upstreamDocumentTitle) || !html.includes(upstreamHeaderTitle)
   throw new Error('Unable to locate the upstream EffeTune branding');
 }
 html = applyProductBranding(html)
-  .replace(/\s*<link rel="stylesheet" href="effetune-(?:mobile|library)\.css">/g, '')
+  .replace(/\s*<link rel="stylesheet" href="css\/effetune-(?:mobile|library)\.css">/g, '')
   .replace(/\s*<link rel="manifest" href="manifest\.json">/g, '')
   .replace(/<meta http-equiv="Content-Security-Policy"[^>]*>/,
     `<meta http-equiv="Content-Security-Policy" content="default-src 'self' blob: data:; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:; connect-src 'self' blob:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline' blob:;">`)
@@ -89,10 +97,32 @@ html = applyProductBranding(html)
   .replace(/\s*<button class="pipeline-menu-item" id="doubleBlindTestButton">[\s\S]*?<\/button>/, '')
   .replace(/\s*<button class="header-button pipeline-analyzer-button" id="pipelineAnalyzerButton"[\s\S]*?<\/button>/, '')
   .replace(/\s*<aside class="pipeline-analyzer-panel" id="pipelineAnalyzerPanel" hidden><\/aside>/, '')
-  .replace(/\s*<script src="js\/vendor\/(?:jszip-3\.10\.1\.min\.js|jsmediatags-3\.9\.5\.min\.js)"><\/script>/g, '')
+  .replace(/\s*<script src="js\/vendor\/jsmediatags-3\.9\.5\.min\.js"><\/script>/g, '')
   .replace('</head>', '    <script src="vst-bootstrap.js"></script>\n</head>');
 await writeFile(path.join(output, 'effetune.html'), html, 'utf8');
-await rm(path.join(output, 'js', 'vendor'), { recursive: true, force: true });
+const backupDialogPath = path.join(output, 'js', 'user-data-backup', 'dialog.js');
+let backupDialog = await readFile(backupDialogPath, 'utf8');
+const backupDownload = '        downloadable(output.blob, output.fileName);';
+if (backupDialog.split(backupDownload).length - 1 !== 1) {
+  throw new Error('Unable to locate the upstream backup download');
+}
+backupDialog = backupDialog.replace(backupDownload,
+  '        await window.__effetuneExportBackup(output.blob, output.fileName, controller.signal);');
+await writeFile(backupDialogPath, backupDialog, 'utf8');
+const backupArchivePath = path.join(output, 'js', 'user-data-backup', 'archive.js');
+let backupArchive = await readFile(backupArchivePath, 'utf8');
+const legacyZipLoader = "new URL('../vendor/jszip-3.10.1.min.js', import.meta.url)";
+if (backupArchive.split(legacyZipLoader).length - 1 !== 1) {
+  throw new Error('Unable to locate the upstream JSZip backup loader');
+}
+backupArchive = backupArchive.replace(legacyZipLoader,
+  "new URL('../vendor/jszip-3.10.2.min.js', import.meta.url)");
+await writeFile(backupArchivePath, backupArchive, 'utf8');
+for (const entry of await readdir(path.join(output, 'js', 'vendor'))) {
+  await rm(path.join(output, 'js', 'vendor', entry), { recursive: true, force: true });
+}
+await cp(path.join(projectRoot, 'ui-shim', 'vendor', 'jszip-3.10.2.min.js'),
+         path.join(output, 'js', 'vendor', 'jszip-3.10.2.min.js'));
 
 const appPath = path.join(output, 'js', 'app.js');
 let app = await readFile(appPath, 'utf8');
@@ -226,7 +256,9 @@ const upstreamChannelOptions = `        // Define channel options - changed for 
             channelOptions.push({ text: \`Ch \${i}\`, value: String(i) });
         }
 
-        channelOptions.forEach(option => {
+        // Fixed-channel hosts expose their supported layout; other hosts may prepare routing offline.
+        const outputChannelCount = this.pipelineCore.audioManager?.outputChannelCount ?? 16;
+        channelOptions.filter(option => getPluginExecutionChannelMode(option.value || null, outputChannelCount)).forEach(option => {
             const optionEl = document.createElement('option');
             optionEl.value = option.value;
             optionEl.textContent = option.text;
@@ -270,6 +302,22 @@ routingDialog = routingDialog.replace(upstreamChannelOptions, `        // The VS
             channelSelect.appendChild(optionEl);
         });`);
 await writeFile(routingDialogPath, routingDialog, 'utf8');
+
+const visualizerEditorPath = path.join(output, 'js', 'visualizer', 'visualizer-editor.js');
+let visualizerEditor = await readFile(visualizerEditorPath, 'utf8');
+const visualizerChannels = `            const channels = [['', '1–2'], ['L', 'L'], ['R', 'R'], ...Array.from({ length: 7 }, (_, i) => [\`\${i * 2 + 3}\${i * 2 + 4}\`, \`\${i * 2 + 3}–\${i * 2 + 4}\`]), ...Array.from({ length: 16 }, (_, i) => [\`\${i + 1}\`, \`\${i + 1}\`])];
+            this.field(properties, this.t('visualizer.channel', 'Channel'), 'select', item.channel || '', value => { item.channel = value || null; this.changed(); }, { values: channels });`;
+if (visualizerEditor.split(visualizerChannels).length - 1 !== 1) {
+  throw new Error('Unable to locate Visualizer channel choices');
+}
+visualizerEditor = visualizerEditor.replace(visualizerChannels, `            const channels = [['', '1–2'], ['L', 'L'], ['R', 'R'], ...Array.from({ length: 3 }, (_, i) => [\`\${i * 2 + 3}\${i * 2 + 4}\`, \`\${i * 2 + 3}–\${i * 2 + 4}\`]), ...Array.from({ length: 8 }, (_, i) => [\`\${i + 1}\`, \`\${i + 1}\`])];
+            const unavailableChannel = item.channel && !channels.some(([value]) => value === item.channel);
+            if (unavailableChannel) channels.push([item.channel, \`Unavailable in this plug-in (\${item.channel})\`]);
+            const channelSelect = this.field(properties, this.t('visualizer.channel', 'Channel'), 'select', item.channel || '', value => { item.channel = value || null; this.changed(); }, { values: channels });
+            if (unavailableChannel) {
+                for (const option of channelSelect.options) option.disabled = option.value === item.channel;
+            }`);
+await writeFile(visualizerEditorPath, visualizerEditor, 'utf8');
 
 const fifteenBandGeqPath = path.join(output, 'plugins', 'eq', 'fifteen_band_geq.js');
 let fifteenBandGeq = await readFile(fifteenBandGeqPath, 'utf8');
@@ -457,7 +505,21 @@ if (!uiManager.includes(musicInitializers)) {
   throw new Error('Unable to locate the music/library UI initializers');
 }
 uiManager = uiManager.replace(musicInitializers,
-  `        // Music player and library are excluded from the VST UI.`);
+  `        this.initOpenLibraryButton();`);
+// The shared initializer owns Effects/Visualizer navigation as well as Library.
+const viewNavigationInitializer = /    initOpenLibraryButton\(\) \{[\s\S]*?\n    \}\n/;
+if (!viewNavigationInitializer.test(uiManager)) {
+  throw new Error('Unable to locate shared view navigation initialization');
+}
+uiManager = uiManager.replace(viewNavigationInitializer, `    initOpenLibraryButton() {
+        this.effectPipelineButton = document.getElementById('effectPipelineButton');
+        this.visualizerButton = document.getElementById('visualizerButton');
+        this.visualizerButton?.addEventListener('click', () => this.showVisualizerView());
+        this.effectPipelineButton?.addEventListener('click', event => {
+            this.showEffectPipelineView({ returnFocus: event.currentTarget });
+        });
+    }
+`);
 const libraryRecoveryInitialization = `        this.libraryRecoveryApi = window.electronAPI?.libraryRecoveryV1 || null;
         this.libraryRecoveryState = {
             apiVersion: 1,
@@ -643,15 +705,13 @@ const offlineImport = `import { OfflineProcessor } from './audio/offline-process
 if (browserAudioManager.includes(offlineImport)) {
   browserAudioManager = browserAudioManager.replace(offlineImport, '');
 }
-const offlineLoader = /    async _ensureOfflineProcessor\(\) \{[\s\S]*?\n    \}\n    \n    \/\*\*\n     \* Encode audio buffer/;
+const offlineLoader = /    async _ensureOfflineProcessor\(\) \{[\s\S]*?\n    \}\n/;
 if (!offlineLoader.test(browserAudioManager)) {
   throw new Error('Unable to locate current lazy offline processor loader');
 }
 browserAudioManager = browserAudioManager.replace(offlineLoader,
   `    async _ensureOfflineProcessor() { return null; }
-
-    /**
-     * Encode audio buffer`);
+`);
 const offlineProcessMethod = /    async processAudioFile\(file, progressCallback = null, outputSettings = null\) \{[\s\S]*?\n    \}\n\n    \/\*\*\n     \* Cancel the current offline audio processing operation/;
 if (!offlineProcessMethod.test(browserAudioManager)) {
   throw new Error('Unable to locate current offline processing method');
@@ -661,12 +721,6 @@ browserAudioManager = browserAudioManager.replace(offlineProcessMethod,
 
     /**
      * Cancel the current offline audio processing operation`);
-const encodeWavMethod = /    encodeWAV\(audioBuffer\) \{[\s\S]*?\n    \}/;
-if (!encodeWavMethod.test(browserAudioManager)) {
-  throw new Error('Unable to locate current offline WAV encoder method');
-}
-browserAudioManager = browserAudioManager.replace(encodeWavMethod,
-  '    encodeWAV() { return null; }');
 await writeFile(browserAudioManagerPath, browserAudioManager, 'utf8');
 
 const configIntegrationPath = path.join(output, 'js', 'electron', 'configIntegration.js');

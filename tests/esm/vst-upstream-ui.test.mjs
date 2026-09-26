@@ -1,0 +1,306 @@
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
+import path from 'node:path';
+import test from 'node:test';
+import { pathToFileURL } from 'node:url';
+import vm from 'node:vm';
+
+const assetsIndex = process.argv.indexOf('--assets');
+assert.ok(assetsIndex >= 0, 'Pass --assets <generated WebView directory>');
+const assets = path.resolve(process.argv[assetsIndex + 1]);
+const assetText = relative => readFile(path.join(assets, relative), 'utf8');
+const assetModule = relative => import(pathToFileURL(path.join(assets, relative)).href);
+
+async function bundledZip() {
+  const module = { exports: {} };
+  const run = vm.runInThisContext(`(function(module,exports,require){${await assetText('js/vendor/jszip-3.10.2.min.js')}\n})`);
+  run(module, module.exports, createRequire(import.meta.url));
+  assert.equal(module.exports.version, '3.10.2');
+  return module.exports;
+}
+
+class Element {
+  constructor(tag) {
+    this.tagName = tag.toUpperCase();
+    this.children = [];
+    this.listeners = new Map();
+    this.dataset = {};
+    this.attributes = new Map();
+    this.value = '';
+    this._classes = new Set();
+    this.classList = {
+      add: (...names) => names.forEach(name => this._classes.add(name)),
+      remove: (...names) => names.forEach(name => this._classes.delete(name)),
+      contains: name => this._classes.has(name),
+      toggle: (name, on = !this._classes.has(name)) => {
+        if (on) this._classes.add(name); else this._classes.delete(name);
+      }
+    };
+  }
+  set className(value) { this._classes = new Set(value.split(/\s+/)); }
+  get className() { return [...this._classes].join(' '); }
+  set textContent(value) {
+    this._text = value;
+    if (value === '') this.children = [];
+  }
+  get textContent() { return this._text || ''; }
+  appendChild(node) { node.parentNode = this; this.children.push(node); return node; }
+  append(...nodes) { nodes.forEach(node => this.appendChild(node)); }
+  remove() {
+    if (this.parentNode) this.parentNode.children = this.parentNode.children.filter(node => node !== this);
+  }
+  contains(node) { return this === node || this.children.some(child => child.contains(node)); }
+  addEventListener(type, callback) {
+    this.listeners.set(type, [...(this.listeners.get(type) || []), callback]);
+  }
+  removeEventListener() {}
+  async dispatch(type) {
+    for (const callback of this.listeners.get(type) || []) {
+      await callback({ target: this, currentTarget: this, preventDefault() {} });
+    }
+  }
+  click() { return this.dispatch('click'); }
+  setAttribute(name, value) { this.attributes.set(name, String(value)); }
+  querySelectorAll() { return []; }
+  focus() { globalThis.document.activeElement = this; }
+}
+
+const flatten = node => [node, ...node.children.flatMap(flatten)];
+const byClass = (node, name) => flatten(node).find(item => item.classList.contains(name));
+const until = async predicate => {
+  const deadline = Date.now() + 5000;
+  while (!predicate()) {
+    assert.ok(Date.now() < deadline, 'UI operation did not complete');
+    await new Promise(resolve => setTimeout(resolve, 1));
+  }
+};
+
+async function bootstrap(hostMessage) {
+  const document = Object.assign(new Element('document'), {
+    head: new Element('head'), body: new Element('body'),
+    createElement: tag => new Element(tag),
+    createTextNode: text => Object.assign(new Element('text'), { textContent: text }),
+    getElementById: () => null
+  });
+  const window = Object.assign(new Element('window'), { vst_hostMessage: hostMessage });
+  const context = { document, window, navigator: { platform: 'Win32', userAgent: 'WebView' },
+    URL, Uint8Array, Blob, DOMException, btoa, console, setTimeout, clearTimeout };
+  vm.runInNewContext(await assetText('vst-bootstrap.js'), context);
+  return context;
+}
+
+test('bundled ElectronIntegration constructs with the VST subscription surface', async () => {
+  const context = await bootstrap(async () => ({ ok: true }));
+  const source = (await assetText('js/electron-integration.js'))
+    .replace(/^import[\s\S]*?;\r?\n/gm, '').replaceAll('export ', '');
+  vm.runInNewContext(`${source}\nthis.integration = new ElectronIntegration();`, context);
+  assert.equal(context.integration.isElectron, true);
+  assert.equal(typeof context.window.electronAPI.onBackupRestore(() => {}), 'function');
+});
+
+test('Effects and Visualizer buttons navigate through shared upstream view transitions', async () => {
+  const context = await bootstrap(async () => ({ ok: true }));
+  const source = await assetText('js/ui-manager.js');
+  const method = name => {
+    const match = source.match(new RegExp(`    (?:async )?${name}\\([^\\n]*\\) \\{[\\s\\S]*?\\n    \\}`));
+    assert.ok(match, `Missing ${name}`);
+    return match[0];
+  };
+  vm.runInNewContext(`class Navigation { ${['initOpenLibraryButton', 'showVisualizerView',
+    'showEffectPipelineView', 'updateViewSwitchButtons'].map(method).join('\n')} }
+    this.navigation = new Navigation();`, context);
+  const effects = new Element('button');
+  const visualizer = new Element('button');
+  context.document.getElementById = id => ({ effectPipelineButton: effects, visualizerButton: visualizer })[id];
+  let visible = false;
+  const navigation = context.navigation;
+  Object.assign(navigation, {
+    isDoubleBlindActive: () => false,
+    hideLibraryView() {},
+    visualizerView: { initialized: Promise.resolve(), layout: {},
+      show() { visible = true; }, hide() { visible = false; }, updateVisibility() {} }
+  });
+  navigation.initOpenLibraryButton();
+  await visualizer.click();
+  assert.equal(visible, true);
+  assert.equal(context.document.body.classList.contains('view-visualizer'), true);
+  await effects.click();
+  assert.equal(visible, false);
+  assert.equal(context.document.body.classList.contains('view-visualizer'), false);
+  assert.equal(effects.attributes.get('aria-pressed'), 'true');
+});
+
+test('VST backup export chunks binary data and cancels incomplete transfers', async () => {
+  const calls = [];
+  const context = await bootstrap(async serialized => {
+    calls.push(JSON.parse(serialized));
+    return { ok: true };
+  });
+  const bytes = Uint8Array.from({ length: 400000 }, (_, index) => index % 256);
+  await context.window.__effetuneExportBackup(new Blob([bytes]), 'saved.effetune_backup');
+  assert.equal(calls[0].type, 'backup/exportBegin');
+  const chunks = calls.filter(call => call.type === 'backup/exportChunk');
+  assert.deepEqual(chunks.map(chunk => chunk.payload.offset), [0, 196608, 393216]);
+  assert.deepEqual(Buffer.concat(chunks.map(chunk => Buffer.from(chunk.payload.data, 'base64'))), Buffer.from(bytes));
+  assert.equal(calls.at(-1).type, 'backup/exportCommit');
+  context.window.vst_hostMessage = async serialized => {
+    const call = JSON.parse(serialized);
+    calls.push(call);
+    return { ok: call.type !== 'backup/exportChunk', error: 'Write failed' };
+  };
+  await assert.rejects(context.window.__effetuneExportBackup(new Blob([bytes]), 'saved.effetune_backup'), /Write failed/);
+  assert.equal(calls.at(-1).type, 'backup/exportCancel');
+});
+
+test('Visualizer choices match eight channels and preserve an imported wider selection', async () => {
+  const source = await assetText('js/visualizer/visualizer-editor.js');
+  const start = source.indexOf('            const channels =');
+  const end = source.indexOf('\n        }\n        this.styleToggles', start);
+  const create = vm.runInNewContext(`(function(item) {
+    const properties = {};
+    ${source.slice(start, end)}
+    return channelSelect;
+  })`);
+  const editor = { t: (_key, text) => text, changed() {},
+    field: (_parent, _label, _kind, value, _action, options) => ({ value,
+      options: options.values.map(([value]) => ({ value, disabled: false })) }) };
+  const current = create.call(editor, { channel: null });
+  assert.deepEqual(JSON.parse(JSON.stringify(current.options.map(option => option.value))),
+    ['', 'L', 'R', '34', '56', '78', '1', '2', '3', '4', '5', '6', '7', '8']);
+  const imported = { channel: '910' };
+  const restored = create.call(editor, imported);
+  assert.equal(restored.value, '910');
+  assert.equal(restored.options.at(-1).disabled, true);
+  assert.equal(imported.channel, '910');
+});
+
+test('shared Visualizer sources report readiness, decode host-rate telemetry and clear on hide/restart/dispose', async () => {
+  const { AudioManager } = await assetModule('js/audio-manager.js');
+  const { TelemetryHub } = await assetModule('js/audio/telemetry-hub.js');
+  const { VisualizerSources } = await assetModule('js/visualizer/visualizer-sources.js');
+  const context = await bootstrap(async () => ({ ok: true }));
+  vm.runInNewContext(await assetText('plugins/analyzer/spectrum_analyzer.js'),
+    { ...context, PluginBase: class {}, Float32Array });
+  const previous = { document: globalThis.document, window: globalThis.window };
+  globalThis.document = context.document;
+  globalThis.window = context.window;
+  try {
+    const messages = [];
+    const port = { postMessage: message => messages.push(message) };
+    const nativeNode = { port };
+    const listeners = new Map();
+    const audio = Object.assign(Object.create(AudioManager.prototype), {
+      contextManager: { workletNode: nativeNode, audioContext: { sampleRate: 384000 } },
+      workletNode: nativeNode, _dspCapabilitiesByNode: new Map([[nativeNode, {}]]),
+      telemetryHub: new TelemetryHub({ port }),
+      updateDspTelemetryRate() {}, _scheduleVisualSyncUpdate() {},
+      addEventListener: (type, callback) => listeners.set(type, callback),
+      removeEventListener: type => listeners.delete(type)
+    });
+    const sources = new VisualizerSources(audio);
+    assert.equal(sources.getStatus(), 'ready');
+    sources.setLayout({ items: [{ id: 'spectrum', type: 'spectrum', channel: null, params: { pt: 8 } }] });
+    sources.setVisible(true);
+    let descriptor = messages.filter(message => message.type === 'setVisualizerSources').at(-1).sources[0];
+    assert.equal(descriptor.type, 'SpectrumAnalyzerPlugin');
+    assert.ok(descriptor.params instanceof Float32Array);
+    const packet = new ArrayBuffer(16 + 12 + 129 * 8);
+    const view = new DataView(packet);
+    view.setUint16(0, 4, true); view.setUint16(2, 1, true);
+    view.setUint32(4, descriptor.tapId, true); view.setUint16(12, packet.byteLength - 16, true);
+    view.setFloat32(16, 48000, true); view.setUint32(20, 129, true); view.setUint16(24, 8, true);
+    for (let index = 0; index < 258; ++index) view.setFloat32(28 + index * 4, -60, true);
+    audio.telemetryHub.handleMessage({ type: 'dspTelemetry', packet, bytes: packet.byteLength });
+    assert.equal(sources.getFrame('spectrum').sampleRate, 48000);
+    context.document.hidden = true;
+    await context.document.dispatch('visibilitychange');
+    assert.equal(messages.filter(message => message.type === 'setVisualizerSources').at(-1).sources.length, 0);
+    assert.equal(sources.getFrame('spectrum'), null);
+    context.document.hidden = false;
+    await context.document.dispatch('visibilitychange');
+    const resumed = messages.filter(message => message.type === 'setVisualizerSources').at(-1).sources[0];
+    assert.notEqual(resumed.tapId, descriptor.tapId);
+    listeners.get('dspReady')();
+    descriptor = messages.filter(message => message.type === 'setVisualizerSources').at(-1).sources[0];
+    assert.notEqual(descriptor.tapId, resumed.tapId);
+    sources.setVisible(false);
+    assert.equal(messages.filter(message => message.type === 'setVisualizerSources').at(-1).sources.length, 0);
+    sources.dispose();
+    assert.equal(audio.telemetryHub.subscribers.size, 0);
+  } finally {
+    if (previous.document === undefined) delete globalThis.document; else globalThis.document = previous.document;
+    if (previous.window === undefined) delete globalThis.window; else globalThis.window = previous.window;
+  }
+});
+
+test('bundled JSZip patch preserves cross-realm Uint8Array and ArrayBuffer bytes', async () => {
+  const JSZip = await bundledZip();
+  const input = vm.runInNewContext(`({
+    view: new Uint8Array([99, 0, 127, 255, 77]).subarray(1, 4),
+    buffer: new Uint8Array([0, 128, 255, 1]).buffer
+  })`);
+  const zip = new JSZip();
+  zip.file('view.bin', input.view);
+  zip.file('buffer.bin', input.buffer);
+  const output = await JSZip.loadAsync(await zip.generateAsync({ type: 'uint8array' }));
+  assert.deepEqual([...await output.file('view.bin').async('uint8array')], [0, 127, 255]);
+  assert.deepEqual([...await output.file('buffer.bin').async('uint8array')], [0, 128, 255, 1]);
+});
+
+test('bundled backup dialog creates a real ZIP and restores saved presets through upstream service', async () => {
+  const { UserDataBackupService } = await assetModule('js/user-data-backup/service.js');
+  const { createUserDataBackupAdapter } = await assetModule('js/user-data-backup/adapters.js');
+  const { createDefaultLayout } = await assetModule('js/visualizer/visualizer-model.js');
+  const { openUserDataBackupDialog } = await assetModule('js/user-data-backup/dialog.js');
+  const JSZip = await bundledZip();
+  const loadZip = async () => JSZip;
+  const store = (pipeline = {}, layouts = []) => {
+    const adapter = createUserDataBackupAdapter({
+      presetManager: { readBackupSnapshot: async () => structuredClone(pipeline),
+        appendPreset: async (name, data) => { pipeline[name] = structuredClone(data); } },
+      pluginPresetStore: { readBackupSnapshot: async () => ({}) },
+      visualizerPresetStore: { readBackupSnapshot: async () => structuredClone(layouts),
+        appendUserPreset: async (name, layout) => { layouts.push({ name, layout }); } },
+      measurementStorage: { readBackupSnapshot: async () => [] },
+      irLibrary: { readBackupSnapshot: async () => [] }
+    });
+    return { pipeline, layouts, service: new UserDataBackupService({ adapter, appVersion: '0.11.1', loadZip }) };
+  };
+  const context = await bootstrap(async () => ({ ok: true }));
+  const previous = { document: globalThis.document, window: globalThis.window };
+  globalThis.document = context.document;
+  globalThis.window = context.window;
+  let output;
+  context.window.__effetuneExportBackup = async (blob, fileName) => { output = { blob, fileName }; };
+  try {
+    const source = store({ Listening: { plugins: [{ nm: 'Volume', vl: -6 }] } },
+      [{ name: 'Wide', layout: createDefaultLayout() }]);
+    const modal = openUserDataBackupDialog({ service: source.service });
+    const button = byClass(modal.element, 'backup-restore-primary');
+    await until(() => button.disabled === false);
+    await button.click();
+    await until(() => !!output && button.disabled === false);
+    const bytes = new Uint8Array(await output.blob.arrayBuffer());
+    assert.deepEqual([...bytes.subarray(0, 4)], [0x50, 0x4b, 3, 4]);
+    modal.close();
+    const target = store();
+    const restore = openUserDataBackupDialog({ service: target.service });
+    await until(() => byClass(restore.element, 'backup-restore-dialog').attributes.get('aria-busy') === 'false');
+    const tabs = byClass(restore.element, 'backup-restore-tabs');
+    await tabs.children[1].click();
+    const input = flatten(restore.element).find(node => node.tagName === 'INPUT' && node.type === 'file');
+    input.files = [Object.assign(output.blob, { name: output.fileName })];
+    await input.dispatch('change');
+    const restoreButton = byClass(restore.element, 'backup-restore-primary');
+    await until(() => restoreButton.disabled === false);
+    await restoreButton.click();
+    await until(() => target.layouts.length === 1 && restoreButton.disabled === false);
+    assert.deepEqual(target.pipeline.Listening, source.pipeline.Listening);
+    assert.deepEqual(target.layouts[0], source.layouts[0]);
+    restore.close();
+  } finally {
+    if (previous.document === undefined) delete globalThis.document; else globalThis.document = previous.document;
+    if (previous.window === undefined) delete globalThis.window; else globalThis.window = previous.window;
+  }
+});

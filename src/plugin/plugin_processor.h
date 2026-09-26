@@ -4,6 +4,7 @@
 #include "public.sdk/source/vst/vstsinglecomponenteffect.h"
 
 #include "bridge/state_codec.h"
+#include "bridge/backup_export.h"
 #include "bridge/config_store.h"
 #include "bridge/preset_store.h"
 #include "engine/automation_catalog.h"
@@ -13,6 +14,7 @@
 #include "engine/engine_host.h"
 #include "engine/frequency_preview.h"
 #include "engine/output_transition.h"
+#include "engine/output_analyzers.h"
 #include "engine/resampler.h"
 #include "plugin/automation_parameters.h"
 #include "plugin/automation_trace.h"
@@ -25,6 +27,9 @@
 #include <bitset>
 #include <chrono>
 #include <cstdint>
+#if defined(EFFETUNE_PROCESSOR_TEST_HOOKS)
+#include <functional>
+#endif
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -174,6 +179,7 @@ private:
   void notifyLatencyChange(Steinberg::uint32 previousLatency);
   void armLatencyNotification();
   void queueLatencyNotification(bool restartDebounce);
+  void cancelBackupExport();
   // The UI reports the latency of the DSP image currently being rendered. This
   // may lead getLatencySamples() briefly while the non-real-time compensation
   // plan and the host PDC notification wait for a safe control window.
@@ -621,6 +627,10 @@ private:
   };
 
   std::vector<std::uint8_t> telemetryScratch_;
+  OutputAnalyzers outputAnalyzers_;
+  bridge::BackupExport backupExport_;
+  std::mutex backupExportMutex_;
+  std::uint64_t backupExportGeneration_ = 0;
   std::unordered_map<std::uint64_t, PendingAssetTransfer> pendingAssetTransfers_;
   std::vector<float> engineOutputBuffer_;
   FrequencyPreview frequencyPreview_;
@@ -782,6 +792,8 @@ private:
   // off; see plugin/automation_trace.h.
   const std::uint32_t traceInstance_ = trace::nextInstanceId();
 #if defined(EFFETUNE_PROCESSOR_TEST_HOOKS)
+  std::function<std::optional<std::filesystem::path>(std::string_view)>
+      backupSaveChooserForTesting_;
   std::uint32_t pipelinePlanRefreshFailuresForTesting_ = 0;
   std::atomic_bool pauseControllerCommitBeforePublishForTesting_{false};
   std::atomic_bool controllerCommitPausedForTesting_{false};

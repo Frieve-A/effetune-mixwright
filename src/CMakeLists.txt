@@ -6,9 +6,11 @@ add_library(effetune_engine STATIC
   engine/engine_host.cpp
   engine/latency.cpp
   engine/output_transition.cpp
+  engine/output_analyzers.cpp
   engine/pipeline_model.cpp
   engine/resampler.cpp
   bridge/config_store.cpp
+  bridge/backup_export.cpp
   bridge/message_router.cpp
   bridge/preset_store.cpp
   bridge/state_codec.cpp)

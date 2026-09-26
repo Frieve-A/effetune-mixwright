@@ -29,6 +29,22 @@ The main build artifacts are:
 - Headless host: `build/windows-release/src/tools/effetune-headless.exe`
 - WebView assets: `build/windows-release/webview-assets`
 
+## Visualizer and Saved Data
+
+Use the **Visualizer** header button to view and edit analyzer layouts fed by the
+native pipeline output. The **Effect Pipeline** button returns to effect editing.
+Visualizer presets and imported images use the VST WebView's local storage.
+The music player and music library remain outside the VST interface.
+
+**Settings → Backup / Restore** transfers saved pipeline, effect and Visualizer
+presets, impulse responses and measurements in an `.effetune_backup` archive.
+Choose a destination in the native save dialog; restoration previews the selected
+items before writing them. Archive creation is limited to 256 MB. Native export
+stages the archive and replaces the chosen file only after all chunks arrive.
+
+Spectrum Overlay's per-effect HQ and Peak Hold controls are not available through
+the native transport. Visualizer analyzer sources have their own analysis settings.
+
 ## Room EQ Measurements
 
 Electron and VST WebViews intentionally keep separate browser-storage profiles and origins.

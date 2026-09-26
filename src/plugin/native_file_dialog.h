@@ -10,6 +10,8 @@ namespace effetune::vst::plugin {
 [[nodiscard]] std::optional<std::filesystem::path> choosePresetToOpen();
 [[nodiscard]] std::optional<std::filesystem::path>
 choosePresetToSave(std::string_view defaultName);
+[[nodiscard]] std::optional<std::filesystem::path>
+chooseBackupToSave(std::string_view defaultName);
 [[nodiscard]] std::string presetPathToUtf8(const std::filesystem::path &path);
 [[nodiscard]] std::filesystem::path presetPathFromUtf8(std::string_view path);
 [[nodiscard]] bool readPresetExchangeFile(const std::filesystem::path &path,

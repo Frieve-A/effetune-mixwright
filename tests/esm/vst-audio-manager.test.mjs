@@ -26,6 +26,8 @@ const topologyCommitStart = source.indexOf('  commitPowerTopologyMutation(');
 const topologyCommitEnd = source.indexOf('\n  registerPipelineProcessors()', topologyCommitStart);
 const masterBypassStart = source.indexOf('  setMasterBypass(');
 const masterBypassEnd = source.indexOf('\n  applyNativeBypass(', masterBypassStart);
+const readinessMethod = source.slice(source.indexOf('  applyNativeReadiness(info) {'),
+  source.lastIndexOf('\n}'));
 
 assert.notEqual(classStart, -1, 'NativePort class is missing');
 assert.notEqual(classEnd, -1, 'NativePort class boundary is missing');
@@ -153,8 +155,39 @@ test('frequency audition forwards start, retune and stop and ends on editor tear
   ]) {
     await port.postMessage({ type: 'frequencyPreview', frequency: 1000 });
     teardown();
-    assert.equal(hostCalls.at(-1).payload.frequency, null);
+    assert.equal(hostCalls.filter(call => call.type === 'audio/frequencyPreview').at(-1).payload.frequency, null);
   }
+});
+
+test('visualizer sources preserve packed parameters, channels and tap identity and clear explicitly', async () => {
+  const { context, hostCalls, node, port } = createNativePort();
+  const descriptor = {
+    tapId: 0xf0000000, type: 'SpectrumAnalyzerPlugin', channel: '34',
+    params: new Float32Array([12, -96, 1]), paramsHash: 0xfedcba98, gain: 2
+  };
+  await port.postMessage({ type: 'setVisualizerSources', sources: [descriptor] });
+  const request = hostCalls.at(-1);
+  assert.equal(request.type, 'visualizer/setSources');
+  const received = JSON.parse(JSON.stringify(request.payload.sources[0]));
+  assert.deepEqual(received, { ...descriptor, params: [12, -96, 1] });
+  await port.postMessage({ type: 'setVisualizerSources', sources: [] });
+  assert.equal(hostCalls.at(-1).type, 'visualizer/setSources');
+  assert.equal(hostCalls.at(-1).payload.sources.length, 0);
+  await port.postMessage({ type: 'setVisualizerSources', sources: [descriptor] });
+  port.owner.nativeNode = node;
+  port.owner._dspCapabilitiesByNode = new Map();
+  port.owner.nativeContextGeneration = 1;
+  port.owner.dispatchEvent = () => {};
+  vm.runInNewContext(`this.applyReadiness = (class { ${readinessMethod} }).prototype.applyNativeReadiness;`, context);
+  context.applyReadiness.call(port.owner, { dspReady: true, contextGeneration: 1 });
+  assert.equal(port.owner._dspCapabilitiesByNode.has(node), true);
+  context.applyReadiness.call(port.owner, { dspReady: false, contextGeneration: 1 });
+  assert.equal(port.owner._dspCapabilitiesByNode.has(node), false);
+  context.window.dispatch('pagehide');
+  assert.equal(hostCalls.at(-1).payload.sources.length, 0);
+  await port.postMessage({ type: 'setVisualizerSources', sources: [descriptor] });
+  port.close();
+  assert.equal(hostCalls.at(-1).payload.sources.length, 0);
 });
 
 test('native payload carries upstream execution capabilities without persisting context', () => {
@@ -283,7 +316,7 @@ test('native performance status drives the upstream latency and CPU events', () 
   assert.notEqual(methodStart, -1, 'native performance status adapter is missing');
   assert.notEqual(methodEnd, -1, 'native performance status adapter boundary is missing');
   const context = {};
-  vm.runInNewContext(`this.Manager = class {${source.slice(methodStart, methodEnd)}\n};`, context);
+  vm.runInNewContext(`this.Manager = class {${source.slice(methodStart, methodEnd)}\n${readinessMethod}\n};`, context);
   const events = [];
   const manager = new context.Manager();
   Object.assign(manager, {
@@ -2991,7 +3024,7 @@ test('a sample rate change reseeds the baseline for rate-derived targets', async
   assert.notEqual(syncEnd, -1, 'AudioManager.synchronizeNativeContext boundary is missing');
   vm.runInNewContext(`this.Manager = class {${source.slice(managerStart, managerEnd)}\n` +
     `${source.slice(rebuildStart, rebuildEnd)}\n` +
-    `${source.slice(syncStart, syncEnd)}\n};`, context);
+    `${source.slice(syncStart, syncEnd)}\n${readinessMethod}\n};`, context);
   const descriptor = context.DSP_AUTOMATION_CATALOG.RoomEqPlugin
     .find(candidate => candidate.key === 'dy');
   assert.ok(descriptor, 'the sample-rate derived channel delay is an automation target');

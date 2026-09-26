@@ -9,6 +9,7 @@
 #include "public.sdk/source/vst/utility/memoryibstream.h"
 
 #include "choc/text/choc_JSON.h"
+#include "choc/memory/choc_Base64.h"
 #include "allocation_guard.h"
 
 #include <algorithm>
@@ -44,6 +45,11 @@ namespace effetune::vst::plugin {
 
 class PluginProcessorTestAccess {
 public:
+  static void setBackupSaveChooser(EffeTuneProcessor &processor,
+      std::function<std::optional<std::filesystem::path>(std::string_view)> chooser) {
+    processor.backupSaveChooserForTesting_ = std::move(chooser);
+  }
+
   [[nodiscard]] static std::unique_lock<std::mutex>
   lockProcessingResources(EffeTuneProcessor &processor) {
     return std::unique_lock(processor.processingResourcesMutex_);
@@ -6766,6 +6772,292 @@ void testDelayBearingEditsWithAStoppedTransportKeepEveryBlockWet() {
          "terminate the stopped-transport drag test");
 }
 
+void testBackupChooserReentrantCancellation() {
+  const auto directory = std::filesystem::temp_directory_path() /
+      ("effetune-modal-backup-test-" + std::to_string(
+          std::chrono::steady_clock::now().time_since_epoch().count()));
+  std::filesystem::create_directory(directory);
+  const auto original = directory / "original.zip";
+  const auto replacement = directory / "replacement.zip";
+  { std::ofstream output(original, std::ios::binary); output << "original"; }
+  const auto contents = [](const std::filesystem::path &path) {
+    std::ifstream input(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(input), {});
+  };
+  constexpr auto begin = R"({"type":"backup/exportBegin","payload":{"defaultName":"backup.zip","totalBytes":4}})";
+  constexpr auto append = R"({"type":"backup/exportChunk","payload":{"offset":0,"data":"AAECAw=="}})";
+  constexpr auto commit = R"({"type":"backup/exportCommit","payload":{}})";
+  for (int action = 0; action < 4; ++action) {
+    auto processor = std::make_unique<EffeTuneProcessor>();
+    expect(processor->initialize(nullptr) == kResultOk, "initialize modal backup cancellation");
+    bool chooserReturned = false;
+    PluginProcessorTestAccess::setBackupSaveChooser(*processor,
+        [&](std::string_view) -> std::optional<std::filesystem::path> {
+          if (action == 0) {
+            const auto result = choc::json::parse(processor->handleUiMessage(
+                R"({"type":"backup/exportCancel","payload":{}})"));
+            expect(result["ok"].getWithDefault<bool>(false), "cancel reenters modal chooser");
+          } else if (action == 1) {
+            processor->detachEditor(nullptr);
+          } else if (action == 2) {
+            (void)processor->handleUiMessage(R"({"type":"host/getInfo","payload":{"startup":true}})");
+          } else {
+            expect(processor->terminate() == kResultOk, "termination reenters modal chooser");
+          }
+          chooserReturned = true;
+          return original;
+        });
+    const auto result = choc::json::parse(processor->handleUiMessage(begin));
+    expect(chooserReturned && result["cancelled"].getWithDefault<bool>(false),
+           "modal cancellation returns without deadlock and invalidates its selected path");
+    expect(contents(original) == "original" &&
+               std::distance(std::filesystem::directory_iterator(directory),
+                             std::filesystem::directory_iterator{}) == 1,
+           "cancelled modal result starts no staging and preserves the destination");
+    if (action != 3) {
+      const auto chunk = choc::json::parse(processor->handleUiMessage(append));
+      expect(!chunk["ok"].getWithDefault<bool>(true), "no export remains after modal cancellation");
+      expect(processor->terminate() == kResultOk, "terminate modal cancellation test");
+    }
+  }
+  auto processor = std::make_unique<EffeTuneProcessor>();
+  expect(processor->initialize(nullptr) == kResultOk, "initialize superseded backup chooser");
+  bool nested = false;
+  PluginProcessorTestAccess::setBackupSaveChooser(*processor,
+      [&](std::string_view) -> std::optional<std::filesystem::path> {
+        if (nested) return replacement;
+        nested = true;
+        const auto newer = choc::json::parse(processor->handleUiMessage(begin));
+        expect(newer["ok"].getWithDefault<bool>(false) &&
+                   !newer["cancelled"].getWithDefault<bool>(false),
+               "superseding begin owns its selected destination");
+        return original;
+      });
+  const auto superseded = choc::json::parse(processor->handleUiMessage(begin));
+  expect(superseded["cancelled"].getWithDefault<bool>(false), "superseded chooser cannot overwrite newer export");
+  expect(choc::json::parse(processor->handleUiMessage(append))["ok"].getWithDefault<bool>(false) &&
+             choc::json::parse(processor->handleUiMessage(commit))["ok"].getWithDefault<bool>(false),
+         "newer export survives the stale modal result");
+  expect(contents(original) == "original" && contents(replacement) == std::string("\0\1\2\3", 4),
+         "only the current selected destination receives the backup");
+  expect(processor->terminate() == kResultOk, "terminate superseded backup chooser");
+  std::filesystem::remove(original);
+  std::filesystem::remove(replacement);
+  std::filesystem::remove(directory);
+}
+
+void testVisualizerCapturesFinalHostOutput() {
+  auto processor = std::make_unique<EffeTuneProcessor>();
+  expect(processor->initialize(nullptr) == kResultOk, "initialize final output analyzer");
+  auto processSetup = setup(48000, 64);
+  expect(processor->setupProcessing(processSetup) == kResultOk, "setup final output analyzer");
+  const auto oversampling = choc::json::parse(processor->handleUiMessage(
+      R"({"type":"os/set","payload":{"factor":4,"phase":"linear","quality":"medium"}})"));
+  expect(oversampling["ok"].getWithDefault<bool>(false), "oversample analyzer output fixture");
+  installGainPipeline(*processor);
+  expect(processor->setActive(true) == kResultOk, "activate final output analyzer");
+  gate_ordering::AudioRig rig(.25f);
+  const auto render = [&] {
+    tresult result;
+    { effetune::allocation_guard::Scope guard; result = processor->process(rig.data); }
+    expect(result == kResultOk, "render final output capture without allocation");
+  };
+  for (const bool bypass : {false, true}) {
+    ParameterChanges changes(1);
+    int32 index = 0;
+    auto *queue = changes.addParameterData(kBypassParameterId, index);
+    expect(queue && queue->addPoint(0, bypass ? 1.0 : 0.0, index) == kResultTrue, "set analyzer bypass fixture");
+    rig.data.inputParameterChanges = &changes;
+    render();
+    rig.data.inputParameterChanges = nullptr;
+    for (int block = 0; block < 32; ++block) render();
+    const auto expected = rig.outputLeft.back();
+    const auto latency = processor->getLatencySamples();
+    const auto tap = bypass ? 4026531841u : 4026531840u;
+    const auto source = choc::json::parse(processor->handleUiMessage(
+        std::string{R"({"type":"visualizer/setSources","payload":{"sources":[{"tapId":)"} +
+        std::to_string(tap) + R"(,"type":"LevelMeterPlugin","params":[],"paramsHash":2166136261,"channel":null,"gain":1}]}})"));
+    expect(source["ok"].getWithDefault<bool>(false), "configure final output meter");
+    bool sawLevel = false;
+    for (int block = 0; block < 32; ++block) {
+      render();
+      const auto reply = choc::json::parse(processor->handleUiMessage(R"({"type":"telemetry/read","payload":{}})"));
+      std::vector<std::uint8_t> packet;
+      expect(choc::base64::decodeToContainer(packet, reply["packet"].getWithDefault<std::string>({})), "decode final output telemetry");
+      for (std::size_t offset = 0; offset + 16 <= packet.size();) {
+        std::uint32_t frameTap;
+        std::memcpy(&frameTap, packet.data() + offset + 4, sizeof(frameTap));
+        if (frameTap == tap) {
+          float peak;
+          std::memcpy(&peak, packet.data() + offset + 20, sizeof(peak));
+          expect(std::abs(peak - expected) < .0001f, "meter sees final host output including bypass and downsampling");
+          sawLevel = true;
+        }
+        const auto payload = static_cast<std::size_t>(packet[offset + 12]) |
+                             (static_cast<std::size_t>(packet[offset + 13]) << 8);
+        offset += (16u + payload + 3u) & ~std::size_t{3};
+      }
+    }
+    expect(sawLevel && processor->getLatencySamples() == latency, "analyzer emits without changing host latency");
+    (void)processor->handleUiMessage(R"({"type":"visualizer/setSources","payload":{"sources":[]}})");
+  }
+  expect(processor->setActive(false) == kResultOk, "deactivate final output analyzer");
+  expect(processor->terminate() == kResultOk, "terminate final output analyzer");
+}
+
+void testOscilloscopeSweepsSurviveProcessorReactivation() {
+  auto processor = std::make_unique<EffeTuneProcessor>();
+  expect(processor->initialize(nullptr) == kResultOk, "initialize retained oscilloscope");
+  auto processSetup = setup(48000, 64);
+  expect(processor->setupProcessing(processSetup) == kResultOk, "prepare retained oscilloscope");
+  installGainPipeline(*processor);
+  expect(processor->setActive(true) == kResultOk, "activate retained oscilloscope");
+  constexpr auto sourceRequest =
+      R"({"type":"visualizer/setSources","payload":{"sources":[{"tapId":4026531840,"type":"OscilloscopePlugin","params":[0.01,0,2,0,0.0001,0,0],"paramsHash":2229411282,"channel":null,"gain":1}]}})";
+  const auto source = choc::json::parse(processor->handleUiMessage(sourceRequest));
+  expect(source["ok"].getWithDefault<bool>(false), "configure retained auto-sweep source");
+  gate_ordering::AudioRig rig(0);
+  std::optional<std::uint32_t> lastSequence;
+  const auto renderPhase = [&](const float level, const int blocks) {
+    rig.inputLeft.fill(level);
+    rig.inputRight.fill(level);
+    const auto expected = level * std::pow(10.0f, -6.0f / 20.0f);
+    bool freshSnapshot = false;
+    for (int block = 0; block < blocks; ++block) {
+      tresult result;
+      { effetune::allocation_guard::Scope guard; result = processor->process(rig.data); }
+      expect(result == kResultOk, "render retained auto-sweep source");
+      const auto reply = choc::json::parse(processor->handleUiMessage(
+          R"({"type":"telemetry/read","payload":{}})"));
+      std::vector<std::uint8_t> packet;
+      expect(choc::base64::decodeToContainer(packet, reply["packet"].getWithDefault<std::string>({})),
+             "decode retained auto-sweep telemetry");
+      for (std::size_t offset = 0; offset + 16 <= packet.size();) {
+        std::uint32_t tap;
+        std::memcpy(&tap, packet.data() + offset + 4, sizeof(tap));
+        const auto payload = static_cast<std::size_t>(packet[offset + 12]) |
+                             (static_cast<std::size_t>(packet[offset + 13]) << 8);
+        expect(offset + 16 + payload <= packet.size(), "complete scope telemetry frame");
+        if (tap == 0xf0000000u) {
+          expect(payload >= 16 && packet[offset + 30] == 0 && packet[offset + 31] == 0,
+                 "raw untriggered auto-sweep snapshot");
+          std::uint32_t samples;
+          std::uint32_t sequence;
+          std::memcpy(&samples, packet.data() + offset + 20, sizeof(samples));
+          std::memcpy(&sequence, packet.data() + offset + 8, sizeof(sequence));
+          expect(!lastSequence || sequence > *lastSequence, "unchanged source retains its telemetry sequence");
+          lastSequence = sequence;
+          expect(samples != 0 && payload == 16u + samples * sizeof(float), "complete raw auto-sweep samples");
+          bool matches = true;
+          for (std::uint32_t sample = 0; sample < samples; ++sample) {
+            float value;
+            std::memcpy(&value, packet.data() + offset + 32 + sample * sizeof(float), sizeof(value));
+            matches = matches && std::abs(value - expected) < .0001f;
+          }
+          freshSnapshot = freshSnapshot || matches;
+        }
+        offset += (16u + payload + 3u) & ~std::size_t{3};
+      }
+    }
+    return freshSnapshot;
+  };
+  expect(renderPhase(.125f, 1000), "complete an auto snapshot before host timeline reset");
+  expect(processor->setActive(false) == kResultOk && processor->setActive(true) == kResultOk,
+         "reactivate with unchanged analyzer rate, channels and sources");
+  const auto firstFresh = renderPhase(.25f, 180);
+  const auto secondFresh = renderPhase(.375f, 180);
+  expect(firstFresh && secondFresh,
+         "retained oscilloscope produces repeated fresh sweeps within normal intervals after reactivation");
+  ResizableMemoryIBStream state;
+  expect(processor->getState(&state) == kResultOk, "save state before retained analyzer replacement");
+  state.rewind();
+  expect(processor->setState(&state) == kResultOk, "replace processor state while retaining analyzer configuration");
+  (void)processor->handleUiMessage(R"({"type":"host/getInfo","payload":{"startup":true}})");
+  installGainPipeline(*processor);
+  expect(choc::json::parse(processor->handleUiMessage(sourceRequest))["ok"].getWithDefault<bool>(false),
+         "resume identical source after state replacement");
+  const auto firstAfterRestore = renderPhase(.5f, 180);
+  const auto secondAfterRestore = renderPhase(.625f, 180);
+  expect(firstAfterRestore && secondAfterRestore,
+         "state replacement also preserves repeated fresh sweeps and source sequence");
+  expect(processor->setActive(false) == kResultOk, "deactivate retained oscilloscope");
+  expect(processor->terminate() == kResultOk, "terminate retained oscilloscope");
+}
+
+void testDeferredBassManagementHostAndBypassLatency() {
+  auto processor = std::make_unique<EffeTuneProcessor>();
+  expect(processor->initialize(nullptr) == kResultOk, "initialize delayed bass latency");
+  auto processSetup = setup(48000, 64);
+  expect(processor->setupProcessing(processSetup) == kResultOk, "setup delayed bass latency");
+  std::array<float, 89> parameters{};
+  std::fill_n(parameters.begin() + 18, 16, 80.0f);
+  std::fill_n(parameters.begin() + 34, 16, 24.0f);
+  parameters[67] = 120;
+  parameters[68] = 24;
+  auto packed = choc::value::createEmptyArray();
+  for (const auto value : parameters) packed.addArrayElement(value);
+  const auto response = choc::json::parse(processor->handleUiMessage(
+      std::string{R"({"type":"pipeline/rebuild","payload":{"pipeline":"A","plugins":[{"id":7,"type":"BassManagementPlugin","name":"Bass Management","enabled":true,"parameters":{},"wasmParamsHash":3385775306,"wasmParams":)"} +
+      choc::json::toString(packed) + "}]}}"));
+  expect(response["ok"].getWithDefault<bool>(false), "install bass management");
+  expect(processor->setActive(true) == kResultOk, "activate delayed bass latency");
+  gate_ordering::AudioRig rig(0);
+  const auto render = [&] {
+    tresult result;
+    { effetune::allocation_guard::Scope guard; result = processor->process(rig.data); }
+    expect(result == kResultOk, "render delayed bass latency");
+  };
+  for (int block = 0; block < 16; ++block) render();
+  auto command = std::make_unique<effetune::vst::AudioCommand>();
+  for (const auto setting : {std::pair{1.0f, 0.0f}, std::pair{1.0f, 1.0f}, std::pair{0.0f, 1.0f}}) {
+    ParameterChanges activeChanges(1);
+    int32 activeIndex = 0;
+    auto *activeQueue = activeChanges.addParameterData(kBypassParameterId, activeIndex);
+    expect(activeQueue && activeQueue->addPoint(0, 0, activeIndex) == kResultTrue, "enable bass processing");
+    rig.data.inputParameterChanges = &activeChanges;
+    render();
+    rig.data.inputParameterChanges = nullptr;
+    parameters[0] = setting.first;
+    parameters[1] = setting.second;
+    expect(PluginProcessorTestAccess::publishParameterImage(
+        *processor, *command, 7, 0xc9ced4cau, parameters), "publish bass phase/taps");
+    for (int block = 0; block < 24; ++block) {
+      render();
+      PluginProcessorTestAccess::serviceLatencyUpdates(*processor);
+    }
+    const auto expected = setting.first == 0 ? 0u : setting.second == 0 ? 4224u : 8320u;
+    expect(processor->getLatencySamples() == expected &&
+        PluginProcessorTestAccess::enginePipelineLatency(*processor) == expected,
+        "host and applied engine latency follow the delayed parameter transition");
+    for (const bool bypass : {false, true}) {
+      ParameterChanges changes(1);
+      int32 index = 0;
+      auto *queue = changes.addParameterData(kBypassParameterId, index);
+      expect(queue && queue->addPoint(0, bypass ? 1.0 : 0.0, index) == kResultTrue, "set bass bypass");
+      rig.data.inputParameterChanges = &changes;
+      render();
+      rig.data.inputParameterChanges = nullptr;
+      for (int block = 0; block < 160; ++block) render();
+      std::uint32_t peak = 0;
+      float magnitude = 0;
+      for (std::uint32_t block = 0; block < 160; ++block) {
+        rig.inputLeft.fill(0);
+        rig.inputRight.fill(0);
+        if (block == 0) rig.inputLeft[0] = rig.inputRight[0] = .25f;
+        render();
+        for (std::uint32_t frame = 0; frame < 64; ++frame) {
+          const auto sample = std::abs(rig.outputLeft[frame]);
+          if (sample > magnitude) { magnitude = sample; peak = block * 64 + frame; }
+        }
+      }
+      expect(peak == expected && magnitude > .2f,
+             "bass wet and master-bypass impulses align with the host latency");
+    }
+  }
+  expect(processor->setActive(false) == kResultOk, "deactivate delayed bass latency");
+  expect(processor->terminate() == kResultOk, "terminate delayed bass latency");
+}
+
 void testLiveLatencyCommitAlignsWetBypassAndHost() {
   for (const bool parallel : {false, true}) {
     for (const int transport : {0, 1, 2}) {
@@ -10881,6 +11173,10 @@ int main() {
     testTopologyEditsDuringPlaybackRaiseNoDiagnostic();
     testPendingWorkIsServicedWhenTheAudioCallbackQuiesces();
     testDelayBearingEditsWithAStoppedTransportKeepEveryBlockWet();
+    testBackupChooserReentrantCancellation();
+    testVisualizerCapturesFinalHostOutput();
+    testOscilloscopeSweepsSurviveProcessorReactivation();
+    testDeferredBassManagementHostAndBypassLatency();
     testLiveLatencyCommitAlignsWetBypassAndHost();
     testRefreshFailuresStayOffTheAudioDiagnosticBurst();
     testHostRefusedGestureStillAdoptsTheUserValue();

@@ -76,8 +76,8 @@ constexpr std::string_view kWebViewHomeUri =
 [[nodiscard]] bool hasRequiredResources(const std::filesystem::path &root) {
   constexpr std::array required{
       "effetune.html",
-      "effetune.css",
-      "effetune-theme.css",
+      "css/effetune.css",
+      "css/effetune-theme.css",
       "vst-bootstrap.js",
       "js/startup.js",
       "js/app.js",

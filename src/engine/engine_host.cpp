@@ -961,15 +961,15 @@ bool EngineHost::ProcessBatch::finish(const bool refreshLatency) noexcept {
     return !failed_;
   }
   auto *host = host_;
-  const auto assetLatencyMayHaveChanged = host->assetPreparationLatencyPolling_;
   auto instanceLatencyChanged = false;
-  if (latencyDirty_ || pipelinePlanDirty_ || refreshLatency) {
-    (void)host->refreshLatencyUnlocked(&instanceLatencyChanged);
+  // A kernel may publish latency only after processing a parameter transition.
+  // This bounded observation reads existing instances without preparing plans.
+  (void)host->refreshLatencyUnlocked(&instanceLatencyChanged);
+  if (latencyDirty_ || pipelinePlanDirty_ || refreshLatency || instanceLatencyChanged) {
     host->processCounterAtoms_.latencyRefreshes.fetch_add(1,
                                                           std::memory_order_relaxed);
   }
-  if (pipelinePlanDirty_ ||
-      (assetLatencyMayHaveChanged && instanceLatencyChanged)) {
+  if (pipelinePlanDirty_ || instanceLatencyChanged) {
     host->pipelinePlanRevision_.fetch_add(1, std::memory_order_acq_rel);
   }
   if (host->assetPreparationLatencyPolling_) {

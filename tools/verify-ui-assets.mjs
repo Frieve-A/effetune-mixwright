@@ -56,11 +56,20 @@ const measurementStorage = await readFile(
   path.join(assets, 'features', 'measurement', 'dataStorage.js'), 'utf8');
 const englishLocale = await readFile(path.join(assets, 'js', 'locales', 'en.json5'), 'utf8');
 const japaneseLocale = await readFile(path.join(assets, 'js', 'locales', 'ja.json5'), 'utf8');
+const backupArchive = await readFile(
+  path.join(assets, 'js', 'user-data-backup', 'archive.js'), 'utf8');
+if (!backupArchive.includes("new URL('../vendor/jszip-3.10.2.min.js', import.meta.url)") ||
+    backupArchive.includes('jszip-3.10.1.min.js')) {
+  throw new Error('The backup archive loader does not use the bundled JSZip patch release');
+}
 
 const requiredFiles = [
   'vst-bootstrap.js',
   'vst-audio-manager.js',
-  'effetune-theme.css',
+  'css/effetune.css',
+  'css/effetune-theme.css',
+  'css/user-data-backup.css',
+  'js/vendor/jszip-3.10.2.min.js',
   'js/startup.js',
   'THIRD-PARTY-NOTICES.txt',
   'plugins/plugins.txt',
@@ -90,7 +99,9 @@ const requiredHtml = [
   '<meta name="twitter:title" content="EffeTune Mixwright - Real-time Audio Effect Processor">',
   'alt="EffeTune Mixwright Icon"',
   'vst-bootstrap.js',
-  'js/startup.js'
+  'js/startup.js',
+  'href="css/effetune.css"',
+  'href="css/user-data-backup.css"'
 ];
 for (const fragment of requiredHtml) {
   if (!html.includes(fragment)) {
@@ -110,8 +121,8 @@ const forbiddenHtml = [
   'doubleBlindTestButton',
   'pipelineAnalyzerButton',
   'pipelineAnalyzerPanel',
-  'jszip-3.10.1.min.js',
-  'jsmediatags-3.9.5.min.js'
+  'jsmediatags-3.9.5.min.js',
+  'jszip-3.10.1.min.js'
 ];
 for (const fragment of forbiddenHtml) {
   if (html.includes(fragment)) {
@@ -286,7 +297,7 @@ if (!electronIntegration.includes('patchDocumentationLinks() {}') ||
   throw new Error('The VST build still rewrites production documentation links to local files');
 }
 if (!bootstrap.includes('.subtitle-container,') ||
-    !bootstrap.includes('#effectPipelineButton') || !bootstrap.includes('#whatsThisLink') ||
+    !bootstrap.includes('#whatsThisLink') ||
     !bootstrap.includes('<span>Upsampling Factor:</span>') ||
     !bootstrap.includes('<span>Phase:</span>') ||
     !bootstrap.includes('<span>Quality:</span>') ||
@@ -761,6 +772,9 @@ for (const excluded of [
   'manifest.json',
   'package.json',
   'js/vendor/jszip-3.10.1.min.js',
+  'css/effetune-mobile.css',
+  'css/effetune-library.css',
+  'css/pipeline-analyzer.css',
   'js/vendor/jsmediatags-3.9.5.min.js',
   'js/vendor/music-metadata-browser.mjs',
   'js/ui/double-blind-test',

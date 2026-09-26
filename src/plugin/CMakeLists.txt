@@ -25,8 +25,7 @@ find_program(EFFETUNE_NODE_EXECUTABLE node REQUIRED)
 set(effetune_webview_assets "${CMAKE_BINARY_DIR}/webview-assets")
 file(GLOB_RECURSE effetune_ui_source_files CONFIGURE_DEPENDS LIST_DIRECTORIES false
   "${PROJECT_SOURCE_DIR}/external/effetune/effetune.html"
-  "${PROJECT_SOURCE_DIR}/external/effetune/effetune.css"
-  "${PROJECT_SOURCE_DIR}/external/effetune/effetune-theme.css"
+  "${PROJECT_SOURCE_DIR}/external/effetune/css/*"
   "${PROJECT_SOURCE_DIR}/external/effetune/js/*"
   "${PROJECT_SOURCE_DIR}/external/effetune/plugins/*"
   "${PROJECT_SOURCE_DIR}/external/effetune/presets/*"
@@ -41,6 +40,7 @@ add_custom_command(
     "${PROJECT_SOURCE_DIR}/tools/build-ui-assets.mjs"
     "${PROJECT_SOURCE_DIR}/ui-shim/vst-bootstrap.js"
     "${PROJECT_SOURCE_DIR}/ui-shim/vst-audio-manager.js"
+    "${PROJECT_SOURCE_DIR}/ui-shim/vendor/jszip-3.10.2.min.js"
     "${PROJECT_SOURCE_DIR}/THIRD-PARTY-NOTICES.txt"
     ${effetune_ui_source_files}
   COMMENT "Preparing EffeTune WebView assets"

@@ -551,6 +551,41 @@ bool MessageRouter::decode(const std::string_view json, RoutedUiMessage &message
     } else if (type == "os/set") {
       decoded.action = UiAction::setOversampling;
       decodeOversampling(payload, decoded.oversampling);
+    } else if (type == "visualizer/setSources") {
+      decoded.action = UiAction::setVisualizerSources;
+      const auto sources = payload["sources"];
+      if (!sources.isArray() || sources.size() > OutputAnalyzers::kMaxSources) {
+        setError(error, "Invalid output analyzer source list");
+        return false;
+      }
+      std::unordered_set<std::uint32_t> taps;
+      for (std::uint32_t index = 0; index < sources.size(); ++index) {
+        const auto item = sources[index];
+        const auto tap = item["tapId"].getWithDefault<std::int64_t>(0);
+        const auto hash = item["paramsHash"].getWithDefault<std::int64_t>(0);
+        const auto parameters = item["params"];
+        if (!item.isObject() || tap < 0xf0000000ll || tap > 0xffffffffll ||
+            hash <= 0 || hash > 0xffffffffll || !parameters.isArray() ||
+            parameters.size() > AudioCommand::kMaxPackedFloats ||
+            (!item["channel"].isVoid() && !item["channel"].isString())) {
+          setError(error, "Invalid output analyzer source");
+          return false;
+        }
+        OutputAnalyzerSource source;
+        source.tapId = static_cast<std::uint32_t>(tap);
+        source.paramsHash = static_cast<std::uint32_t>(hash);
+        source.type = item["type"].getWithDefault<std::string>({});
+        source.channel = item["channel"].getWithDefault<std::string>({});
+        source.gain = static_cast<float>(item["gain"].getWithDefault<double>(1));
+        for (std::uint32_t parameter = 0; parameter < parameters.size(); ++parameter)
+          source.parameters.push_back(static_cast<float>(parameters[parameter].getWithDefault<double>(
+              std::numeric_limits<double>::quiet_NaN())));
+        if (!OutputAnalyzers::validSource(source) || !taps.insert(source.tapId).second) {
+          setError(error, "Invalid output analyzer source");
+          return false;
+        }
+        decoded.visualizerSources.push_back(std::move(source));
+      }
     } else if (type == "telemetry/read") {
       decoded.action = UiAction::readTelemetry;
     } else if (type == "telemetry/discard") {
@@ -574,6 +609,29 @@ bool MessageRouter::decode(const std::string_view json, RoutedUiMessage &message
         return false;
       }
       decoded.content = choc::json::toString(payload["config"]);
+    } else if (type == "backup/exportBegin") {
+      decoded.action = UiAction::beginBackupExport;
+      decoded.defaultName = payload["defaultName"].getWithDefault<std::string>("effetune-backup.zip");
+      const auto bytes = payload["totalBytes"].getWithDefault<std::int64_t>(0);
+      if (bytes <= 0 || bytes > 256 * 1024 * 1024) {
+        setError(error, "Backup exceeds the export size limit");
+        return false;
+      }
+      decoded.assetByteSize = static_cast<std::size_t>(bytes);
+    } else if (type == "backup/exportChunk") {
+      decoded.action = UiAction::appendBackupExport;
+      const auto offset = payload["offset"].getWithDefault<std::int64_t>(-1);
+      decoded.content = payload["data"].getWithDefault<std::string>({});
+      if (offset < 0 || offset > 256 * 1024 * 1024 || decoded.content.empty() ||
+          decoded.content.size() > 256u * 1024u) {
+        setError(error, "Backup chunk is invalid");
+        return false;
+      }
+      decoded.assetOffset = static_cast<std::size_t>(offset);
+    } else if (type == "backup/exportCommit") {
+      decoded.action = UiAction::commitBackupExport;
+    } else if (type == "backup/exportCancel") {
+      decoded.action = UiAction::cancelBackupExport;
     } else if (type == "dialog/openPreset") {
       decoded.action = UiAction::openPresetDialog;
     } else if (type == "dialog/savePreset") {
