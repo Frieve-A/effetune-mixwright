@@ -449,6 +449,7 @@ tresult PLUGIN_API EffeTuneProcessor::setActive(const TBool state) {
     // is not enough: it has to stay out of the callback entirely.
     const AudioTimelineWindow timelineWindow{*this};
     oversampler_.reset();
+    frequencyPreviewTailFrames_ = 0;
     engine_.reset();
     dryDelay_.reset();
     engineFramesProcessed_ = 0.0;
@@ -527,6 +528,7 @@ bool EffeTuneProcessor::configureDspLocked(AutomationResourceLock &resources,
     }
     oversampler_.prepare(snapshot.oversampling, static_cast<std::uint32_t>(configuredChannels),
                          static_cast<std::uint32_t>(maxHostFrames));
+    frequencyPreviewTailFrames_ = 0;
     if (!outputAnalyzers_.prepare(hostSampleRate, static_cast<std::uint32_t>(configuredChannels),
                                   static_cast<std::uint32_t>(maxHostFrames), error)) {
       return false;
@@ -2781,9 +2783,20 @@ tresult PLUGIN_API EffeTuneProcessor::process(ProcessData &data) {
   // topology until then, so audio continues to be processed instead of falling
   // back to the input signal.
   copyDryToScratch(input, data.numSamples);
-  frequencyPreview_.mix(dryTransitionPointers_.data(),
+  const auto previewInBlock = frequencyPreview_.mix(dryTransitionPointers_.data(),
                         static_cast<std::uint32_t>(input.numChannels),
                         static_cast<std::uint32_t>(data.numSamples), hostSampleRate);
+  // Audition PCM remains at the DSP input while the interpolation filters
+  // drain, even after the host-rate oscillator's release has reached zero.
+  const auto previewAtDspInput = previewInBlock || frequencyPreviewTailFrames_ != 0;
+  if (previewInBlock) {
+    frequencyPreviewTailFrames_ = oversampler_.interpolationTailHostFrames();
+  } else {
+    const auto hostFrames = static_cast<std::uint32_t>(data.numSamples);
+    frequencyPreviewTailFrames_ = frequencyPreviewTailFrames_ > hostFrames
+                                      ? frequencyPreviewTailFrames_ - hostFrames : 0;
+  }
+  engine_.setFrequencyPreviewActive(previewAtDspInput);
   for (int32 channel = 0; channel < output.numChannels; ++channel) {
     dryPointers[static_cast<std::size_t>(channel)] =
         dryTransitionPointers_[static_cast<std::size_t>(channel)];
@@ -2829,7 +2842,7 @@ tresult PLUGIN_API EffeTuneProcessor::process(ProcessData &data) {
   }
 
   EngineHost::ProcessBatch batch;
-  auto processed = engine_.beginProcessBatch(batch, nullptr, nullptr);
+  auto processed = engine_.beginProcessBatch(batch, &instanceCommands_, nullptr);
   auto refreshLatencyAtBlockEnd = false;
   std::array<EngineHost::ResolvedParameterTarget, kMaxPluginInstances> parameterTargets{};
   for (std::size_t runtimeIndex = 0;
@@ -2939,6 +2952,7 @@ tresult PLUGIN_API EffeTuneProcessor::process(ProcessData &data) {
   }
   if (failure != ProcessTransactionError::none) {
     oversampler_.reset();
+    frequencyPreviewTailFrames_ = 0;
     if (stageParameterImages) {
       // The dirty flags belong to whoever owns the runtime image. While the
       // control service owns it this block staged nothing, so there is nothing
@@ -3727,6 +3741,26 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
   if (message.action == UiAction::frequencyPreview) {
     frequencyPreview_.setFrequency(message.previewFrequency);
     return bridgeResult(true);
+  }
+  if (message.action == UiAction::resetPluginState) {
+    std::scoped_lock resources(processingResourcesMutex_);
+    if (stateReplacementPending_.load(std::memory_order_acquire) ||
+        stateReplacementEpoch_.load(std::memory_order_acquire) != requestStateEpoch ||
+        uiPageGeneration_.load(std::memory_order_acquire) != requestPageGeneration) {
+      return bridgeResult(false, "The pipeline changed. Try the reset again.");
+    }
+    const auto runtime = std::find_if(runtimePlugins_.begin(), runtimePlugins_.end(),
+        [&](const RuntimePlugin &plugin) { return plugin.logicalId == message.pluginId; });
+    if (runtime == runtimePlugins_.end()) {
+      return bridgeResult(false, "The plug-in is no longer available.");
+    }
+    AudioCommand command;
+    command.type = AudioCommandType::resetInstance;
+    command.logicalId = runtime->logicalId;
+    command.paramsHash = runtime->paramsHash;
+    return instanceCommands_.push(command)
+               ? bridgeResult(true)
+               : bridgeResult(false, "The reset could not be queued. Try again.");
   }
   drainAutomationValues();
 

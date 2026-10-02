@@ -12,6 +12,7 @@ namespace effetune::vst {
 enum class UiAction {
   hostInfo,
   frequencyPreview,
+  resetPluginState,
   openExternalUrl,
   rebuildPipeline,
   restoreHistory,

@@ -12,6 +12,15 @@ import {
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const source = await readFile(path.join(projectRoot, 'ui-shim', 'vst-audio-manager.js'), 'utf8');
+
+test('native startup output readiness never requests a browser worklet gate', async () => {
+  const method = source.match(/  fadeInOutputWhenReady\(\) \{[^\n]*\}/)?.[0];
+  assert.ok(method);
+  const context = {};
+  vm.runInNewContext(`this.manager = { ${method} };`, context);
+  context.manager._requestDspControl = () => assert.fail('native startup must not wait for browser outputReady');
+  await context.manager.fadeInOutputWhenReady();
+});
 const generatedCatalogSource = await readFile(
   path.join(projectRoot, 'external', 'effetune', 'js', 'audio', 'dsp-params.generated.js'), 'utf8');
 const pluginBaseSource = await readFile(
@@ -140,6 +149,19 @@ function createNativePort() {
   context.window.workletNode = node;
   return { context, hostCalls, node, port };
 }
+
+test('an explicit plugin reset flushes its pending parameter edit before native reset', async () => {
+  const { port, hostCalls } = createNativePort();
+  port.owner.preserveReadyNativePipelineDuringStartup = false;
+  const plugin = { id: 7, type: 'VolumePlugin', parameters: { vl: -6 } };
+  port.owner.pipelineA.push(plugin);
+  const pending = port.postMessage({ type: 'updatePlugin', plugin });
+  await port.postMessage({ type: 'resetPluginState', pluginId: 7 });
+  await pending;
+  assert.deepEqual(hostCalls.map(call => call.type), ['pipeline/updatePlugin', 'pipeline/resetPluginState']);
+  assert.equal(hostCalls[0].payload.plugin.id, 7);
+  assert.equal(hostCalls[1].payload.pluginId, 7);
+});
 
 test('frequency audition forwards start, retune and stop and ends on editor teardown', async () => {
   const { context, hostCalls, port } = createNativePort();

@@ -2,6 +2,7 @@
 
 #include "engine/latency.h"
 #include "engine.h"
+#include "TonalBalanceEQPluginParams.h"
 
 #include <algorithm>
 #include <cmath>
@@ -357,10 +358,19 @@ bool EngineHost::rebuild(const PipelineState &pipeline,
     const auto instanceParamsHash = runtime.contextuallyBypassed
                                         ? instanceKernel->second.paramsHash
                                         : runtime.paramsHash;
-    const auto paramStatus = engine_->setInstanceParams(
-        instance, packed.empty() ? nullptr : packed.data(),
-        static_cast<std::uint32_t>(packed.size()), instanceParamsHash, 0);
-    if (paramStatus != ET_OK) {
+    InstanceEntry instanceEntry{instance, runtime.paramsHash, kernel->second.index,
+                        runtime.contextuallyBypassed, {}};
+    try {
+      if (!runtime.contextuallyBypassed && runtime.type == "TonalBalanceEQPlugin") {
+        instanceEntry.measurementParameters.resize(generated::TonalBalanceEQPluginParams::kFloatCount);
+      }
+    } catch (const std::bad_alloc &) {
+      engine_->destroyInstance(instance);
+      clearInstancesUnlocked();
+      setError(error, "Unable to prepare DSP measurement parameters");
+      return false;
+    }
+    if (!stageFloatsUnlocked(instanceEntry, packed, instanceParamsHash)) {
       engine_->destroyInstance(instance);
       clearInstancesUnlocked();
       setError(error, "Unable to initialize DSP parameters for " + runtime.type);
@@ -385,9 +395,7 @@ bool EngineHost::rebuild(const PipelineState &pipeline,
     try {
       const auto inserted = instances_
                                 .emplace(runtime.logicalId,
-                                         InstanceEntry{instance, runtime.paramsHash,
-                                                       kernel->second.index,
-                                                       runtime.contextuallyBypassed})
+                                         std::move(instanceEntry))
                                 .second;
       if (!inserted) {
         engine_->destroyInstance(instance);
@@ -544,6 +552,25 @@ bool EngineHost::applyDescriptorCommand(const AudioCommand &command,
   return true;
 }
 
+bool EngineHost::stageFloatsUnlocked(InstanceEntry &entry,
+                                     std::span<const float> packed,
+                                     const std::uint32_t paramsHash) noexcept {
+  if (!entry.measurementParameters.empty()) {
+    using Params = generated::TonalBalanceEQPluginParams;
+    if (paramsHash != Params::kHash || packed.size() != Params::kFloatCount) return false;
+    if (packed.data() != entry.measurementParameters.data()) {
+      std::copy(packed.begin(), packed.end(), entry.measurementParameters.begin());
+    }
+    constexpr auto pauseOffset = offsetof(Params, measurementPaused) / sizeof(float);
+    // The host owns this transient field; never copy it into the document or
+    // runtime parameter image that UI updates and automation persist.
+    entry.measurementParameters[pauseOffset] = frequencyPreviewActive_ ? 1.0f : 0.0f;
+    packed = entry.measurementParameters;
+  }
+  return engine_->setInstanceParams(entry.instance, packed.empty() ? nullptr : packed.data(),
+                                   static_cast<std::uint32_t>(packed.size()), paramsHash, 0) == ET_OK;
+}
+
 bool EngineHost::updateParametersUnlocked(const std::uint32_t logicalId,
                                           const std::span<const float> packed,
                                           const std::uint32_t paramsHash,
@@ -557,9 +584,7 @@ bool EngineHost::updateParametersUnlocked(const std::uint32_t logicalId,
   if (found->second.contextuallyBypassed) {
     return true;
   }
-  if (engine_->setInstanceParams(found->second.instance,
-                                 packed.empty() ? nullptr : packed.data(),
-                                 static_cast<std::uint32_t>(packed.size()), paramsHash, 0) != ET_OK) {
+  if (!stageFloatsUnlocked(found->second, packed, paramsHash)) {
     return false;
   }
   return parameterBytes.empty() ||
@@ -792,6 +817,13 @@ bool EngineHost::applyCommandUnlocked(const AudioCommand &command,
     return false;
   case AudioCommandType::reset:
     return engine_->reset() == ET_OK;
+  case AudioCommandType::resetInstance: {
+    const auto found = instances_.find(command.logicalId);
+    // A topology edit may have removed or replaced this queued target.
+    if (found == instances_.end() || found->second.paramsHash != command.paramsHash ||
+        found->second.contextuallyBypassed) return true;
+    return engine_->resetInstance(found->second.instance) == ET_OK;
+  }
   }
   return false;
 }
@@ -874,20 +906,12 @@ bool EngineHost::ProcessBatch::stageParameters(
     return true;
   }
   const auto previousLatency = host_->engine_->instanceLatency(target.instance);
-  const auto parametersStaged =
-      host_->engine_->setInstanceParams(
-          target.instance, packed.empty() ? nullptr : packed.data(),
-          static_cast<std::uint32_t>(packed.size()), target.paramsHash, 0) == ET_OK;
-  const auto bytesStaged =
-      parametersStaged && (parameterBytes.empty() ||
-                           host_->engine_->setInstanceParamBytes(
-                               target.instance, parameterBytes.data(),
-                               static_cast<std::uint32_t>(parameterBytes.size()),
-                               target.paramsHash, 0) == ET_OK);
+  const auto parametersStaged = host_->updateParametersUnlocked(
+      target.logicalId, packed, target.paramsHash, parameterBytes);
   if (host_->engine_->instanceLatency(target.instance) != previousLatency) {
     pipelinePlanDirty_ = true;
   }
-  if (!parametersStaged || !bytesStaged) {
+  if (!parametersStaged) {
     host_->processCounterAtoms_.parameterStageFailures.fetch_add(
         1, std::memory_order_relaxed);
     host_->recordProcessFailure(ProcessError::parameterStageRejected);
@@ -931,6 +955,20 @@ bool EngineHost::ProcessBatch::processChunk(const float *const *input, float *co
     }
     std::memcpy(host_->combined_ + static_cast<std::size_t>(channel) * frameCount,
                 input[channel], sizeof(float) * frameCount);
+  }
+  constexpr auto pauseOffset =
+      offsetof(generated::TonalBalanceEQPluginParams, measurementPaused) / sizeof(float);
+  for (auto &[logicalId, entry] : host_->instances_) {
+    (void)logicalId;
+    if (!entry.measurementParameters.empty() &&
+        entry.measurementParameters[pauseOffset] !=
+            (host_->frequencyPreviewActive_ ? 1.0f : 0.0f) &&
+        !host_->stageFloatsUnlocked(entry, entry.measurementParameters, entry.paramsHash)) {
+      host_->processCounterAtoms_.parameterStageFailures.fetch_add(1, std::memory_order_relaxed);
+      host_->recordProcessFailure(ProcessError::parameterStageRejected);
+      failed_ = true;
+      return false;
+    }
   }
   et_status status = ET_ERR_STATE;
   {

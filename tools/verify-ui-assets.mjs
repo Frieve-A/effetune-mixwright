@@ -68,8 +68,11 @@ const requiredFiles = [
   'vst-audio-manager.js',
   'css/effetune.css',
   'css/effetune-theme.css',
+  'css/effetune-library.css',
   'css/user-data-backup.css',
   'js/vendor/jszip-3.10.2.min.js',
+  'js/midi/playback-speed.js',
+  'js/ui/visualizer-shared.js',
   'js/startup.js',
   'THIRD-PARTY-NOTICES.txt',
   'plugins/plugins.txt',
@@ -89,6 +92,12 @@ for (const relative of requiredFiles) {
 if (notices !== sourceNotices) {
   throw new Error('The generated UI does not contain the complete third-party notices');
 }
+const sharedDialogCss = await readFile(path.join(assets, 'css', 'effetune-library.css'), 'utf8');
+const upstreamDialogCss = await readFile(path.join(projectRoot, 'external', 'effetune', 'css', 'effetune-library.css'), 'utf8');
+if (sharedDialogCss !== upstreamDialogCss ||
+    html.split('<link rel="stylesheet" href="css/effetune-library.css">').length - 1 !== 1) {
+  throw new Error('Shared upstream dialog styling must be retained completely and loaded at startup');
+}
 
 const requiredHtml = [
   "default-src 'self' blob: data:",
@@ -101,6 +110,7 @@ const requiredHtml = [
   'vst-bootstrap.js',
   'js/startup.js',
   'href="css/effetune.css"',
+  '<link rel="stylesheet" href="css/effetune-library.css">',
   'href="css/user-data-backup.css"'
 ];
 for (const fragment of requiredHtml) {
@@ -114,7 +124,6 @@ const forbiddenHtml = [
   'alt="EffeTune Icon"',
   'EffeTune version <span id="app-version"></span>',
   'effetune-mobile.css',
-  'effetune-library.css',
   'manifest.json',
   'googletagmanager.com',
   'google-analytics.com',
@@ -304,11 +313,16 @@ if (!bootstrap.includes('.subtitle-container,') ||
     !bootstrap.includes("headerButtons.insertBefore(controls, headerButtons.querySelector('.settings-menu-container'))")) {
   throw new Error('VST-only header controls or hidden single-view entries are missing');
 }
-if (!bootstrap.includes('.config-dialog .config-dialog-content { display: block !important; }') ||
-    !bootstrap.includes('.config-dialog .device-section { display: none !important; }') ||
+if (!bootstrap.includes('.config-dialog .device-section { display: none !important; }') ||
     !bootstrap.includes('.config-dialog .device-section:has(#language-select) { display: block !important; }') ||
-    !bootstrap.includes('.config-dialog .config-dialog-power-column { display: none !important; }')) {
-  throw new Error('The VST settings dialog is not restricted to the language setting');
+    !bootstrap.includes('.config-dialog #physical-control-section { display: block !important; }')) {
+  throw new Error('The VST settings dialog does not expose language and controller mapping sections');
+}
+const configIntegration = await readFile(path.join(assets, 'js', 'electron', 'configIntegration.js'), 'utf8');
+if (!configIntegration.includes("const categories = ['general', 'controllers'];") ||
+    !configIntegration.includes('${Object.keys(categoryPanels).map(category => `') ||
+    !configIntegration.includes('id="config-panel-${category}" hidden>')) {
+  throw new Error('The VST settings navigation exposes unsupported standalone categories');
 }
 if (bootstrap.includes('.pipeline-header-right')) {
   throw new Error('The VST shim overrides the upstream pipeline header alignment');
@@ -773,7 +787,6 @@ for (const excluded of [
   'package.json',
   'js/vendor/jszip-3.10.1.min.js',
   'css/effetune-mobile.css',
-  'css/effetune-library.css',
   'css/pipeline-analyzer.css',
   'js/vendor/jsmediatags-3.9.5.min.js',
   'js/vendor/music-metadata-browser.mjs',

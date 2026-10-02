@@ -2,7 +2,13 @@
 #include "bridge/message_router.h"
 #include "engine/engine_host.h"
 #include "engine/output_analyzers.h"
+#include "engine/frequency_preview.h"
 #include "BassManagementPluginParams.h"
+#include "OscilloscopePluginParams.h"
+#include "PhaseSelectEQPluginParams.h"
+#include "AnalogMeterPluginParams.h"
+#include "RhythmAnalyzerPluginParams.h"
+#include "TonalBalanceEQPluginParams.h"
 #include "allocation_guard.h"
 #include <choc/memory/choc_Base64.h>
 
@@ -91,11 +97,14 @@ void testOutputAnalyzers() {
       {0xf0000000u, "LevelMeterPlugin", "34", {}, 0x811c9dc5u, 2},
       {0xf0000001u, "SpectrumAnalyzerPlugin", "L", {-96, 10, 0}, 0x3e6e0819u, 1},
       {0xf0000002u, "SpectrogramPlugin", "R", {-96, 10, 0}, 0x3e6e0819u, 1},
-      {0xf0000003u, "OscilloscopePlugin", "1", {.01f, 0, 0, 0, .0001f, 0, 0}, 0x84e21dd2u, 1},
+      {0xf0000003u, "OscilloscopePlugin", "1", {.01f, 0, 0, 0, .0001f, 0, 0}, effetune::generated::OscilloscopePluginParams::kHash, 1},
       {0xf0000004u, "StereoMeterPlugin", "", {.1f}, 0xb0de3212u, 1},
       {0xf0000005u, "NoteSpectrogramPlugin", "", {60, 72, 2}, 0x0c9bdf4eu, 1},
-      {0xf0000006u, "ChromaSpiralPlugin", "", {}, 0x811c9dc5u, 1}};
-  expect(analyzers.setSources(sources, &error), "all seven analyzers configure");
+      {0xf0000006u, "ChromaSpiralPlugin", "", {}, 0x811c9dc5u, 1},
+      {0xf0000007u, "PhaseSelectEqPlugin", "", std::vector<float>(effetune::generated::PhaseSelectEqPluginParams::kFloatCount), effetune::generated::PhaseSelectEqPluginParams::kHash, 1},
+      {0xf0000008u, "AnalogMeterPlugin", "", {0, .3f, 5, 1.5f}, effetune::generated::AnalogMeterPluginParams::kHash, 1},
+      {0xf0000009u, "RhythmAnalyzerPlugin", "", {40, 240, 0}, effetune::generated::RhythmAnalyzerPluginParams::kHash, 1}};
+  expect(analyzers.setSources(sources, &error), "all Visualizer analyzers configure");
   std::array<std::array<float, 1024>, 8> audio;
   std::array<float *, 8> pointers{};
   for (std::size_t channel = 0; channel < audio.size(); ++channel) {
@@ -236,6 +245,121 @@ void testOutputAnalyzerClockFollowsConsumedAudio() {
   render();
 }
 
+void testInstanceResetAndPreviewMeasurementGate() {
+  using Params = effetune::generated::TonalBalanceEQPluginParams;
+  auto engine = std::make_unique<EngineHost>();
+  auto commands = std::make_unique<AudioCommandQueue>();
+  std::string error;
+  expect(engine->prepare(48000, 2, 1024, EngineHost::kDefaultTelemetryBytes, &error), "prepare measurement reset");
+  Params params{};
+  params.range = 6;
+  params.smoothing = .5f;
+  params.averagingTime = 30;
+  params.low = 20;
+  params.high = 16000;
+  params.averageSpl = 83;
+  params.tiltSlope = -6;
+  params.tiltCorner = 250;
+  std::fill_n(params.adjustFrequency, 5, 1000.0f);
+  std::fill_n(params.adjustQ, 5, .7f);
+  const auto packed = [&] { return std::span<const float>(reinterpret_cast<const float *>(&params), Params::kFloatCount); };
+  RuntimePlugin tonal;
+  tonal.logicalId = 41;
+  tonal.type = "TonalBalanceEQPlugin";
+  tonal.paramsHash = Params::kHash;
+  tonal.packedParameters.assign(packed().begin(), packed().end());
+  RuntimePlugin meter;
+  meter.logicalId = 42;
+  meter.type = "AnalogMeterPlugin";
+  meter.paramsHash = effetune::generated::AnalogMeterPluginParams::kHash;
+  meter.packedParameters = {3, .3f, 5, 1.5f};
+  PipelineState pipeline;
+  pipeline.plugins = {PluginState{41, "TonalBalanceEQPlugin", true}, PluginState{42, "AnalogMeterPlugin", true}};
+  expect(engine->rebuild(pipeline, {tonal, meter}, &error), "build measurement reset pipeline");
+  std::array<float, 1024> left{}, right{};
+  float *channels[]{left.data(), right.data()};
+  std::vector<std::uint8_t> telemetry(EngineHost::kDefaultTelemetryBytes);
+  std::uint32_t hops = 0, meterSequence = 0, style = 0;
+  std::uint64_t frames = 0;
+  const auto render = [&](int blocks, bool stageImages = false) {
+    for (int block = 0; block < blocks; ++block) {
+      for (std::size_t frame = 0; frame < left.size(); ++frame)
+        left[frame] = right[frame] = .25f * static_cast<float>(std::sin(6.283185307179586 * 1000 * static_cast<double>(frames + frame) / 48000));
+      if (stageImages && block % 3 == 0)
+        expect(engine->updateParameters(41, packed(), Params::kHash), "control parameter image preserves measurement gate");
+      bool processed = false;
+      {
+        effetune::allocation_guard::Scope guard;
+        EngineHost::ProcessBatch batch;
+        processed = engine->beginProcessBatch(batch, commands.get());
+        if (processed && stageImages)
+          processed = batch.stageParameters(41, packed(), Params::kHash);
+        processed = processed && batch.processChunk(channels, 2, 1024, static_cast<double>(frames) / 48000, false);
+        processed = batch.finish() && processed;
+      }
+      expect(processed, "reset and preview overlay allocate nothing on audio");
+      frames += 1024;
+      std::uint32_t dropped = 0;
+      const auto bytes = engine->readTelemetry(telemetry, dropped);
+      expect(dropped == 0, "measurement telemetry is complete");
+      for (std::uint32_t offset = 0; offset + 16 <= bytes;) {
+        const auto tap = u32(telemetry.data() + offset + 4);
+        const auto payload = static_cast<std::uint32_t>(telemetry[offset + 12]) |
+                             (static_cast<std::uint32_t>(telemetry[offset + 13]) << 8);
+        if (tap == 41 && payload >= 24) {
+          hops = u32(telemetry.data() + offset + 36);
+          style = telemetry[offset + 25];
+        } else if (tap == 42) {
+          const auto sequence = u32(telemetry.data() + offset + 8);
+          expect(sequence >= meterSequence, "reset preserves unrelated instance telemetry sequence");
+          meterSequence = sequence;
+          expect(telemetry[offset + 16] == 3, "reset preserves unrelated parameters");
+        }
+        offset += (16u + payload + 3u) & ~3u;
+      }
+    }
+  };
+  render(150);
+  expect(hops > 0, "ordinary input accumulates tonal measurements");
+  engine->setFrequencyPreviewActive(true);
+  render(16);
+  const auto frozen = hops;
+  params.target = 1;
+  AudioCommand image;
+  image.type = AudioCommandType::setParameters;
+  image.logicalId = 41;
+  image.paramsHash = Params::kHash;
+  image.floatCount = Params::kFloatCount;
+  std::copy(packed().begin(), packed().end(), image.packed.begin());
+  expect(commands->push(image), "queue image during preview");
+  render(64, true);
+  expect(hops == frozen && style == 1, "preview freezes measurement across queued, control and automation images");
+  AudioCommand reset;
+  reset.type = AudioCommandType::resetInstance;
+  reset.logicalId = 41;
+  reset.paramsHash = Params::kHash;
+  expect(commands->push(reset), "queue instance-only temporal reset");
+  const auto meterBefore = meterSequence;
+  render(64);
+  expect(hops == 0 && style == 1 && meterSequence > meterBefore,
+         "target history clears while its settings and other instances survive");
+  engine->setFrequencyPreviewActive(false);
+  render(100);
+  expect(hops > 0 && style == 1, "measurement resumes on preview release without another parameter image");
+  params.measurementPaused = 1;
+  expect(engine->updateParameters(41, packed(), Params::kHash), "accept a stale UI transient field");
+  const auto resumed = hops;
+  render(64);
+  expect(hops > resumed, "host-owned gate overrides stale serialized or UI pause values");
+  FrequencyPreview preview;
+  expect(!preview.mix(channels, 2, 1024, 48000), "silent preview block reports no gate");
+  preview.setFrequency(1000);
+  expect(preview.mix(channels, 2, 1024, 48000), "active preview block reports gate");
+  preview.setFrequency(0);
+  expect(preview.mix(channels, 2, 1024, 48000), "release-ramp block keeps gate closed");
+  expect(!preview.mix(channels, 2, 1024, 48000), "following clean block reopens gate");
+}
+
 void testBackupExport() {
   const auto directory = std::filesystem::temp_directory_path() /
       ("effetune-backup-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
@@ -271,6 +395,7 @@ int main() {
     testDeferredBassLatency();
     testOutputAnalyzers();
     testOutputAnalyzerClockFollowsConsumedAudio();
+    testInstanceResetAndPreviewMeasurementGate();
     testBackupExport();
     std::cout << "Upstream integration tests passed\n";
   } catch (const std::exception &error) {

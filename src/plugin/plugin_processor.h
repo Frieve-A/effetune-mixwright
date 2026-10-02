@@ -514,6 +514,7 @@ private:
   std::atomic_bool appliedLatencyNotificationPending_{false};
   OutputTransition outputTransition_;
   LatestParameterMailbox parameterMailbox_;
+  AudioCommandQueue instanceCommands_;
   std::optional<AudioCommand> pendingDescriptorCommand_;
   AutomationBindingRegistry automationBindings_;
   AutomationParameterBank automationParameters_;
@@ -634,6 +635,7 @@ private:
   std::unordered_map<std::uint64_t, PendingAssetTransfer> pendingAssetTransfers_;
   std::vector<float> engineOutputBuffer_;
   FrequencyPreview frequencyPreview_;
+  std::uint32_t frequencyPreviewTailFrames_ = 0;
   std::vector<float> dryTransitionBuffer_;
   std::vector<std::uint8_t> hostBypassMask_;
   std::array<float *, EngineHost::kMaxChannels> engineOutputPointers_{};

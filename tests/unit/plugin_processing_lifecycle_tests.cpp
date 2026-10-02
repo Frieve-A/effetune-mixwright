@@ -1,5 +1,6 @@
 #include "plugin/plugin_processor.h"
 #include "plugin/plugin_ids.h"
+#include "../../external/effetune/dsp/generated/cpp/OscilloscopePluginParams.h"
 
 #include "pluginterfaces/base/ustring.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
@@ -45,6 +46,20 @@ namespace effetune::vst::plugin {
 
 class PluginProcessorTestAccess {
 public:
+  [[nodiscard]] static bool previewMeasurementPaused(const EffeTuneProcessor &processor) {
+    return processor.engine_.frequencyPreviewActive_;
+  }
+
+  [[nodiscard]] static float previewEnginePeak(const EffeTuneProcessor &processor,
+                                               const std::uint32_t hostFrames) {
+    float peak = 0;
+    const auto frames = hostFrames * processor.oversampler_.factor();
+    for (std::uint32_t channel = 0; channel < 2; ++channel)
+      for (std::uint32_t frame = 0; frame < frames; ++frame)
+        peak = std::max(peak, std::abs(processor.engineOutputPointers_[channel][frame]));
+    return peak;
+  }
+
   static void setBackupSaveChooser(EffeTuneProcessor &processor,
       std::function<std::optional<std::filesystem::path>(std::string_view)> chooser) {
     processor.backupSaveChooserForTesting_ = std::move(chooser);
@@ -1291,6 +1306,10 @@ void testFrequencyPreviewReachesPipelineAndStopsWithEditor() {
   send("1000");
   process();
   process();
+  const auto resetReply = choc::json::parse(processor->handleUiMessage(
+      R"({"type":"pipeline/resetPluginState","payload":{"pluginId":1}})"));
+  expect(resetReply["ok"].getWithDefault<bool>(false), "queue a per-instance reset through the bridge");
+  process();
   const auto peak = *std::max_element(outputLeft.begin(), outputLeft.end());
   expect(std::abs(peak - 0.251188643150958f * 0.5011872336f) < 1.0e-6f,
          "preview is mixed before the gain pipeline at upstream amplitude");
@@ -1327,6 +1346,76 @@ void testFrequencyPreviewReachesPipelineAndStopsWithEditor() {
   expectStopped();
   expect(processor->setActive(false) == kResultOk, "deactivate preview");
   expect(processor->terminate() == kResultOk, "terminate preview");
+}
+
+void testPreviewMeasurementGateCoversInterpolationTail() {
+  using effetune::vst::FilterQuality;
+  using effetune::vst::FrequencyPreview;
+  using effetune::vst::OversamplingPhase;
+  using effetune::vst::OversamplingSettings;
+  const std::array settings{
+      OversamplingSettings{1, OversamplingPhase::linear, FilterQuality::ultra},
+      OversamplingSettings{2, OversamplingPhase::linear, FilterQuality::ultra},
+      OversamplingSettings{4, OversamplingPhase::minimum, FilterQuality::ultra}};
+  bool sawDelayedAudition = false;
+  for (const auto &setting : settings) {
+    auto processor = std::make_unique<EffeTuneProcessor>();
+    expect(processor->initialize(nullptr) == kResultOk, "initialize interpolated preview");
+    auto processSetup = setup(48000, 64);
+    expect(processor->setupProcessing(processSetup) == kResultOk, "prepare interpolated preview");
+    installGainPipeline(*processor);
+    const auto phase = setting.phase == OversamplingPhase::linear ? "linear" : "minimum";
+    const auto reply = choc::json::parse(processor->handleUiMessage(
+        std::string(R"({"type":"os/set","payload":{"factor":)") + std::to_string(setting.factor) +
+        R"(,"phase":")" + phase + R"(","quality":"ultra"}})"));
+    expect(reply["ok"].getWithDefault<bool>(false), "prepare real interpolation cascade");
+    expect(processor->setActive(true) == kResultOk, "activate interpolated preview");
+    std::array<float, 64> inputLeft{}, inputRight{}, outputLeft{}, outputRight{}, referenceAudio{};
+    Sample32 *inputs[]{inputLeft.data(), inputRight.data()};
+    Sample32 *outputs[]{outputLeft.data(), outputRight.data()};
+    AudioBusBuffers input{}, output{};
+    input.numChannels = output.numChannels = 2;
+    input.channelBuffers32 = inputs;
+    output.channelBuffers32 = outputs;
+    ProcessData data{};
+    data.symbolicSampleSize = kSample32;
+    data.numSamples = 64;
+    data.numInputs = data.numOutputs = 1;
+    data.inputs = &input;
+    data.outputs = &output;
+    FrequencyPreview reference;
+    float *referenceChannels[]{referenceAudio.data()};
+    const auto request = [&](bool active) {
+      reference.setFrequency(active ? 1000 : 0);
+      const auto response = choc::json::parse(processor->handleUiMessage(
+          active ? R"({"type":"audio/frequencyPreview","payload":{"frequency":1000}})"
+                 : R"({"type":"audio/frequencyPreview","payload":{"frequency":null}})"));
+      expect(response["ok"].getWithDefault<bool>(false), "control interpolated preview");
+    };
+    const auto render = [&] {
+      referenceAudio.fill(0);
+      const auto sourceActive = reference.mix(referenceChannels, 1, 64, 48000);
+      tresult result;
+      { effetune::allocation_guard::Scope guard; result = processor->process(data); }
+      expect(result == kResultOk, "process interpolation tail without allocations");
+      const auto peak = PluginProcessorTestAccess::previewEnginePeak(*processor, 64);
+      const auto paused = PluginProcessorTestAccess::previewMeasurementPaused(*processor);
+      if (sourceActive || peak > .00001f)
+        expect(paused, "actual DSP audition PCM never reaches an open measurement gate");
+      if (!sourceActive && peak > .01f) sawDelayedAudition = true;
+      if (!paused) expect(peak < 1.0e-12f, "measurement resumes only after interpolation history drains");
+      return paused;
+    };
+    request(true);
+    for (int block = 0; block < 32; ++block) expect(render(), "pause while auditioning");
+    request(false);
+    bool resumed = false;
+    for (int block = 0; block < 20; ++block) resumed = !render() || resumed;
+    expect(resumed, "bounded FIR support eventually resumes normal measurement");
+    expect(processor->setActive(false) == kResultOk, "deactivate interpolated preview");
+    expect(processor->terminate() == kResultOk, "terminate interpolated preview");
+  }
+  expect(sawDelayedAudition, "fixture reproduces material preview PCM after host oscillator release");
 }
 
 void testVariableHostBlocksAndOversampledLatency() {
@@ -6912,8 +7001,10 @@ void testOscilloscopeSweepsSurviveProcessorReactivation() {
   expect(processor->setupProcessing(processSetup) == kResultOk, "prepare retained oscilloscope");
   installGainPipeline(*processor);
   expect(processor->setActive(true) == kResultOk, "activate retained oscilloscope");
-  constexpr auto sourceRequest =
-      R"({"type":"visualizer/setSources","payload":{"sources":[{"tapId":4026531840,"type":"OscilloscopePlugin","params":[0.01,0,2,0,0.0001,0,0],"paramsHash":2229411282,"channel":null,"gain":1}]}})";
+  const auto sourceRequest =
+      std::string(R"({"type":"visualizer/setSources","payload":{"sources":[{"tapId":4026531840,"type":"OscilloscopePlugin","params":[0.01,0,2,0,0.0001,0,0],"paramsHash":)") +
+      std::to_string(effetune::generated::OscilloscopePluginParams::kHash) +
+      R"(,"channel":null,"gain":1}]}})";
   const auto source = choc::json::parse(processor->handleUiMessage(sourceRequest));
   expect(source["ok"].getWithDefault<bool>(false), "configure retained auto-sweep source");
   gate_ordering::AudioRig rig(0);
@@ -11124,6 +11215,7 @@ int main() {
     testAutomationCatalogProjectionIsOneControlTransaction();
     testVariableHostBlocksAndOversampledLatency();
     testFrequencyPreviewReachesPipelineAndStopsWithEditor();
+    testPreviewMeasurementGateCoversInterpolationTail();
     testClosedEditorHostAutomationUpdatesStateAndAudio();
     testBoundTargetGestureReachesAudioWithoutHostEcho();
     testNamedBulkAutomationEditsReachAudioAndUnnamedOnesStayOverlaid();

@@ -21,12 +21,12 @@ public:
     frequency_ = gain_ = phase_ = 0.0;
   }
 
-  void mix(float *const *channels, const std::uint32_t channelCount,
+  bool mix(float *const *channels, const std::uint32_t channelCount,
            const std::uint32_t frames, const double sampleRate) noexcept {
     const auto requested = requestedFrequency_.load(std::memory_order_relaxed);
     const auto active = requested > 0.0 && requested < sampleRate * 0.5;
     if (active) frequency_ = requested;
-    if (!active && gain_ == 0.0) return;
+    if (!active && gain_ == 0.0) return false;
     constexpr auto twoPi = 6.28318530717958647692;
     constexpr auto amplitude = 0.251188643150958;
     const auto phaseStep = twoPi * std::min(frequency_, sampleRate * 0.499) / sampleRate;
@@ -40,6 +40,8 @@ public:
       phase_ += phaseStep;
       if (phase_ >= twoPi) phase_ -= twoPi;
     }
+    // Include the release ramp: this entire block was exposed to audition PCM.
+    return true;
   }
 
 private:

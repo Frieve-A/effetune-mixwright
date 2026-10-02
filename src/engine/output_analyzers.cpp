@@ -11,9 +11,10 @@
 
 namespace effetune::vst {
 namespace {
-constexpr std::array<std::string_view, 7> kAnalyzerTypes{
+constexpr std::array<std::string_view, 10> kAnalyzerTypes{
     "SpectrumAnalyzerPlugin", "SpectrogramPlugin", "OscilloscopePlugin",
-    "StereoMeterPlugin", "LevelMeterPlugin", "NoteSpectrogramPlugin", "ChromaSpiralPlugin"};
+    "StereoMeterPlugin", "LevelMeterPlugin", "NoteSpectrogramPlugin", "ChromaSpiralPlugin",
+    "PhaseSelectEqPlugin", "AnalogMeterPlugin", "RhythmAnalyzerPlugin"};
 constexpr std::array<std::string_view, 26> kChannels{
     "", "L", "R", "1", "2", "3", "4", "5", "6", "7", "8", "9",
     "10", "11", "12", "13", "14", "15", "16", "34", "56", "78",

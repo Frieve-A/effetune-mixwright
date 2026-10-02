@@ -735,7 +735,8 @@ int main(const int argc, char **argv) {
   bool headerControlsAreVstSpecific = false;
   bool visualizerNavigationWorks = false;
   std::string visualizerNavigationDiagnostics;
-  bool configDialogIsLanguageOnly = false;
+  bool configDialogCategoriesValid = false;
+  std::string configDialogDiagnostics;
   bool languageChangedImmediately = false;
   bool measurementImportAvailable = false;
   std::string measurementImportDiagnostics;
@@ -1333,18 +1334,96 @@ int main(const int argc, char **argv) {
             "(() => { document.getElementById('configSettingsButton')?.click(); return true; })()",
             ignored) && ignored == "true" && waitForJavascript(
                 "!!document.getElementById('language-select')", kCompletionTimeout);
-        configDialogIsLanguageOnly = configDialogOpened && evaluate(
-            "(() => { const content = document.querySelector('.config-dialog-content'); "
-            "const powerColumn = document.querySelector('.config-dialog-power-column'); "
-            "const sections = [...document.querySelectorAll('.config-dialog .device-section')]; "
-            "if (!content || !powerColumn || sections.length <= 1) return false; "
-            "const visible = sections.filter(section => "
-            "getComputedStyle(section).display !== 'none'); "
-            "return visible.length === 1 && "
-            "visible[0].contains(document.getElementById('language-select')) && "
-            "getComputedStyle(content).display === 'block' && "
-            "getComputedStyle(powerColumn).display === 'none'; })()",
-            ignored) && ignored == "true";
+        const auto settingsCategoriesStarted = configDialogOpened && evaluate(R"JS(
+          (() => {
+            window.__vstSettingsCategoriesReady = false;
+            (async () => {
+              const visible = element => !!element?.getClientRects().length &&
+                getComputedStyle(element).display !== 'none';
+              const buttons = [...document.querySelectorAll('.config-category-button')];
+              if (buttons.map(button => button.id).join(',') !==
+                  'config-category-general,config-category-controllers') throw new Error('Settings categories');
+              const sections = [...document.querySelectorAll('.config-dialog .device-section')];
+              const generalVisible = sections.filter(visible);
+              if (generalVisible.length !== 1 || !generalVisible[0].contains(
+                  document.getElementById('language-select'))) throw new Error('General visibility');
+              const unsupported = [...document.querySelectorAll('.config-category-panel')].filter(
+                panel => !['config-panel-general', 'config-panel-controllers'].includes(panel.id));
+              if (unsupported.some(visible)) throw new Error('Unsupported panel visible');
+              document.getElementById('config-category-controllers').click();
+              if (visible(document.getElementById('config-panel-general')) ||
+                  !visible(document.getElementById('physical-control-section')) ||
+                  !visible(document.getElementById('controller-mapping-btn'))) throw new Error('Controllers visibility');
+              document.getElementById('controller-mapping-btn').click();
+              const deadline = Date.now() + 60000;
+              while (!visible(document.querySelector('.midi-mapping-dialog'))) {
+                if (Date.now() >= deadline) throw new Error('Mapping entry did not open dialog');
+                await new Promise(resolve => setTimeout(resolve, 20));
+              }
+              const manager = window.midiControllerManager;
+              if (!visible(document.querySelector('.midi-mapping-dialog'))) throw new Error('Mapping dialog unavailable');
+              const dialog = document.querySelector('.midi-mapping-dialog');
+              const backdrop = dialog.closest('.library-dialog-backdrop');
+              const backdropRect = backdrop.getBoundingClientRect();
+              const dialogRect = dialog.getBoundingClientRect();
+              // Fixed CSS layout fills the client viewport, excluding scrollbars.
+              const viewportWidth = document.documentElement.clientWidth;
+              const viewportHeight = document.documentElement.clientHeight;
+              if (getComputedStyle(backdrop).position !== 'fixed' ||
+                  Math.abs(backdropRect.left) > 1 || Math.abs(backdropRect.top) > 1 ||
+                  Math.abs(backdropRect.width - viewportWidth) > 1 ||
+                  Math.abs(backdropRect.height - viewportHeight) > 1) throw new Error(
+                    'Mapping backdrop is not viewport modal: ' + JSON.stringify({
+                      position: getComputedStyle(backdrop).position,
+                      rect: backdropRect.toJSON(), viewport: { width: viewportWidth, height: viewportHeight }
+                    }));
+              if (dialogRect.left < 0 || dialogRect.top < 0 || dialogRect.right > viewportWidth ||
+                  dialogRect.bottom > viewportHeight ||
+                  Math.abs(dialogRect.left + dialogRect.width / 2 - viewportWidth / 2) > 2 ||
+                  Math.abs(dialogRect.top + dialogRect.height / 2 - viewportHeight / 2) > 2) throw new Error('Mapping dialog is not centered in viewport');
+              if (document.elementFromPoint(5, 5) !== backdrop || !dialog.contains(document.elementFromPoint(
+                  dialogRect.left + dialogRect.width / 2, dialogRect.top + 12))) throw new Error('Mapping modal does not block background');
+              const body = dialog.querySelector('.library-properties-body');
+              const header = dialog.querySelector('.library-properties-head');
+              const close = dialog.querySelector('.library-properties-head:last-child button');
+              if (!['auto', 'scroll'].includes(getComputedStyle(body).overflowY) ||
+                  !visible(header) || !visible(close) ||
+                  getComputedStyle(dialog).display !== 'grid') throw new Error('Mapping scroll body or fixed controls unavailable');
+              const targets = manager.dialog.createSelect();
+              manager.dialog.populateParameterSelect(targets, '_global', { param: 'preset', element: 0 });
+              if ([...targets.options].map(option => option.value).join(',') !==
+                  'masterBypass:0,abToggle:0,preset:0' || targets.value !== 'preset:0') throw new Error('Preset target unavailable');
+              body.prepend(targets);
+              targets.focus();
+              targets.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+              const list = document.querySelector('.standard-select-list:not([hidden])');
+              if (!visible(list)) throw new Error('Mapping target dropdown unavailable');
+              const listRect = list.getBoundingClientRect();
+              if (!list.contains(document.elementFromPoint(listRect.left + listRect.width / 2,
+                  listRect.top + Math.min(12, listRect.height / 2)))) throw new Error('Mapping dropdown is behind modal');
+              targets.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+              targets.remove();
+              await manager.dialog.close();
+              document.getElementById('close-btn').click();
+              await window.electronIntegration.showConfigDialog();
+              if (document.getElementById('config-category-controllers').getAttribute('aria-current') !== 'true' ||
+                  !visible(document.getElementById('physical-control-section'))) throw new Error('Category not restored');
+              document.getElementById('config-category-general').click();
+              if (!visible(document.getElementById('language-select')) ||
+                  visible(document.getElementById('physical-control-section'))) throw new Error('General return');
+              window.__vstSettingsCategoriesReady = true;
+            })().catch(error => { window.__vstSettingsCategoriesError = String(error); });
+            return true;
+          })()
+        )JS", ignored) && ignored == "true";
+        configDialogCategoriesValid = settingsCategoriesStarted && waitForJavascript(
+            "window.__vstSettingsCategoriesReady === true || !!window.__vstSettingsCategoriesError",
+            kCompletionTimeout) && evaluate("window.__vstSettingsCategoriesReady === true", ignored) &&
+            ignored == "true";
+        if (!configDialogCategoriesValid) {
+          evaluate("String(window.__vstSettingsCategoriesError || 'Settings check did not complete')",
+                   configDialogDiagnostics);
+        }
         const auto languageChangeStarted = configDialogOpened && evaluate(
             "(() => { const select = document.getElementById('language-select'); "
             "if (!select) return false; select.value = 'ja'; "
@@ -2036,8 +2115,9 @@ int main(const int argc, char **argv) {
               << visualizerNavigationDiagnostics << '\n';
     return 1;
   }
-  if (!configDialogIsLanguageOnly) {
-    std::cerr << "The VST settings dialog exposed non-language settings\n";
+  if (!configDialogCategoriesValid) {
+    std::cerr << "The VST settings categories, controller mapping entry or preset target were unavailable: "
+              << configDialogDiagnostics << '\n';
     return 1;
   }
   if (!languageChangedImmediately) {

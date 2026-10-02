@@ -36,6 +36,10 @@ native pipeline output. The **Effect Pipeline** button returns to effect editing
 Visualizer presets and imported images use the VST WebView's local storage.
 The music player and music library remain outside the VST interface.
 
+Use **Settings → Configuration → Controllers** to open controller mapping settings.
+Controller mappings can toggle master bypass, switch A/B, and step through saved
+presets. Player transport controls are omitted from the mapping choices.
+
 **Settings → Backup / Restore** transfers saved pipeline, effect and Visualizer
 presets, impulse responses and measurements in an `.effetune_backup` archive.
 Choose a destination in the native save dialog; restoration previews the selected

@@ -28,11 +28,10 @@
     #audioConfigSettingsButton, #benchmarkSettingsButton,
     #measurementSettingsButton, #resetAudioSettingsButton,
     #installAppButton, #installAppElement, #doubleBlindTestButton { display: none !important; }
-    .config-dialog { width: min(420px, calc(100vw - 32px)) !important; }
-    .config-dialog .config-dialog-content { display: block !important; }
+    .config-dialog { width: min(640px, calc(100vw - 32px)) !important; }
     .config-dialog .device-section { display: none !important; }
     .config-dialog .device-section:has(#language-select) { display: block !important; }
-    .config-dialog .config-dialog-power-column { display: none !important; }
+    .config-dialog #physical-control-section { display: block !important; }
     .vst-os-controls {
       display: inline-flex;
       align-items: flex-end;

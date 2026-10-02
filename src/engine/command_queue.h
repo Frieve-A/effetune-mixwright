@@ -63,7 +63,7 @@ private:
 
 // Descriptor commands carry logical plug-in IDs. The processor's non-real-time
 // control service resolves them to current native instances before publication.
-enum class AudioCommandType : std::uint8_t { setParameters, setDescriptor, reset };
+enum class AudioCommandType : std::uint8_t { setParameters, setDescriptor, reset, resetInstance };
 
 struct AudioCommand {
   static constexpr std::size_t kMaxParameterBytes = 8192;

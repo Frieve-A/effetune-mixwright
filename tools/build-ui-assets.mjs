@@ -50,7 +50,8 @@ await mkdir(output, { recursive: true });
 for (const entry of ['js', 'plugins', 'presets', 'images', 'css']) {
   await cp(path.join(source, entry), path.join(output, entry), { recursive: true });
 }
-for (const entry of ['effetune-mobile.css', 'effetune-library.css', 'pipeline-analyzer.css']) {
+// Shared modal/controller styling lives in the upstream library stylesheet.
+for (const entry of ['effetune-mobile.css', 'pipeline-analyzer.css']) {
   await rm(path.join(output, 'css', entry), { force: true });
 }
 await cp(path.join(projectRoot, 'ui-shim', 'vst-bootstrap.js'),
@@ -88,7 +89,8 @@ if (!html.includes(upstreamDocumentTitle) || !html.includes(upstreamHeaderTitle)
   throw new Error('Unable to locate the upstream EffeTune branding');
 }
 html = applyProductBranding(html)
-  .replace(/\s*<link rel="stylesheet" href="css\/effetune-(?:mobile|library)\.css">/g, '')
+  .replace(/\s*<link rel="stylesheet" href="css\/effetune-mobile\.css">/g, '')
+  .replace('</head>', '    <link rel="stylesheet" href="css/effetune-library.css">\n</head>')
   .replace(/\s*<link rel="manifest" href="manifest\.json">/g, '')
   .replace(/<meta http-equiv="Content-Security-Policy"[^>]*>/,
     `<meta http-equiv="Content-Security-Policy" content="default-src 'self' blob: data:; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:; connect-src 'self' blob:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline' blob:;">`)
@@ -369,8 +371,8 @@ let history = await readFile(historyPath, 'utf8');
 const historySerialization =
   `this.pipelineManager.core.getSerializablePluginState(plugin, true, false, false)`;
 const historySerializationMatches = history.split(historySerialization).length - 1;
-if (historySerializationMatches !== 2) {
-  throw new Error(`Expected two history serialization sites, found ${historySerializationMatches}`);
+if (historySerializationMatches !== 1) {
+  throw new Error(`Expected one shared history serialization site, found ${historySerializationMatches}`);
 }
 history = history.replaceAll(historySerialization,
   `({ ...${historySerialization}, id: plugin.id })`);
@@ -400,6 +402,36 @@ if (history.split(historyWorkletUpdate).length - 1 !== 1) {
 }
 history = history.replace(historyWorkletUpdate, '');
 await writeFile(historyPath, history, 'utf8');
+
+// Controller targets share a pure player-speed utility even when no player is packaged.
+await cp(path.join(source, 'js', 'ui', 'audio-player', 'playback-speed.js'),
+         path.join(output, 'js', 'midi', 'playback-speed.js'));
+const appTargetsPath = path.join(output, 'js', 'midi', 'app-targets.js');
+let appTargets = await readFile(appTargetsPath, 'utf8');
+const speedImport = "from '../ui/audio-player/playback-speed.js'";
+if (appTargets.split(speedImport).length - 1 !== 1) {
+  throw new Error('Expected one controller playback-speed utility import');
+}
+await writeFile(appTargetsPath, appTargets.replace(speedImport, "from './playback-speed.js'"), 'utf8');
+const controllerDialogPath = path.join(output, 'js', 'midi', 'midi-mapping-dialog.js');
+let controllerDialog = await readFile(controllerDialogPath, 'utf8');
+const appChoices = 'for (const param of Object.keys(APP_TARGETS)) {';
+if (controllerDialog.split(appChoices).length - 1 !== 1) {
+  throw new Error('Expected one controller application target choice list');
+}
+controllerDialog = controllerDialog.replace(appChoices,
+  "for (const param of ['masterBypass', 'abToggle', 'preset']) {");
+await writeFile(controllerDialogPath, controllerDialog, 'utf8');
+
+// The Visualizer uses a dependency-free viewport helper shared with the library UI.
+await cp(path.join(source, 'js', 'ui', 'library', 'library-view-shared.js'),
+         path.join(output, 'js', 'ui', 'visualizer-shared.js'));
+const viewportImport = "from '../ui/library/library-view-shared.js'";
+if (visualizerEditor.split(viewportImport).length - 1 !== 1) {
+  throw new Error('Expected one Visualizer viewport helper import');
+}
+await writeFile(visualizerEditorPath,
+  visualizerEditor.replace(viewportImport, "from '../ui/visualizer-shared.js'"), 'utf8');
 
 const pipelineManagerPath = path.join(output, 'js', 'ui', 'pipeline-manager.js');
 let pipelineManager = await readFile(pipelineManagerPath, 'utf8');
@@ -735,6 +767,17 @@ if (!configIntegration.includes(libraryConfigImport)) {
 configIntegration = configIntegration.replace(libraryConfigImport,
   `const MUSIC_LIBRARY_STARTUP_VIEWS = Object.freeze(['tracks']);
 const normalizeMusicLibraryStartupView = () => 'tracks';`);
+const configCategories = 'const categories = Object.keys(categoryPanels);';
+const configPanels = '${categories.map(category => `\n          <div class="config-category-panel" id="config-panel-${category}">';
+if (configIntegration.split(configCategories).length - 1 !== 1 ||
+    configIntegration.split(configPanels).length - 1 !== 1) {
+  throw new Error('Unable to locate categorized settings navigation and panels');
+}
+configIntegration = configIntegration.replace(configCategories,
+  "const categories = ['general', 'controllers'];");
+// Keep nonselectable panels for upstream initialization and translated control IDs.
+configIntegration = configIntegration.replace(configPanels,
+  '${Object.keys(categoryPanels).map(category => `\n          <div class="config-category-panel" id="config-panel-${category}" hidden>');
 await writeFile(configIntegrationPath, configIntegration, 'utf8');
 
 const clipboardPath = path.join(output, 'js', 'ui', 'pipeline', 'clipboard-manager.js');

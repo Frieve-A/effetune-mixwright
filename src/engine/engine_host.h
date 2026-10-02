@@ -19,6 +19,7 @@ class Engine;
 }
 
 namespace effetune::vst {
+namespace plugin { class PluginProcessorTestAccess; }
 
 struct KernelInfo {
   std::uint32_t index = 0;
@@ -149,6 +150,8 @@ public:
                              std::uint32_t telemetryBytes = kDefaultTelemetryBytes,
                              std::string *error = nullptr);
   void reset();
+  // Called by the engine owner with the actual audition state of the audio block.
+  void setFrequencyPreviewActive(bool active) noexcept { frequencyPreviewActive_ = active; }
 
   [[nodiscard]] bool rebuild(const PipelineState &pipeline,
                              const std::vector<RuntimePlugin> &runtimePlugins,
@@ -215,14 +218,20 @@ public:
   [[nodiscard]] bool prepared() const noexcept { return prepared_; }
 
 private:
+  friend class plugin::PluginProcessorTestAccess;
   struct InstanceEntry {
     et_instance instance = 0;
     std::uint32_t paramsHash = 0;
     std::uint32_t kernelIndex = 0;
     bool contextuallyBypassed = false;
+    // Allocated only at rebuild for kernels with a host-owned measurement gate.
+    std::vector<float> measurementParameters;
   };
 
   void discoverKernels();
+  [[nodiscard]] bool stageFloatsUnlocked(InstanceEntry &entry,
+                                        std::span<const float> packed,
+                                        std::uint32_t paramsHash) noexcept;
   void clearInstancesUnlocked() noexcept;
   [[nodiscard]] bool applyCommandUnlocked(const AudioCommand &command,
                                           bool *pipelinePlanDirty = nullptr) noexcept;
@@ -256,6 +265,7 @@ private:
   std::uint32_t channels_ = 0;
   std::uint32_t maxProcessFrames_ = 0;
   bool prepared_ = false;
+  bool frequencyPreviewActive_ = false;
   std::array<std::uint8_t, AudioCommand::kMaxDescriptorBytes> activeDescriptor_{};
   std::uint32_t activeDescriptorByteCount_ = 0;
   std::unordered_map<std::string, KernelInfo> kernels_;

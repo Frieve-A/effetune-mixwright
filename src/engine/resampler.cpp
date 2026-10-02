@@ -352,10 +352,14 @@ void Oversampler::prepare(const OversamplingSettings &settings, const std::uint3
   downBuffers_.resize(stages);
 
   double latency = 0.0;
+  std::uint32_t interpolationTail = 0;
   for (std::uint32_t stage = 0; stage < stages; ++stage) {
     const auto design = FirDesigner::designHalfBand(settings.quality, settings.phase, stage);
     upStages_[stage].prepare(channels_, design);
     downStages_[stage].prepare(channels_, design);
+    // Express the accumulated support at this stage's doubled output rate.
+    // Energy delay and host round-trip latency do not bound a FIR's tail.
+    interpolationTail = 2u * interpolationTail + upStages_[stage].tapCount() - 1u;
     const auto rateFactor = static_cast<double>(1u << (stage + 1u));
     const auto delay = settings.phase == OversamplingPhase::linear
                            ? static_cast<double>(design.coefficients.size() - 1u) * 0.5
@@ -373,6 +377,8 @@ void Oversampler::prepare(const OversamplingSettings &settings, const std::uint3
   }
   passthroughBuffer_.assign(static_cast<std::size_t>(channels_) * maxHostFrames_, 0.0f);
   latencyHostFrames_ = static_cast<std::uint32_t>(std::lround(latency));
+  interpolationTailHostFrames_ =
+      (interpolationTail + settings.factor - 1u) / settings.factor;
   reset();
 }
 

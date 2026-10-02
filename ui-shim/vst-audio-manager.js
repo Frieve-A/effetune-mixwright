@@ -379,6 +379,14 @@ class NativePort {
     // the bridge, so a deferred update can never land after the rebuild, master
     // bypass, or asset operation that replaced it.
     if (message.type !== 'updatePlugin') this.flushPluginUpdates();
+    if (message.type === 'resetPluginState') {
+      return window.__effetuneHostCall('pipeline/resetPluginState', {
+        pluginId: message.pluginId
+      }).catch(error => {
+        console.error('[EffeTune Mixwright] plug-in reset failed', error);
+        window.uiManager?.setError?.('The measurement could not be reset. Try again.', false);
+      });
+    }
     if (message.type === 'setVisualizerSources') {
       return window.__effetuneHostCall('visualizer/setSources', {
         sources: (message.sources || []).map(source => ({
@@ -1183,6 +1191,8 @@ export class AudioManager extends BrowserAudioManager {
 
   registerPipelineProcessors() {}
   fadeInOutput() {}
+  // Native processing publishes its own readiness; there is no browser output gate.
+  fadeInOutputWhenReady() { return Promise.resolve(); }
   fadeOutOutput() { return Promise.resolve(); }
   startPowerPolicyController() { return Promise.resolve(false); }
   updateDspTelemetryRate() {}

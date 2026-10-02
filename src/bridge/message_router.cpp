@@ -434,6 +434,14 @@ bool MessageRouter::decode(const std::string_view json, RoutedUiMessage &message
       if (!std::isfinite(decoded.previewFrequency) || decoded.previewFrequency <= 0.0) {
         decoded.previewFrequency = 0.0;
       }
+    } else if (type == "pipeline/resetPluginState") {
+      decoded.action = UiAction::resetPluginState;
+      const auto id = payload["pluginId"].getWithDefault<std::int64_t>(0);
+      if (id <= 0 || id > UINT32_MAX) {
+        setError(error, "Invalid plug-in reset target");
+        return false;
+      }
+      decoded.pluginId = static_cast<std::uint32_t>(id);
     } else if (type == "host/openExternal") {
       decoded.action = UiAction::openExternalUrl;
       decoded.url = payload["url"].getWithDefault<std::string>({});

@@ -73,6 +73,10 @@ public:
 
   [[nodiscard]] std::uint32_t factor() const noexcept { return settings_.factor; }
   [[nodiscard]] std::uint32_t latencyHostFrames() const noexcept { return latencyHostFrames_; }
+  // Full interpolation FIR support, including every prepared cascade stage.
+  [[nodiscard]] std::uint32_t interpolationTailHostFrames() const noexcept {
+    return interpolationTailHostFrames_;
+  }
   [[nodiscard]] std::uint32_t upsampledFrames(std::uint32_t hostFrames) const noexcept {
     return hostFrames * settings_.factor;
   }
@@ -82,6 +86,7 @@ private:
   std::uint32_t channels_ = 0;
   std::uint32_t maxHostFrames_ = 0;
   std::uint32_t latencyHostFrames_ = 0;
+  std::uint32_t interpolationTailHostFrames_ = 0;
   std::vector<HalfBandStage> upStages_;
   std::vector<HalfBandStage> downStages_;
   std::vector<std::vector<float>> upBuffers_;

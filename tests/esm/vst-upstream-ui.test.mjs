@@ -12,6 +12,112 @@ const assets = path.resolve(process.argv[assetsIndex + 1]);
 const assetText = relative => readFile(path.join(assets, relative), 'utf8');
 const assetModule = relative => import(pathToFileURL(path.join(assets, relative)).href);
 
+test('shared history snapshots and restoration retain native logical plugin IDs', async () => {
+  const { HistoryManager } = await assetModule('js/ui/pipeline/history-manager.js');
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  globalThis.window = {};
+  globalThis.document = { querySelector: () => null };
+  try {
+    let synchronized = 0;
+    const audioManager = {
+      pipelineA: [{ id: 42, name: 'Gain', value: 2 }], pipelineB: [], currentPipeline: 'A', workletNode: {},
+      dispatchEvent() {}, setMasterBypass() {},
+      getCurrentPipeline() { return this.currentPipeline === 'B' ? this.pipelineB : this.pipelineA; },
+      synchronizeHistoryState() { synchronized++; }
+    };
+    const pluginManager = {
+      nextPluginId: 1,
+      createPlugin(name) {
+        return { id: this.nextPluginId++, name, setEnabled(value) { this.enabled = value; },
+          setParameters(parameters) { this.value = parameters.value; } };
+      }
+    };
+    const history = new HistoryManager({ audioManager, pluginManager, expandedPlugins: new Set(), core: {
+      getSerializablePluginState: plugin => ({ nm: plugin.name, en: true, value: plugin.value }),
+      updatePipelineUI() {}
+    } });
+    const snapshot = history.createSnapshot();
+    assert.equal(snapshot.pipelineA[0].id, 42);
+    history.history = [snapshot];
+    history.historyIndex = 0;
+    assert.equal(history.matchesRecordedPluginState(audioManager.pipelineA[0]), true);
+    history.loadStateFromHistory();
+    assert.equal(audioManager.pipelineA[0].id, 42);
+    assert.equal(audioManager.pipelineA[0].value, 2);
+    assert.ok(pluginManager.nextPluginId > 42);
+    assert.equal(synchronized, 1);
+  } finally {
+    globalThis.window = previousWindow;
+    globalThis.document = previousDocument;
+  }
+});
+
+test('bundled controller module graph exposes VST app choices and steps presets', async () => {
+  const { APP_TARGETS, getAppTarget } = await assetModule('js/midi/app-targets.js');
+  const { MidiMappingDialog } = await assetModule('js/midi/midi-mapping-dialog.js');
+  const dialog = new MidiMappingDialog({ manager: {}, windowRef: {
+    document: { createElement: tag => new Element(tag) }
+  } });
+  const select = new Element('select');
+  const existing = { type: '_global', param: 'playPause', element: 0 };
+  dialog.populateParameterSelect(select, '_global', existing);
+  assert.deepEqual(select.children.map(option => option.value), ['masterBypass:0', 'abToggle:0', 'preset:0']);
+  assert.equal(existing.param, 'playPause');
+  assert.equal(getAppTarget(existing.param), APP_TARGETS.playPause);
+  const loads = [];
+  const presetManager = {
+    currentPresetName: 'Alpha',
+    async getLoadablePresets() { return { Beta: {}, Alpha: {} }; },
+    async loadPreset(name) { loads.push(name); this.currentPresetName = name; }
+  };
+  APP_TARGETS.preset.run({ pipelineManager: { presetManager } }, 1);
+  await until(() => loads.length === 1);
+  assert.deepEqual(loads, ['Beta']);
+});
+
+test('bundled Visualizer module graph retains viewport menu clamping', async () => {
+  await assetModule('js/visualizer/visualizer-editor.js');
+  const { clampMenuToViewport } = await assetModule('js/ui/visualizer-shared.js');
+  const previousWindow = globalThis.window;
+  globalThis.window = { innerWidth: 640, innerHeight: 480 };
+  try {
+    const menu = { style: { left: '630px', top: '470px' },
+      getBoundingClientRect: () => ({ width: 120, height: 90 }) };
+    clampMenuToViewport(menu);
+    assert.deepEqual(menu.style, { left: '516px', top: '386px' });
+    menu.style = { left: '-20px', top: '-10px' };
+    clampMenuToViewport(menu);
+    assert.deepEqual(menu.style, { left: '4px', top: '4px' });
+  } finally { globalThis.window = previousWindow; }
+});
+
+test('categorized settings select only supported panels and retain controller selection', async () => {
+  const source = await assetText('js/electron/configIntegration.js');
+  const selectCategory = source.match(/  function selectCategory\(category\) \{[\s\S]*?\n  \}/)?.[0];
+  assert.ok(selectCategory);
+  assert.ok(source.includes("const categories = ['general', 'controllers'];"));
+  assert.ok(source.includes('id="config-panel-${category}" hidden>'));
+  const nodes = Object.fromEntries(['general', 'controllers', 'startup', 'display', 'audio', 'power'].flatMap(category => {
+    const panel = new Element('div');
+    panel.hidden = true;
+    return [[`config-panel-${category}`, panel], [`config-category-${category}`, new Element('button')]];
+  }));
+  const context = { document: { getElementById: id => nodes[id] } };
+  vm.runInNewContext(`const categories = ['general', 'controllers']; let selectedConfigCategory = 'general';
+    ${selectCategory}
+    this.select = selectCategory; this.selected = () => selectedConfigCategory;`, context);
+  context.select('general');
+  assert.equal(nodes['config-panel-general'].hidden, false);
+  context.select('controllers');
+  assert.equal(nodes['config-panel-general'].hidden, true);
+  assert.equal(nodes['config-panel-controllers'].hidden, false);
+  assert.equal(context.selected(), 'controllers');
+  context.select(context.selected());
+  assert.equal(nodes['config-panel-controllers'].hidden, false);
+  for (const category of ['startup', 'display', 'audio', 'power']) assert.equal(nodes[`config-panel-${category}`].hidden, true);
+});
+
 async function bundledZip() {
   const module = { exports: {} };
   const run = vm.runInThisContext(`(function(module,exports,require){${await assetText('js/vendor/jszip-3.10.2.min.js')}\n})`);
@@ -117,6 +223,7 @@ test('Effects and Visualizer buttons navigate through shared upstream view trans
   const navigation = context.navigation;
   Object.assign(navigation, {
     isDoubleBlindActive: () => false,
+    async ensureVisualizerView() { return this.visualizerView; },
     hideLibraryView() {},
     visualizerView: { initialized: Promise.resolve(), layout: {},
       show() { visible = true; }, hide() { visible = false; }, updateVisibility() {} }
