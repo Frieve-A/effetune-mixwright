@@ -30,6 +30,7 @@ enum class UiAction {
   readTelemetry,
   discardTelemetry,
   setVisualizerSources,
+  setSpectrumTap,
   storageFileExists,
   storageReadFile,
   storageWriteFile,
@@ -103,6 +104,7 @@ struct RoutedUiMessage {
   std::uint32_t elementIndex = 0;
   double normalizedValue = 0.0;
   double previewFrequency = 0.0;
+  SpectrumMode spectrumMode = SpectrumMode::off;
   std::string pluginType;
   std::string parameterKey;
   OversamplingSettings oversampling;

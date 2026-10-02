@@ -1,6 +1,7 @@
 #include "plugin/plugin_processor.h"
 #include "plugin/plugin_ids.h"
 #include "../../external/effetune/dsp/generated/cpp/OscilloscopePluginParams.h"
+#include "../../external/effetune/dsp/generated/cpp/TubeSimulatorPluginParams.h"
 
 #include "pluginterfaces/base/ustring.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
@@ -26,6 +27,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -6994,6 +6996,121 @@ void testVisualizerCapturesFinalHostOutput() {
   expect(processor->terminate() == kResultOk, "terminate final output analyzer");
 }
 
+void testSpectrumOverlayBridgeLifecycle() {
+  auto processor = std::make_unique<EffeTuneProcessor>();
+  expect(processor->initialize(nullptr) == kResultOk, "initialize spectrum overlay bridge");
+  auto processSetup = setup(48000, 64);
+  expect(processor->setupProcessing(processSetup) == kResultOk, "prepare spectrum overlay bridge");
+  installGainPipeline(*processor);
+  expect(processor->setActive(true) == kResultOk, "activate spectrum overlay bridge");
+  const auto request = [&](const char *json) { return choc::json::parse(processor->handleUiMessage(json)); };
+  expect(!request(R"({"type":"spectrum/setTap","payload":{"pluginId":99,"enabled":true}})")["ok"].getBool(),
+         "reject spectrum enable outside active pipeline");
+  expect(request(R"({"type":"spectrum/setTap","payload":{"pluginId":99,"enabled":false}})")["ok"].getBool(),
+         "stale spectrum disable is idempotent");
+  const auto subscribe = [&] {
+    expect(request(R"({"type":"spectrum/setTap","payload":{"pluginId":1,"enabled":true,"mode":"compare"}})")["ok"].getBool(),
+           "subscribe Compare without claiming audio ownership");
+  };
+  subscribe();
+  gate_ordering::AudioRig rig(.25f);
+  const auto render = [&] {
+    for (int block = 0; block < 64; ++block) {
+      tresult result;
+      { effetune::allocation_guard::Scope guard; result = processor->process(rig.data); }
+      expect(result == kResultOk, "render spectrum bridge allocation-free");
+    }
+  };
+  render();
+  const auto reply = request(R"({"type":"telemetry/read"})");
+  const auto overlays = reply["spectrumOverlays"];
+  expect(overlays.size() == 1, "bridge returns spectrum independently of kernel telemetry");
+  const auto overlay = overlays[0];
+  expect(overlay["type"].getString() == "spectrumOverlay" &&
+         overlay["spectrumPluginId"].getInt64() == 1 && overlay["mode"].getString() == "compare" &&
+         overlay["quality"].getString() == "normal" && overlay["sampleRate"].get<double>() == 48000,
+         "overlay payload follows the upstream receiver contract");
+  for (const auto *field : {"inputBuffer", "outputBuffer"}) {
+    std::vector<std::uint8_t> pcm;
+    expect(choc::base64::decodeToContainer(pcm, overlay[field].getString()) && pcm.size() == 4096 * sizeof(float),
+           "spectrum uses exact 4096-sample float payloads");
+    float sample;
+    std::memcpy(&sample, pcm.data(), sizeof(sample));
+    const auto expected = std::string_view(field) == "inputBuffer" ? .25f : .25f * std::pow(10.0f, -6.0f / 20.0f);
+    expect(std::abs(sample - expected) < .0001f, "Compare carries actual pre/post effect PCM");
+  }
+  render();
+  processor->detachEditor(nullptr);
+  expect(request(R"({"type":"telemetry/read"})")["spectrumOverlays"].size() == 0,
+         "native editor close invalidates queued spectra");
+  render();
+  expect(request(R"({"type":"telemetry/read"})")["spectrumOverlays"].size() == 0,
+         "closed editor cannot keep capturing");
+  subscribe();
+  render();
+  expect(request(R"({"type":"telemetry/read"})")["spectrumOverlays"].size() == 1,
+         "reopened editor can explicitly resume capture");
+  expect(processor->getLatencySamples() == 0, "overlay subscription leaves host latency unchanged");
+  expect(processor->setActive(false) == kResultOk, "deactivate spectrum overlay bridge");
+  expect(processor->terminate() == kResultOk, "terminate spectrum overlay bridge");
+}
+
+void testTubeCircuitFaultBridgeLifecycle() {
+  auto processor = std::make_unique<EffeTuneProcessor>();
+  expect(processor->initialize(nullptr) == kResultOk, "initialize circuit-fault bridge");
+  auto processSetup = setup(48000, 64);
+  expect(processor->setupProcessing(processSetup) == kResultOk, "prepare circuit-fault bridge");
+  const auto request = [&](std::string_view json) { return choc::json::parse(processor->handleUiMessage(json)); };
+  const auto install = [&] {
+    const auto reply = request(std::string{
+        R"({"type":"pipeline/rebuild","payload":{"pipeline":"A","plugins":[{"id":17,"type":"TubeSimulatorPlugin","name":"Tube Simulator","enabled":true,"parameters":{},"wasmParams":[-30,2,0,250,10,10,39,100,2.828,0,0,0,320,270,0,2,1,8,0,1,0,400,1000,1],"wasmParamsHash":)"} +
+        std::to_string(effetune::generated::TubeSimulatorPluginParams::kHash) + R"(}]}})");
+    expect(reply["ok"].getBool(), "install actual Tube circuit");
+  };
+  install();
+  expect(processor->setActive(true) == kResultOk, "activate circuit-fault bridge");
+  gate_ordering::AudioRig rig(0);
+  const auto render = [&] {
+    tresult result;
+    { effetune::allocation_guard::Scope guard; result = processor->process(rig.data); }
+    expect(result == kResultOk, "publish circuit fault without audio allocation");
+  };
+  render();
+  rig.inputLeft.fill(std::numeric_limits<float>::max());
+  rig.inputRight.fill(std::numeric_limits<float>::max());
+  render();
+  rig.inputLeft.fill(0);
+  rig.inputRight.fill(0);
+  rig.inputLeft[0] = std::numeric_limits<float>::quiet_NaN();
+  render();
+  const auto reply = request(R"({"type":"telemetry/read"})");
+  expect(reply["runtimeEvents"].size() == 1, "telemetry includes circuit runtime state");
+  const auto fault = reply["runtimeEvents"][0];
+  expect(fault["type"].getString() == "tubeSimulatorCircuitFault" &&
+         fault["pluginType"].getString() == "TubeSimulatorPlugin" && fault["pluginId"].getInt64() == 17 &&
+         fault["latched"].getBool() && fault["cause"].getString() == "processingSafetyFailure",
+         "bridge forwards actual fault with upstream validation fields");
+  const auto epoch = fault["instanceEpoch"].getInt64();
+  const auto generation = fault["generation"].getInt64();
+  processor->detachEditor(nullptr);
+  const auto reopened = request(R"({"type":"host/getInfo","payload":{"startup":true}})");
+  expect(reopened["runtimeEvents"].size() == 1 && reopened["runtimeEvents"][0]["latched"].getBool() &&
+         reopened["runtimeEvents"][0]["instanceEpoch"].getInt64() == epoch &&
+         reopened["runtimeEvents"][0]["generation"].getInt64() == generation,
+         "editor startup republishes the cached latch even without another audio block");
+  installGainPipeline(*processor);
+  expect(request(R"({"type":"telemetry/read"})")["runtimeEvents"].size() == 0,
+         "replacing the active pipeline removes old fault identities");
+  install();
+  const auto recreated = request(R"({"type":"host/getInfo"})");
+  expect(recreated["runtimeEvents"].size() == 1 && !recreated["runtimeEvents"][0]["latched"].getBool() &&
+         recreated["runtimeEvents"][0]["generation"].getInt64() == 0 &&
+         recreated["runtimeEvents"][0]["instanceEpoch"].getInt64() > epoch,
+         "new circuit incarnation clears the old HUD latch with a newer epoch");
+  expect(processor->setActive(false) == kResultOk, "deactivate circuit-fault bridge");
+  expect(processor->terminate() == kResultOk, "terminate circuit-fault bridge");
+}
+
 void testOscilloscopeSweepsSurviveProcessorReactivation() {
   auto processor = std::make_unique<EffeTuneProcessor>();
   expect(processor->initialize(nullptr) == kResultOk, "initialize retained oscilloscope");
@@ -11267,6 +11384,8 @@ int main() {
     testDelayBearingEditsWithAStoppedTransportKeepEveryBlockWet();
     testBackupChooserReentrantCancellation();
     testVisualizerCapturesFinalHostOutput();
+    testSpectrumOverlayBridgeLifecycle();
+    testTubeCircuitFaultBridgeLifecycle();
     testOscilloscopeSweepsSurviveProcessorReactivation();
     testDeferredBassManagementHostAndBypassLatency();
     testLiveLatencyCommitAlignsWetBypassAndHost();

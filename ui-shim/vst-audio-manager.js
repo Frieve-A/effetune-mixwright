@@ -161,6 +161,11 @@ class NativePort {
     this.adoptedAutomationValues = new Map();
     this.deferredHostAutomationDeltas = new Map();
     this.pendingPluginUpdates = new Map();
+    this.spectrumTaps = new Map();
+    this.spectrumRevision = 0;
+    this.spectrumPublishedRevision = 0;
+    this.spectrumRequests = Promise.resolve();
+    this.spectrumClosed = false;
     this.cancelPluginUpdateFlush = null;
     this.pluginUpdateFlushDeadlineMs = PLUGIN_UPDATE_FLUSH_DEADLINE_MS;
     // An editor that goes away cannot release the pointer either, so the same
@@ -172,6 +177,8 @@ class NativePort {
       if (event?.type === 'pagehide' || document.hidden) {
         void this.postMessage({ type: 'setVisualizerSources', sources: [] });
       }
+      if (event?.type === 'pagehide') this.spectrumClosed = true;
+      this.synchronizeSpectrumTaps();
       this.closePointerGesture();
       this.flushPluginUpdates();
     };
@@ -379,6 +386,19 @@ class NativePort {
     // the bridge, so a deferred update can never land after the rebuild, master
     // bypass, or asset operation that replaced it.
     if (message.type !== 'updatePlugin') this.flushPluginUpdates();
+    if (message.type === 'setSpectrumTapRoute' || message.type === 'setSpectrumTap') {
+      if (!Number.isInteger(message.pluginId) || message.pluginId <= 0) return;
+      const tap = this.spectrumTaps.get(message.pluginId) ||
+        { pluginId: message.pluginId, route: true, enabled: false, mode: 'after' };
+      if (message.type === 'setSpectrumTapRoute') tap.route = message.enabled === true;
+      else {
+        tap.enabled = message.enabled === true;
+        if (tap.enabled) tap.mode = message.mode === 'compare' ? 'compare' : 'after';
+      }
+      this.spectrumTaps.set(tap.pluginId, tap);
+      this.synchronizeSpectrumTaps();
+      return this.spectrumRequests;
+    }
     if (message.type === 'resetPluginState') {
       return window.__effetuneHostCall('pipeline/resetPluginState', {
         pluginId: message.pluginId
@@ -424,6 +444,7 @@ class NativePort {
       });
     }
     if (message.type === 'updatePlugins') {
+      this.invalidateSpectrumFrames();
       const pipeline = this.owner.currentPipeline;
       const normalizedPlugins = (message.plugins || [])
         .map(plugin => normalizePlugin(plugin, this.owner));
@@ -445,6 +466,7 @@ class NativePort {
           window.uiManager?.setError?.('Some effects are unavailable and were bypassed.', false);
         }
         this.owner.synchronizeNativeAssetMembership();
+        this.synchronizeSpectrumTaps(true);
         this.owner.scheduleLatencyService();
         return result;
       }).catch(error => {
@@ -818,6 +840,62 @@ class NativePort {
     if (type === 'message') this.listeners.delete(listener);
   }
   start() {}
+  invalidateSpectrumFrames() {
+    if (this.spectrumTaps.size) ++this.spectrumRevision;
+  }
+
+  synchronizeSpectrumTaps(force = false) {
+    const current = this.owner.getCurrentPipeline?.() || [];
+    const all = [...(this.owner.pipelineA || []), ...(this.owner.pipelineB || [])];
+    for (const [id, tap] of this.spectrumTaps) {
+      const retained = all.some(plugin => plugin.id === id);
+      const enabled = retained && tap.route && tap.enabled && !this.spectrumClosed &&
+        !document.hidden && current.some(plugin => plugin.id === id);
+      const publication = `${enabled}:${tap.mode}`;
+      if (force || publication !== tap.publication) {
+        tap.publication = publication;
+        const revision = ++this.spectrumRevision;
+        const payload = { pluginId: id, enabled, mode: tap.mode };
+        // Preserve Off/After/Compare order even when bridge replies are delayed.
+        this.spectrumRequests = this.spectrumRequests.then(() =>
+          window.__effetuneHostCall('spectrum/setTap', payload)).then(result => {
+          if (result?.ok === false) throw new Error('Spectrum capture was not accepted');
+          this.spectrumPublishedRevision = revision;
+        }).catch(error => {
+          console.error('[EffeTune Mixwright] spectrum capture failed', error);
+          window.uiManager?.setError?.('The spectrum could not be updated. Turn it off and try again.', false);
+        });
+      }
+      if (!retained || !tap.route) this.spectrumTaps.delete(id);
+    }
+  }
+
+  dispatchSpectrumOverlays(frames, revision) {
+    if (document.hidden || this.spectrumClosed || revision !== this.spectrumRevision ||
+        revision !== this.spectrumPublishedRevision || !Array.isArray(frames)) return;
+    const current = this.owner.getCurrentPipeline?.() || [];
+    const decode = encoded => {
+      if (typeof encoded !== 'string') return null;
+      const binary = atob(encoded);
+      if (binary.length !== 4096 * Float32Array.BYTES_PER_ELEMENT) return null;
+      const bytes = Uint8Array.from(binary, character => character.charCodeAt(0));
+      return new Float32Array(bytes.buffer);
+    };
+    for (const frame of frames) {
+      const tap = this.spectrumTaps.get(frame.spectrumPluginId);
+      if (!tap?.route || !tap.enabled || tap.mode !== frame.mode ||
+          frame.quality !== 'normal' || !current.some(plugin => plugin.id === tap.pluginId) ||
+          !Number.isFinite(frame.sampleRate) || frame.sampleRate <= 0 ||
+          !Number.isInteger(frame.bufferPosition) || frame.bufferPosition < 0 || frame.bufferPosition >= 4096) continue;
+      try {
+        const outputBuffer = decode(frame.outputBuffer);
+        const inputBuffer = frame.mode === 'compare' ? decode(frame.inputBuffer) : undefined;
+        if (!outputBuffer || (frame.mode === 'compare' && !inputBuffer)) continue;
+        this.dispatch({ ...frame, type: 'spectrumOverlay', outputBuffer, inputBuffer });
+      } catch (_) { /* Discard an incomplete PCM frame; the next poll supplies a fresh one. */ }
+    }
+  }
+
   stopFrequencyPreview() {
     if (this.frequencyPreviewActive) {
       this.postMessage({ type: 'frequencyPreview', frequency: null });
@@ -827,6 +905,8 @@ class NativePort {
   // so it publishes before it releases the listeners that would have done it.
   close() {
     this.stopFrequencyPreview();
+    this.spectrumClosed = true;
+    this.synchronizeSpectrumTaps();
     void this.postMessage({ type: 'setVisualizerSources', sources: [] });
     // The port is the only route the close itself can leave through, and the
     // listeners that would have derived it are released just below, so a touch
@@ -917,11 +997,14 @@ export class AudioManager extends BrowserAudioManager {
         await window.__effetuneHostCall('telemetry/discard');
         return;
       }
+      const spectrumRevision = this.nativePort.spectrumPublishedRevision;
+      const runtimePipeline = [...this.getCurrentPipeline()];
       const result = await window.__effetuneHostCall(hidden ? 'host/getInfo' : 'telemetry/read');
       this.applyNativePerformanceStatus(result);
       this.applyHostAutomationDeltas(result.automationDeltas);
       this.applyHostDiagnostics(result.diagnostics);
       this.applyNativeBypass(result.masterBypass === true);
+      this.applyNativeRuntimeEvents(result.runtimeEvents, runtimePipeline);
       // The startup pipeline is restored after AudioManager construction. Rebuilding for a
       // context change before App initialization would publish the temporary empty pipeline.
       if (window.app?.initialized === true && result.contextGeneration &&
@@ -929,6 +1012,7 @@ export class AudioManager extends BrowserAudioManager {
         void this.synchronizeNativeContext(result);
       }
       if (hidden) return;
+      this.nativePort.dispatchSpectrumOverlays(result.spectrumOverlays, spectrumRevision);
       if (!result.packet || !result.bytes) return;
       const binary = atob(result.packet);
       const bytes = new Uint8Array(binary.length);
@@ -1030,6 +1114,19 @@ export class AudioManager extends BrowserAudioManager {
     }
   }
 
+  applyNativeRuntimeEvents(events, capturedPipeline) {
+    if (!Array.isArray(events)) return;
+    const current = this.getCurrentPipeline();
+    for (const data of events) {
+      if (data?.type !== 'tubeSimulatorCircuitFault') continue;
+      const plugin = current.find(candidate => candidate.id === data.pluginId);
+      // An old poll must not target an inactive A/B instance or a new JS
+      // plug-in reusing the same ID. The upstream validator owns epoch ordering.
+      if (!plugin || !capturedPipeline.includes(plugin)) continue;
+      this.handleWorkletMessage({ data }, this.nativeNode);
+    }
+  }
+
   applyNativeExecutionStates(states) {
     if (!Array.isArray(states)) return;
     this._resetDspExecutionStateSnapshot();
@@ -1110,6 +1207,7 @@ export class AudioManager extends BrowserAudioManager {
     // Undo/redo replaces both pipelines, so any coalesced image still waiting
     // for its frame has to reach the native side before the restore does.
     this.nativePort.flushPluginUpdates();
+    this.nativePort.invalidateSpectrumFrames();
     const pipelineA = this.serializePipeline(this.pipelineA);
     const pipelineB = this.pipelineB === null ? null : this.serializePipeline(this.pipelineB);
     // Undo and redo carry values the user explicitly asked for, so the targets
@@ -1151,6 +1249,7 @@ export class AudioManager extends BrowserAudioManager {
         window.uiManager?.setError?.('Some effects are unavailable and were bypassed.', false);
       }
       this.synchronizeNativeAssetMembership();
+      this.nativePort.synchronizeSpectrumTaps(true);
       this.scheduleLatencyService();
       return result;
     }).catch(error => {

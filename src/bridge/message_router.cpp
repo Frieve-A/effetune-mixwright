@@ -594,6 +594,18 @@ bool MessageRouter::decode(const std::string_view json, RoutedUiMessage &message
         }
         decoded.visualizerSources.push_back(std::move(source));
       }
+    } else if (type == "spectrum/setTap") {
+      const auto id = payload["pluginId"].getWithDefault<std::int64_t>(0);
+      const auto mode = payload["mode"].getWithDefault<std::string>("after");
+      if (!payload["pluginId"].isInt() || id <= 0 || id > 0xffffffffll ||
+          !payload["enabled"].isBool() || (mode != "after" && mode != "compare")) {
+        setError(error, "Invalid spectrum tap");
+        return false;
+      }
+      decoded.action = UiAction::setSpectrumTap;
+      decoded.pluginId = static_cast<std::uint32_t>(id);
+      decoded.spectrumMode = !payload["enabled"].getBool() ? SpectrumMode::off
+          : mode == "compare" ? SpectrumMode::compare : SpectrumMode::after;
     } else if (type == "telemetry/read") {
       decoded.action = UiAction::readTelemetry;
     } else if (type == "telemetry/discard") {

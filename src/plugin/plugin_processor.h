@@ -355,6 +355,7 @@ private:
   void appendAutomationDeltas(choc::value::Value &result);
   void appendActiveAutomationSnapshot(choc::value::Value &result);
   void appendExecutionStates(choc::value::Value &result);
+  void appendCircuitFaults(choc::value::Value &result);
   void appendDeferredDiagnostics(choc::value::Value &result);
   void recordProcessTransactionFailure(ProcessTransactionError error) noexcept;
   // Refreshing the compensation plan or the reported latency is recurring

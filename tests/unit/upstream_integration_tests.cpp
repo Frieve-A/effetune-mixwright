@@ -5,10 +5,12 @@
 #include "engine/frequency_preview.h"
 #include "BassManagementPluginParams.h"
 #include "OscilloscopePluginParams.h"
-#include "PhaseSelectEQPluginParams.h"
+#include "PhaseSelectEqPluginParams.h"
 #include "AnalogMeterPluginParams.h"
 #include "RhythmAnalyzerPluginParams.h"
 #include "TonalBalanceEQPluginParams.h"
+#include "FiveBandPEQPluginParams.h"
+#include "TubeSimulatorPluginParams.h"
 #include "allocation_guard.h"
 #include <choc/memory/choc_Base64.h>
 
@@ -21,6 +23,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <stdexcept>
 #include <thread>
 #include <unordered_set>
@@ -360,6 +363,191 @@ void testInstanceResetAndPreviewMeasurementGate() {
   expect(!preview.mix(channels, 2, 1024, 48000), "following clean block reopens gate");
 }
 
+void testSpectrumCapture() {
+  auto engine = std::make_unique<EngineHost>();
+  std::string error;
+  expect(engine->prepare(48000, 8, 257, EngineHost::kDefaultTelemetryBytes, &error), "prepare spectrum capture");
+  const auto gainHash = engine->kernels().at("TestGainPlugin").paramsHash;
+  const auto gain = [&](std::uint32_t id, float value) {
+    RuntimePlugin runtime;
+    runtime.logicalId = id;
+    runtime.type = "TestGainPlugin";
+    runtime.paramsHash = gainHash;
+    runtime.packedParameters = {value};
+    return runtime;
+  };
+  PipelineState pipeline;
+  pipeline.plugins = {PluginState{1, "Gain", true}, PluginState{2, "Gain", true},
+                      PluginState{3, "Gain", true}};
+  pipeline.plugins[0].channel = "A";
+  pipeline.plugins[1].outputBus = 4;
+  pipeline.plugins[1].channel = "34";
+  pipeline.plugins[2].inputBus = 4;
+  pipeline.plugins[2].channel = "A";
+  expect(engine->rebuild(pipeline, {gain(1, 2), gain(2, 3), gain(3, 4)}, &error), "build routed spectrum fixture");
+  auto &capture = engine->spectrumCapture();
+  expect(capture.setTap(1, SpectrumMode::compare) && capture.setTap(2, SpectrumMode::compare) &&
+         capture.setTap(3, SpectrumMode::after), "subscribe multiple node spectra");
+  std::array<std::array<float, 257>, 8> audio{};
+  std::array<float *, 8> channels{};
+  for (std::size_t channel = 0; channel < channels.size(); ++channel) channels[channel] = audio[channel].data();
+  std::uint64_t clock = 0;
+  const auto render = [&](bool bypass = false) {
+    const auto frames = clock % 2 ? 127u : 257u;
+    for (std::size_t channel = 0; channel < channels.size(); ++channel)
+      audio[channel].fill(static_cast<float>(channel + 1));
+    bool success;
+    { effetune::allocation_guard::Scope guard;
+      success = engine->tryProcessBlock(channels.data(), 8, frames, 0, bypass); }
+    expect(success, "spectrum capture preserves allocation-free variable block processing");
+    clock += frames;
+  };
+  for (int block = 0; block < 32; ++block) render();
+  std::uint32_t dropped = 0;
+  auto frames = capture.read(dropped);
+  expect(frames.size() == 3 && dropped == 0, "all selected nodes produce normal spectra");
+  for (const auto &frame : frames) {
+    const auto index = (frame.bufferPosition + SpectrumFrame::kSamples - 1) % SpectrumFrame::kSamples;
+    if (frame.pluginId == 1) expect(frame.input[index] == 4.5f && frame.output[index] == 9,
+                                  "all-channel tap observes its own effect, not the final output");
+    if (frame.pluginId == 2) expect(frame.input[index] == 7 && frame.output[index] == 21,
+                                  "selected channel pair tap observes the send before destination mixing");
+    if (frame.pluginId == 3) expect(frame.output[index] == 21,
+                                  "return tap observes the routed bus before merging main output");
+  }
+  expect(audio[2][0] == 78 && audio[0][0] == 2 && engine->pipelineLatency() == 0,
+         "capture does not alter audio, buses or latency");
+  render();
+  expect(capture.setTap(1, SpectrumMode::off) && capture.setTap(2, SpectrumMode::off) &&
+         capture.setTap(3, SpectrumMode::off), "disable spectra");
+  expect(capture.read(dropped).empty(), "disabled taps discard queued old frames");
+
+  RuntimePlugin delay;
+  delay.logicalId = 5;
+  delay.type = "TestDelayPlugin";
+  delay.paramsHash = engine->kernels().at(delay.type).paramsHash;
+  pipeline.plugins = {PluginState{5, "Delay", true}};
+  expect(engine->rebuild(pipeline, {delay}, &error), "build intrinsic latency fixture");
+  expect(capture.setTap(5, SpectrumMode::compare), "compare delayed effect");
+  for (int block = 0; block < 32; ++block) render();
+  frames = capture.read(dropped);
+  expect(frames.size() == 1 && frames[0].input == frames[0].output && engine->pipelineLatency() == 192,
+         "Compare aligns input by intrinsic effect latency without adding host latency");
+  render();
+  render(true);
+  expect(capture.read(dropped).empty(), "master bypass invalidates queued spectra");
+  for (int block = 0; block < 32; ++block) render();
+  expect(!capture.read(dropped).empty(), "spectra resume after bypass");
+  render();
+  engine->reset();
+  expect(capture.read(dropped).empty(), "reset clears previous timeline spectra");
+  for (int block = 0; block < 32; ++block) render();
+  pipeline.plugins[0].enabled = false;
+  expect(engine->updateDescriptor(pipeline, &error), "disable node descriptor");
+  expect(capture.read(dropped).empty(), "descriptor changes invalidate old spectra");
+  for (int block = 0; block < 32; ++block) render();
+  expect(capture.read(dropped).empty(), "disabled nodes are not captured");
+  pipeline.plugins[0].enabled = true;
+  pipeline.plugins.insert(pipeline.plugins.begin(), PluginState{9, "Section", false});
+  expect(engine->updateDescriptor(pipeline, &error), "disable containing section");
+  for (int block = 0; block < 32; ++block) render();
+  expect(capture.read(dropped).empty(), "disabled sections are not captured");
+
+  using Params = effetune::generated::FiveBandPEQPluginParams;
+  Params params{};
+  std::fill_n(params.frequency, 5, 1000.0f);
+  std::fill_n(params.q, 5, 1.0f);
+  RuntimePlugin equalizer;
+  equalizer.logicalId = 7;
+  equalizer.type = "FiveBandPEQPlugin";
+  equalizer.paramsHash = Params::kHash;
+  const auto *packed = reinterpret_cast<const float *>(&params);
+  equalizer.packedParameters.assign(packed, packed + Params::kFloatCount);
+  pipeline.plugins = {PluginState{7, "5 Band PEQ", true}};
+  expect(engine->rebuild(pipeline, {equalizer}, &error), "build real 5 Band PEQ");
+  capture.stopCapture();
+  expect(capture.setTap(7, SpectrumMode::compare), "enable real EQ spectrum");
+  for (int block = 0; block < 32; ++block) render();
+  frames = capture.read(dropped);
+  expect(frames.size() == 1 && frames[0].pluginId == 7 && frames[0].input == frames[0].output,
+         "normal spectrum and Compare work for actual FiveBandPEQ");
+  for (int block = 0; block < 2200; ++block) render();
+  expect(capture.read(dropped).empty() && dropped > 0, "queue saturation is bounded, observable and drops stale display data");
+  for (int block = 0; block < 32; ++block) render();
+  expect(!capture.read(dropped).empty() && dropped == 0, "capture recovers after display backpressure");
+  capture.stopCapture();
+  for (int block = 0; block < 32; ++block) render();
+  expect(capture.read(dropped).empty(), "editor closure stops capture");
+}
+
+void testCircuitFaultPublication() {
+  auto engine = std::make_unique<EngineHost>();
+  std::string error;
+  expect(engine->prepare(48000, 2, 128, EngineHost::kDefaultTelemetryBytes, &error), "prepare Tube fault publication");
+  RuntimePlugin tube;
+  tube.logicalId = 17;
+  tube.type = "TubeSimulatorPlugin";
+  tube.paramsHash = effetune::generated::TubeSimulatorPluginParams::kHash;
+  tube.packedParameters = {-30, 2, 0, 250, 10, 10, 39, 100, 2.828f, 0, 0, 0,
+                           320, 270, 0, 2, 1, 8, 0, 1, 0, 400, 1000, 1};
+  PipelineState pipeline;
+  pipeline.plugins = {PluginState{17, "Tube Simulator", true}};
+  expect(engine->rebuild(pipeline, {tube}, &error), "build actual Tube fault fixture");
+  auto events = engine->circuitFaults();
+  expect(events.size() == 1 && events[0].pluginId == 17 && !events[0].latched && events[0].cause == 0,
+         "new Tube instance publishes clear initial state before audio starts");
+  const auto firstEpoch = events[0].instanceEpoch;
+  std::array<float, 128> left{}, right{};
+  float *channels[]{left.data(), right.data()};
+  const auto render = [&] {
+    bool succeeded;
+    { effetune::allocation_guard::Scope guard;
+      succeeded = engine->tryProcessBlock(channels, 2, 128, 0, false); }
+    expect(succeeded, "Tube runtime state publication remains allocation-free");
+  };
+  render();
+  // This is the production safety-fault trigger used by the upstream native
+  // fixture, not an injected host projection or a replacement test kernel.
+  left.fill(std::numeric_limits<float>::max());
+  right.fill(std::numeric_limits<float>::max());
+  render();
+  left.fill(0);
+  right.fill(0);
+  left[0] = std::numeric_limits<float>::quiet_NaN();
+  render();
+  events = engine->circuitFaults();
+  expect(events.size() == 1 && events[0].latched && events[0].cause == 2 && events[0].generation > 0 &&
+         events[0].instanceEpoch == firstEpoch, "actual circuit safety latch reaches the control snapshot");
+  const auto faultGeneration = events[0].generation;
+  expect(engine->circuitFaults()[0].generation == faultGeneration,
+         "repeated polls retain generation for renderer deduplication");
+  engine->reset();
+  expect(engine->circuitFaults()[0].latched, "host reset preserves the kernel's latched safety fault");
+  expect(engine->rebuild(pipeline, {tube}, &error), "recreate the Tube circuit");
+  events = engine->circuitFaults();
+  expect(events.size() == 1 && events[0].instanceEpoch > firstEpoch && !events[0].latched && events[0].generation == 0,
+         "recreation clears the latch with a new incarnation despite generation returning to zero");
+  PipelineState empty;
+  expect(engine->updateDescriptor(empty, &error), "remove Tube from the active descriptor");
+  expect(engine->circuitFaults().empty(), "retained inactive instances cannot publish stale circuit faults");
+  expect(engine->rebuild(empty, {}, &error), "rebuild empty active pipeline");
+  expect(engine->circuitFaults().empty(), "A/B replacement removes old runtime-event identities");
+}
+
+void testSpectrumRouter() {
+  RoutedUiMessage message;
+  std::string error;
+  expect(MessageRouter::decode(R"({"type":"spectrum/setTap","payload":{"pluginId":7,"enabled":true,"mode":"compare"}})", message, &error) &&
+         message.action == UiAction::setSpectrumTap && message.pluginId == 7 && message.spectrumMode == SpectrumMode::compare,
+         "route a Compare subscription");
+  for (const auto *request : {
+      R"({"type":"spectrum/setTap","payload":{"pluginId":0,"enabled":true}})",
+      R"({"type":"spectrum/setTap","payload":{"pluginId":1.5,"enabled":true}})",
+      R"({"type":"spectrum/setTap","payload":{"pluginId":7,"enabled":"yes"}})",
+      R"({"type":"spectrum/setTap","payload":{"pluginId":7,"enabled":true,"mode":"hq"}})"})
+    expect(!MessageRouter::decode(request, message, &error), "reject malformed spectrum subscription");
+}
+
 void testBackupExport() {
   const auto directory = std::filesystem::temp_directory_path() /
       ("effetune-backup-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
@@ -396,6 +584,9 @@ int main() {
     testOutputAnalyzers();
     testOutputAnalyzerClockFollowsConsumedAudio();
     testInstanceResetAndPreviewMeasurementGate();
+    testSpectrumCapture();
+    testSpectrumRouter();
+    testCircuitFaultPublication();
     testBackupExport();
     std::cout << "Upstream integration tests passed\n";
   } catch (const std::exception &error) {

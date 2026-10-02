@@ -3,6 +3,8 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
 import vm from 'node:vm';
+import { createOverlayHarness } from '../../external/effetune/tests/helpers/spectrum-overlay-harness.mjs';
+import { installThemePaletteStub } from '../../external/effetune/tests/helpers/theme-palette-stub.mjs';
 import { fileURLToPath } from 'node:url';
 
 import * as irContract from '../../external/effetune/js/ir-library/ir-plugin-contract.js';
@@ -103,6 +105,7 @@ function createNativePort() {
   const hostCalls = [];
   const context = {
     ArrayBuffer,
+    atob,
     btoa,
     clearTimeout,
     console,
@@ -149,6 +152,132 @@ function createNativePort() {
   context.window.workletNode = node;
   return { context, hostCalls, node, port };
 }
+
+function spectrumFrame(mode = 'after', id = 7) {
+  const encode = level => Buffer.from(new Float32Array(4096).fill(level).buffer).toString('base64');
+  return { type: 'spectrumOverlay', spectrumPluginId: id, mode, quality: 'normal',
+    outputBuffer: encode(.5), ...(mode === 'compare' ? { inputBuffer: encode(1) } : {}),
+    bufferPosition: 0, sampleRate: 48000 };
+}
+
+function installSpectrumPolling({ context, port }) {
+  const start = source.indexOf('  async pollNativeTelemetryOnce()');
+  const end = source.indexOf('\n  async initAudio()', start);
+  vm.runInNewContext(`this.poll = (class { ${source.slice(start, end)} }).prototype.pollNativeTelemetryOnce;`, context);
+  Object.assign(port.owner, { nativePort: port, applyNativePerformanceStatus() {},
+    applyNativeRuntimeEvents() {},
+    applyHostDiagnostics() {}, applyNativeBypass() {}, telemetryWasHidden: false,
+    telemetryHub: { handleMessage() { assert.fail('empty DSP packets must not enter TelemetryHub'); } } });
+  return () => context.poll.call(port.owner);
+}
+
+test('real upstream spectrum button renders native After and Compare PCM with no DSP packet', async () => {
+  const fixture = createNativePort();
+  const { context, port, node, hostCalls } = fixture;
+  const poll = installSpectrumPolling(fixture);
+  const h = createOverlayHarness();
+  installThemePaletteStub(h.window);
+  h.window.workletNode = node;
+  h.window.audioManager = port.owner;
+  port.owner.pipelineA = [h.plugin];
+  const { instance } = h.attach();
+  const hostCall = context.window.__effetuneHostCall;
+  let mode = 'after';
+  context.window.__effetuneHostCall = (type, payload) => type === 'telemetry/read'
+    ? Promise.resolve({ bytes: 0, spectrumOverlays: [spectrumFrame(mode)] }) : hostCall(type, payload);
+  assert.equal(instance.mode, 'off');
+  instance.button.listeners.get('click')();
+  await port.spectrumRequests;
+  assert.equal(hostCalls.at(-1).payload.enabled, true);
+  assert.equal(hostCalls.at(-1).payload.mode, 'after');
+  await poll();
+  h.frame();
+  assert.ok(instance.levels[0] < -6 && instance.levels[0] > -6.03);
+  assert.equal(instance.inputLevels, null);
+  assert.equal(instance.canvas.strokeStyles.at(-1), 'stub:graph-overlay-after');
+  instance.button.listeners.get('click')();
+  mode = 'compare';
+  await port.spectrumRequests;
+  await poll();
+  h.frame();
+  assert.ok(instance.inputLevels[0] > -.01);
+  assert.ok(instance.levels[0] < -6 && instance.levels[0] > -6.03);
+  assert.equal(instance.canvas.strokeStyles.at(-1), 'stub:graph-overlay-compare');
+  instance.button.listeners.get('click')();
+  await port.spectrumRequests;
+  assert.equal(hostCalls.at(-1).payload.enabled, false);
+  assert.equal(instance.mode, 'off');
+  assert.equal(instance.canvas, null);
+  assert.equal(port.spectrumTaps.size, 0);
+  instance.dispose();
+  port.close();
+});
+
+test('spectrum suspension, A/B membership and removal never deliver stale or misrouted PCM', async () => {
+  const fixture = createNativePort();
+  const { context, port, hostCalls } = fixture;
+  const poll = installSpectrumPolling(fixture);
+  port.owner.pipelineA = [{ id: 7 }];
+  port.owner.pipelineB = [{ id: 8 }];
+  const received = [];
+  port.addEventListener('message', event => received.push(event.data));
+  await port.postMessage({ type: 'setSpectrumTap', pluginId: 7, enabled: true, mode: 'compare' });
+  const generation = port.spectrumRevision;
+  context.document.hidden = true;
+  context.document.dispatch('visibilitychange');
+  await port.spectrumRequests;
+  assert.equal(hostCalls.filter(call => call.type === 'spectrum/setTap').at(-1).payload.enabled, false);
+  port.dispatchSpectrumOverlays([spectrumFrame('compare')], generation);
+  assert.equal(received.length, 0);
+  context.document.hidden = false;
+  context.document.dispatch('visibilitychange');
+  await port.spectrumRequests;
+  assert.equal(hostCalls.at(-1).payload.enabled, true);
+  port.owner.currentPipeline = 'B';
+  port.synchronizeSpectrumTaps();
+  await port.spectrumRequests;
+  port.dispatchSpectrumOverlays([spectrumFrame('compare')], port.spectrumRevision);
+  assert.equal(received.length, 0);
+  assert.equal(hostCalls.at(-1).payload.enabled, false);
+  port.owner.currentPipeline = 'A';
+  port.synchronizeSpectrumTaps();
+  await port.spectrumRequests;
+  const hostCall = context.window.__effetuneHostCall;
+  let finishPoll;
+  context.window.__effetuneHostCall = (type, payload) => type === 'telemetry/read'
+    ? new Promise(resolve => { finishPoll = resolve; }) : hostCall(type, payload);
+  const pendingPoll = poll();
+  await port.postMessage({ type: 'setSpectrumTap', pluginId: 7, enabled: false });
+  await port.postMessage({ type: 'setSpectrumTap', pluginId: 7, enabled: true, mode: 'compare' });
+  finishPoll({ bytes: 0, spectrumOverlays: [spectrumFrame('compare')] });
+  await pendingPoll;
+  assert.equal(received.length, 0, 'an old poll cannot reappear after Off then Compare');
+  let finishEnable;
+  context.window.__effetuneHostCall = (type, payload) => {
+    if (type === 'spectrum/setTap') return new Promise(resolve => { finishEnable = resolve; });
+    if (type === 'telemetry/read') return new Promise(resolve => { finishPoll = resolve; });
+    return hostCall(type, payload);
+  };
+  port.synchronizeSpectrumTaps(true);
+  const duringConfiguration = poll();
+  await Promise.resolve();
+  finishEnable({ ok: true });
+  await port.spectrumRequests;
+  finishPoll({ bytes: 0, spectrumOverlays: [spectrumFrame('compare')] });
+  await duringConfiguration;
+  assert.equal(received.length, 0, 'polls issued before tap acknowledgement cannot become fresh when the reply arrives');
+  context.window.__effetuneHostCall = hostCall;
+  port.dispatchSpectrumOverlays([spectrumFrame('after'), spectrumFrame('compare', 8),
+    { ...spectrumFrame('compare'), outputBuffer: 'bad' }, spectrumFrame('compare')], port.spectrumRevision);
+  assert.equal(received.length, 1);
+  assert.ok(received[0].inputBuffer instanceof Float32Array);
+  port.owner.pipelineA = [];
+  port.synchronizeSpectrumTaps(true);
+  await port.spectrumRequests;
+  assert.equal(port.spectrumTaps.size, 0);
+  assert.equal(hostCalls.at(-1).payload.enabled, false);
+  port.close();
+});
 
 test('an explicit plugin reset flushes its pending parameter edit before native reset', async () => {
   const { port, hostCalls } = createNativePort();
@@ -449,6 +578,90 @@ test('native execution states use the upstream validated worklet route', () => {
       nativeNode: true
     }
   ]);
+});
+
+test('native Tube fault snapshots use the real upstream validator and HUD across recovery and editor lifecycle', async () => {
+  const upstreamAudio = await readFile(path.join(projectRoot, 'external/effetune/js/audio-manager.js'), 'utf8');
+  const tubeSource = await readFile(path.join(projectRoot, 'external/effetune/plugins/saturation/tube_simulator.js'), 'utf8');
+  const dispatcher = upstreamAudio.slice(upstreamAudio.indexOf('    handleWorkletMessage('),
+    upstreamAudio.indexOf('    updateExposedProperties()', upstreamAudio.indexOf('    handleWorkletMessage(')));
+  const receiver = tubeSource.slice(tubeSource.indexOf('    onMessage(message)'),
+    tubeSource.indexOf('    _hudViewAvailable(', tubeSource.indexOf('    onMessage(message)')));
+  const hud = tubeSource.slice(tubeSource.indexOf('    _hudStatusText()'), tubeSource.indexOf('    _safetyReductionDb()'));
+  const adapter = source.slice(source.indexOf('  applyNativeRuntimeEvents('), source.indexOf('  applyNativeExecutionStates('));
+  const create = () => {
+    const fixture = createNativePort();
+    const poll = installSpectrumPolling(fixture);
+    const { context, node, port } = fixture;
+    vm.runInNewContext(`this.RuntimeManager = class { ${adapter}\n${dispatcher} };\n` +
+      `this.TubeSimulatorPlugin = class TubeSimulatorPlugin { ${receiver}\n${hud} };`, context);
+    const plugin = new context.TubeSimulatorPlugin();
+    Object.assign(plugin, { id: 7, enabled: true, _sectionEnabled: true, _powerUiEnabled: true,
+      executionStateReceived: true, executionState: { state: 'active' }, hudView: 'driver',
+      circuitFault: { latched: false, cause: 'none' }, ensureDspTelemetrySubscription() {},
+      _safetyReductionDb() { return 0; }, _refreshHudState() { this.hudText = this._hudStatusText(); } });
+    const events = [];
+    Object.assign(port.owner, { nativeNode: node, pipelineA: [plugin], pipelineB: [],
+      _tubeRuntimeEventsByNode: new WeakMap(), _getPrimaryWorkletNode: () => node,
+      _isActiveDspWorklet: candidate => candidate === node,
+      handleWorkletMessage: context.RuntimeManager.prototype.handleWorkletMessage,
+      applyNativeRuntimeEvents: context.RuntimeManager.prototype.applyNativeRuntimeEvents,
+      dispatchEvent: (type, data) => events.push({ type, data }) });
+    return { ...fixture, poll, plugin, events };
+  };
+  const snapshot = (instanceEpoch, generation, latched = false, cause = 'none') => ({
+    type: 'tubeSimulatorCircuitFault', pluginId: 7, pluginType: 'TubeSimulatorPlugin',
+    instanceEpoch, generation, latched, cause
+  });
+  const first = create();
+  let current = snapshot(1, 0);
+  first.context.window.__effetuneHostCall = async () => ({ bytes: 0, runtimeEvents: [current] });
+  await first.poll();
+  assert.match(first.plugin.hudText, /is active/);
+  current = snapshot(1, 1, true, 'feedbackOscillation');
+  await first.poll();
+  assert.match(first.plugin.hudText, /feedback oscillation.*bypassed/);
+  assert.equal(first.events.at(-1).data.validated, true);
+  await first.poll();
+  assert.equal(first.events.length, 2, 'complete snapshot duplicates do not redraw the HUD');
+  const reopened = create();
+  reopened.context.window.__effetuneHostCall = async () => ({ bytes: 0, runtimeEvents: [current] });
+  await reopened.poll();
+  assert.equal(reopened.plugin.circuitFault.latched, true, 'a reopened editor receives an already latched fault');
+  current = snapshot(2, 0);
+  first.context.document.hidden = true;
+  first.port.owner.lastHiddenContextPoll = 0;
+  await first.poll();
+  assert.equal(first.plugin.circuitFault.latched, false, 'host/getInfo snapshots clear a recreated circuit while hidden');
+  assert.match(first.plugin.hudText, /is active/);
+  first.context.document.hidden = false;
+  first.port.owner.telemetryWasHidden = false;
+  current = snapshot(1, 99, true, 'processingSafetyFailure');
+  await first.poll();
+  assert.equal(first.plugin.circuitFault.latched, false, 'a prior native epoch cannot relatch the current circuit');
+  current = snapshot(2, 1, true, 'processingSafetyFailure');
+  await first.poll();
+  assert.match(first.plugin.hudText, /could not be processed safely/);
+  let finish;
+  first.context.window.__effetuneHostCall = () => new Promise(resolve => { finish = resolve; });
+  const pending = first.poll();
+  first.port.owner.currentPipeline = 'B';
+  finish({ bytes: 0, runtimeEvents: [snapshot(2, 2)] });
+  await pending;
+  assert.equal(first.plugin.circuitFault.latched, true, 'a late A response does not update inactive A');
+  first.port.owner.currentPipeline = 'A';
+  const reusedId = new first.context.TubeSimulatorPlugin();
+  Object.assign(reusedId, first.plugin, { circuitFault: { latched: false, cause: 'none' } });
+  const replacing = first.poll();
+  first.port.owner.pipelineA = [reusedId];
+  finish({ bytes: 0, runtimeEvents: [snapshot(2, 3, true, 'processingSafetyFailure')] });
+  await replacing;
+  assert.equal(reusedId.circuitFault.latched, false, 'a stale poll cannot target a replacement JS object with the same ID');
+  first.context.window.__effetuneHostCall = async () => ({ bytes: 0, runtimeEvents: [snapshot(3, 0)] });
+  await first.poll();
+  assert.match(reusedId.hudText, /is active/);
+  first.port.close();
+  reopened.port.close();
 });
 
 test('startup rebuilds a pending state replacement but preserves an ordinary ready DSP',
@@ -2810,6 +3023,8 @@ test('successful history restore applies its native authoritative snapshot', asy
     currentPipeline: 'A',
     nativePort: {
       flushPluginUpdates: () => applied.push('flush'),
+      invalidateSpectrumFrames() {},
+      synchronizeSpectrumTaps() {},
       collectAutomationEdits: () => []
     },
     serializePipeline: pipeline => pipeline,

@@ -3,6 +3,7 @@
 #include "effetune/abi.h"
 #include "engine/command_queue.h"
 #include "engine/pipeline_model.h"
+#include "engine/spectrum_capture.h"
 
 #include <array>
 #include <atomic>
@@ -86,6 +87,15 @@ public:
     std::uint64_t sequence = 0;
     ProcessError error = ProcessError::none;
   };
+
+  struct CircuitFaultSnapshot {
+    std::uint32_t pluginId = 0;
+    std::uint32_t instanceEpoch = 0;
+    std::uint32_t generation = 0;
+    bool latched = false;
+    std::uint32_t cause = 0;
+  };
+  [[nodiscard]] std::vector<CircuitFaultSnapshot> circuitFaults() const;
 
   struct ResolvedParameterTarget {
     std::uint32_t logicalId = 0;
@@ -206,6 +216,7 @@ public:
   [[nodiscard]] std::uint32_t readTelemetry(std::span<std::uint8_t> destination,
                                             std::uint32_t &droppedFrames) noexcept;
   void discardTelemetry() noexcept;
+  [[nodiscard]] SpectrumCapture &spectrumCapture() noexcept { return spectrumCapture_; }
   [[nodiscard]] std::uint64_t latencyRevision() const noexcept {
     return latencyRevision_.load(std::memory_order_acquire);
   }
@@ -219,6 +230,10 @@ public:
 
 private:
   friend class plugin::PluginProcessorTestAccess;
+  struct CircuitFaultProjection {
+    std::uint32_t instanceEpoch = 0;
+    std::atomic<std::uint64_t> state{0};
+  };
   struct InstanceEntry {
     et_instance instance = 0;
     std::uint32_t paramsHash = 0;
@@ -226,6 +241,7 @@ private:
     bool contextuallyBypassed = false;
     // Allocated only at rebuild for kernels with a host-owned measurement gate.
     std::vector<float> measurementParameters;
+    std::unique_ptr<CircuitFaultProjection> circuitFault;
   };
 
   void discoverKernels();
@@ -252,6 +268,7 @@ private:
   [[nodiscard]] bool refreshLatencyUnlocked(
       bool *instanceLatencyChanged = nullptr) noexcept;
   void drainTelemetryUnlocked() noexcept;
+  void refreshCircuitFaultsUnlocked() noexcept;
   void recordProcessFailure(ProcessError error) noexcept;
   static void setError(std::string *destination, std::string message);
 
@@ -279,6 +296,9 @@ private:
         static_cast<std::uint32_t>(ET_ASSET_STATE_NONE)};
   };
   std::unordered_map<std::uint32_t, InstanceEntry> instances_;
+  std::uint32_t nextCircuitFaultEpoch_ = 0;
+  std::unordered_map<et_instance, std::uint32_t> spectrumInstanceIds_;
+  SpectrumCapture spectrumCapture_;
   std::unordered_map<std::uint64_t, AssetEntry> assets_;
   bool assetPreparationLatencyPolling_ = false;
   struct TelemetryStorage;

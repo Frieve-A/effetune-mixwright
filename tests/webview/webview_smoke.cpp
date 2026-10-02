@@ -1,10 +1,14 @@
 #include "bridge/webview_host.h"
 #include "plugin/editor_size.h"
+#include "choc/memory/choc_Base64.h"
+#include "choc/text/choc_JSON.h"
 
 #include <Windows.h>
 #include <TlHelp32.h>
 
 #include <atomic>
+#include <array>
+#include <cmath>
 #include <chrono>
 #include <exception>
 #include <filesystem>
@@ -372,9 +376,19 @@ struct SmokeState {
   std::atomic_uint32_t channels{2};
   std::atomic_bool lastMasterBypass{false};
   std::atomic_bool pipelineStateRead{false};
+  std::atomic_uint32_t spectrumPluginId{0};
+  std::atomic_uint32_t spectrumMode{0};
 };
 
 [[nodiscard]] std::string responseFor(const std::string_view request, SmokeState &state) {
+  if (request.find("spectrum/setTap") != std::string_view::npos) {
+    const auto message = choc::json::parse(request);
+    const auto payload = message["payload"];
+    state.spectrumPluginId.store(static_cast<std::uint32_t>(payload["pluginId"].getWithDefault<std::int64_t>(0)));
+    state.spectrumMode.store(payload["enabled"].getWithDefault<bool>(false)
+        ? (payload["mode"].getWithDefault<std::string>({}) == "compare" ? 2u : 1u) : 0u);
+    return R"({"ok":true})";
+  }
   if (request.find("host/getInfo") != std::string_view::npos) {
     state.hostInfoCalls.fetch_add(1, std::memory_order_relaxed);
     return "{\"ok\":true,\"sampleRate\":48000,\"engineSampleRate\":" +
@@ -408,6 +422,21 @@ struct SmokeState {
   }
   if (request.find("telemetry/read") != std::string_view::npos) {
     state.telemetryCalls.fetch_add(1, std::memory_order_relaxed);
+    std::string spectra = ",\"spectrumOverlays\":[]";
+    const auto mode = state.spectrumMode.load();
+    if (mode != 0) {
+      const auto encode = [](const float amplitude) {
+        std::array<float, 4096> samples{};
+        for (std::size_t index = 0; index < samples.size(); ++index)
+          samples[index] = amplitude * static_cast<float>(std::sin(6.283185307179586 * 1000.0 * static_cast<double>(index) / 48000.0));
+        return choc::base64::encodeToString(samples.data(), sizeof(samples));
+      };
+      spectra = ",\"spectrumOverlays\":[{\"type\":\"spectrumOverlay\",\"spectrumPluginId\":" +
+          std::to_string(state.spectrumPluginId.load()) + ",\"mode\":\"" + (mode == 2 ? "compare" : "after") +
+          "\",\"quality\":\"normal\",\"outputBuffer\":\"" + encode(.25f) + "\"," +
+          (mode == 2 ? "\"inputBuffer\":\"" + encode(.5f) + "\"," : "") +
+          "\"bufferPosition\":0,\"sampleRate\":48000}]";
+    }
     return "{\"ok\":true,\"bytes\":16,\"droppedFrames\":0,"
            "\"packet\":\"AQABAJIQAAABAAAAAAAAAA==\",\"masterBypass\":false,"
            "\"contextGeneration\":" +
@@ -416,8 +445,7 @@ struct SmokeState {
            std::to_string(state.engineSampleRate.load(std::memory_order_relaxed)) +
            ",\"channels\":" + std::to_string(state.channels.load(std::memory_order_relaxed)) +
            ",\"latencySamples\":128,\"processingLatencySamples\":384,"
-           "\"latencyCompensated\":false,\"pipelineCpuAverage\":12.5"
-           "}";
+           "\"latencyCompensated\":false,\"pipelineCpuAverage\":12.5" + spectra + "}";
   }
   if (request.find("telemetry/discard") != std::string_view::npos) {
     state.telemetryDiscardCalls.fetch_add(1, std::memory_order_relaxed);
@@ -719,6 +747,8 @@ int main(const int argc, char **argv) {
   std::string evaluationResult;
   std::string readinessDiagnostics;
   bool telemetryDelivered = false;
+  bool spectrumOverlayRendered = false;
+  std::string spectrumOverlayDiagnostics;
   bool amRadioHudDisplayed = false;
   std::string amRadioHudDiagnostics;
   bool dynamicLatencyServiced = false;
@@ -1183,6 +1213,72 @@ int main(const int argc, char **argv) {
               "effectsPressed:document.getElementById('effectPipelineButton')?.getAttribute('aria-pressed')})",
               visualizerNavigationDiagnostics);
         }
+
+        const auto spectrumFixtureStarted = evaluate(
+            R"JS((() => {
+              window.__vstSpectrumReady = false;
+              window.__vstSpectrumError = '';
+              void (async () => {
+                const audio = window.audioManager;
+                const manager = window.uiManager.pipelineManager;
+                const plugin = window.pluginManager.createPlugin('Band Pass Filter');
+                if (!plugin) throw new Error('spectrum fixture plug-in unavailable');
+                window.__vstSpectrumPlugin = plugin;
+                audio.getCurrentPipeline().push(plugin);
+                manager.expandedPlugins.add(plugin);
+                await audio.rebuildPipeline();
+                const original = window.SpectrumOverlay.attach;
+                try {
+                  window.SpectrumOverlay.attach = function(target, ui) {
+                    const instance = original.call(this, target, ui);
+                    if (target.id === plugin.id) window.__vstSpectrumInstance = instance;
+                    return instance;
+                  };
+                  manager.updatePipelineUI(true);
+                } finally { window.SpectrumOverlay.attach = original; }
+                const instance = window.__vstSpectrumInstance;
+                if (!instance || instance.mode !== 'off') throw new Error('initial spectrum mode');
+                instance.button.scrollIntoView({ block: 'center' });
+                window.__vstSpectrumReady = true;
+              })().catch(error => { window.__vstSpectrumError = String(error); });
+              return true;
+            })())JS", ignored) && ignored == "true";
+        const auto spectrumReady = spectrumFixtureStarted && waitForJavascript(
+            "window.__vstSpectrumReady === true", kCompletionTimeout);
+        const auto afterClicked = spectrumReady && evaluate(
+            "(() => { window.__vstSpectrumInstance.button.click(); return true; })()", ignored);
+        const auto afterRendered = afterClicked && waitForJavascript(
+            "(() => { const s = window.__vstSpectrumInstance; return s?.mode === 'after' && "
+            "s.active && s.canvas?.width > 0 && s.levels && Math.max(...s.levels) > -30 && "
+            "s.inputLevels === null && s.canvas.getContext('2d').getImageData(0, 0, "
+            "s.canvas.width, s.canvas.height).data.some(value => value !== 0); })()", kCompletionTimeout);
+        const auto compareClicked = afterRendered && evaluate(
+            "(() => { window.__vstSpectrumInstance.button.click(); return true; })()", ignored);
+        const auto compareRendered = compareClicked && waitForJavascript(
+            "(() => { const s = window.__vstSpectrumInstance; if (s?.mode !== 'compare' || "
+            "!s.inputLevels || !s.levels) return false; const difference = "
+            "Math.max(...s.inputLevels) - Math.max(...s.levels); return difference > 5.9 && "
+            "difference < 6.2 && s.canvas.getContext('2d').getImageData(0, 0, s.canvas.width, "
+            "s.canvas.height).data.some(value => value !== 0); })()", kCompletionTimeout);
+        const auto offClicked = compareRendered && evaluate(
+            "(() => { window.__vstSpectrumInstance.button.click(); return true; })()", ignored);
+        spectrumOverlayRendered = offClicked && waitForJavascript(
+            "window.__vstSpectrumInstance?.mode === 'off' && window.__vstSpectrumInstance.canvas === null && "
+            "window.audioManager.nativePort.spectrumTaps.size === 0", kCompletionTimeout);
+        if (!spectrumOverlayRendered) {
+          (void)evaluate(
+              "JSON.stringify({error:window.__vstSpectrumError, mode:window.__vstSpectrumInstance?.mode, "
+              "active:window.__vstSpectrumInstance?.active, levels:!!window.__vstSpectrumInstance?.levels, "
+              "before:!!window.__vstSpectrumInstance?.inputLevels, revision:window.audioManager.nativePort.spectrumRevision, "
+              "published:window.audioManager.nativePort.spectrumPublishedRevision})", spectrumOverlayDiagnostics);
+        }
+        (void)evaluate(
+            "(() => { const plugin = window.__vstSpectrumPlugin; if (!plugin) return true; "
+            "window.SpectrumOverlay.detach(plugin.id); const pipeline = window.audioManager.getCurrentPipeline(); "
+            "const index = pipeline.indexOf(plugin); if (index >= 0) pipeline.splice(index, 1); "
+            "window.uiManager.pipelineManager.expandedPlugins.delete(plugin); plugin.cleanup?.(); "
+            "window.uiManager.pipelineManager.updatePipelineUI(true); "
+            "void window.audioManager.rebuildPipeline(); return true; })()", ignored);
 
         const auto languageFixtureStarted = evaluate(
             "(() => { window.__vstLanguageFixtureReady = false; void (async () => { "
@@ -2053,6 +2149,11 @@ int main(const int argc, char **argv) {
   }
   if (!telemetryDelivered) {
     std::cerr << "A non-empty native telemetry packet did not reach a TelemetryHub subscriber\n";
+    return 1;
+  }
+  if (!spectrumOverlayRendered) {
+    std::cerr << "The shared spectrum button did not render native After/Compare PCM and return Off: "
+              << spectrumOverlayDiagnostics << '\n';
     return 1;
   }
   if (!amRadioHudDisplayed) {

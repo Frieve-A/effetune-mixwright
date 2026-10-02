@@ -174,6 +174,15 @@ EngineHost::EngineHost()
     throw std::runtime_error("Unsupported EffeTune DSP ABI");
   }
   engine_ = std::make_unique<effetune::Engine>();
+  engine_->setPipelineObserver([](void *context, et_instance instance, const float *audio,
+                                  std::uint32_t channels, std::uint32_t frames,
+                                  std::uint32_t latency, bool before) noexcept {
+    auto &host = *static_cast<EngineHost *>(context);
+    const auto found = host.spectrumInstanceIds_.find(instance);
+    if (found != host.spectrumInstanceIds_.end())
+      host.spectrumCapture_.observe(found->second, audio, channels, frames, latency,
+          host.sampleRate_, static_cast<std::uint64_t>(host.processedFrames_), before);
+  }, this);
   discoverKernels();
 }
 
@@ -241,6 +250,7 @@ bool EngineHost::prepare(const double sampleRate, const std::uint32_t channels,
   sampleRate_ = sampleRate;
   channels_ = channels;
   maxProcessFrames_ = maxFrames;
+  spectrumCapture_.prepare(maxFrames);
   processedFrames_ = 0.0;
   prepared_ = true;
   activeDescriptorByteCount_ = 0;
@@ -257,14 +267,18 @@ bool EngineHost::prepare(const double sampleRate, const std::uint32_t channels,
 
 void EngineHost::reset() {
   std::scoped_lock lock(engineMutex_);
+  spectrumCapture_.invalidate();
   if (prepared_) {
     (void)engine_->reset();
+    refreshCircuitFaultsUnlocked();
     combined_ = engine_->combined();
     processedFrames_ = 0.0;
   }
 }
 
 void EngineHost::clearInstancesUnlocked() noexcept {
+  spectrumCapture_.invalidate();
+  spectrumInstanceIds_.clear();
   for (const auto &[logicalId, entry] : instances_) {
     (void)logicalId;
     if (entry.instance != 0) {
@@ -359,8 +373,12 @@ bool EngineHost::rebuild(const PipelineState &pipeline,
                                         ? instanceKernel->second.paramsHash
                                         : runtime.paramsHash;
     InstanceEntry instanceEntry{instance, runtime.paramsHash, kernel->second.index,
-                        runtime.contextuallyBypassed, {}};
+                        runtime.contextuallyBypassed, {}, nullptr};
     try {
+      if (!runtime.contextuallyBypassed && runtime.type == "TubeSimulatorPlugin") {
+        instanceEntry.circuitFault = std::make_unique<CircuitFaultProjection>();
+        instanceEntry.circuitFault->instanceEpoch = ++nextCircuitFaultEpoch_;
+      }
       if (!runtime.contextuallyBypassed && runtime.type == "TonalBalanceEQPlugin") {
         instanceEntry.measurementParameters.resize(generated::TonalBalanceEQPluginParams::kFloatCount);
       }
@@ -403,6 +421,7 @@ bool EngineHost::rebuild(const PipelineState &pipeline,
         setError(error, "Native DSP plug-in IDs must be unique");
         return false;
       }
+      spectrumInstanceIds_.emplace(instance, runtime.logicalId);
     } catch (const std::bad_alloc &) {
       engine_->destroyInstance(instance);
       clearInstancesUnlocked();
@@ -971,6 +990,7 @@ bool EngineHost::ProcessBatch::processChunk(const float *const *input, float *co
     }
   }
   et_status status = ET_ERR_STATE;
+  host_->spectrumCapture_.beginBlock(masterBypass);
   {
 #if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
     const ScopedMxcsrDenormalFlush mxcsrDenormalFlush;
@@ -1014,6 +1034,7 @@ bool EngineHost::ProcessBatch::finish(const bool refreshLatency) noexcept {
     host->assetPreparationLatencyPolling_ = host->refreshAssetStatesUnlocked();
   }
   host->drainTelemetryUnlocked();
+  host->refreshCircuitFaultsUnlocked();
   host->processCounterAtoms_.telemetryDrains.fetch_add(1,
                                                        std::memory_order_relaxed);
   host->processCounterAtoms_.completedBatches.fetch_add(1,
@@ -1068,6 +1089,45 @@ bool EngineHost::beginProcessBatch(
     return false;
   }
   return true;
+}
+
+void EngineHost::refreshCircuitFaultsUnlocked() noexcept {
+  static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
+  for (const auto &[id, entry] : instances_) {
+    (void)id;
+    if (!entry.circuitFault) continue;
+    effetune::RuntimeEventState event{};
+    if (engine_->readInstanceRuntimeEvent(entry.instance, event) != ET_OK) continue;
+    const auto state = static_cast<std::uint64_t>(event.generation) |
+        (static_cast<std::uint64_t>(event.latched != 0) << 32u) |
+        (static_cast<std::uint64_t>(event.cause) << 33u);
+    entry.circuitFault->state.store(state, std::memory_order_release);
+  }
+}
+
+std::vector<EngineHost::CircuitFaultSnapshot> EngineHost::circuitFaults() const {
+  // Like assetState(), this locks only control-side instance lifetime. The audio
+  // owner never takes the mutex; it publishes each complete event in one store.
+  std::scoped_lock lock(engineMutex_);
+  std::vector<CircuitFaultSnapshot> result;
+  if (!validDescriptor(activeDescriptor_.data(), activeDescriptorByteCount_)) return result;
+  const auto nodeCount = readUint32(activeDescriptor_.data() + 4u);
+  for (const auto &[id, entry] : instances_) {
+    if (!entry.circuitFault) continue;
+    bool inPipeline = false;
+    for (std::uint32_t node = 0; node < nodeCount; ++node) {
+      if (readUint32(activeDescriptor_.data() + kPipelineDescriptorHeaderBytes +
+                     node * kPipelineDescriptorNodeBytes) == entry.instance) {
+        inPipeline = true;
+        break;
+      }
+    }
+    if (!inPipeline) continue;
+    const auto state = entry.circuitFault->state.load(std::memory_order_acquire);
+    result.push_back({id, entry.circuitFault->instanceEpoch, static_cast<std::uint32_t>(state),
+                      ((state >> 32u) & 1u) != 0, static_cast<std::uint32_t>(state >> 33u)});
+  }
+  return result;
 }
 
 EngineHost::ProcessCounters EngineHost::processCounters() const noexcept {
@@ -1157,6 +1217,7 @@ void EngineHost::discardPipelineLatencyUpdate() noexcept {
 
 void EngineHost::storeActiveDescriptorUnlocked(const std::uint8_t *descriptor,
                                                const std::uint32_t byteCount) noexcept {
+  spectrumCapture_.invalidate();
   if (!validDescriptor(descriptor, byteCount) || byteCount > activeDescriptor_.size()) {
     activeDescriptorByteCount_ = 0;
     return;

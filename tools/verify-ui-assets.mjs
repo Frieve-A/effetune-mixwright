@@ -374,6 +374,14 @@ if (!audioAdapter.includes('name: plugin.name || logical?.name') ||
     !audioAdapter.includes("__effetuneHostCall('pipeline/masterBypass'")) {
   throw new Error('The VST display-name or telemetry byte-count contract is missing');
 }
+if (!app.includes("config.spectrumOverlayQuality = 'normal';") ||
+    !audioAdapter.includes("message.type === 'setSpectrumTapRoute'") ||
+    !audioAdapter.includes("__effetuneHostCall('spectrum/setTap'") ||
+    !audioAdapter.includes('this.nativePort.dispatchSpectrumOverlays(result.spectrumOverlays, spectrumRevision);') ||
+    audioAdapter.indexOf('this.nativePort.dispatchSpectrumOverlays(result.spectrumOverlays, spectrumRevision);') >
+      audioAdapter.indexOf('if (!result.packet || !result.bytes) return;')) {
+  throw new Error('The normal spectrum overlay PCM route must run independently of DSP telemetry packets');
+}
 for (const fragment of [
   "message.type === 'setPluginAsset'",
   "__effetuneHostCall('pipeline/assetBegin'",

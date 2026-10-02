@@ -7,6 +7,7 @@ add_library(effetune_engine STATIC
   engine/latency.cpp
   engine/output_transition.cpp
   engine/output_analyzers.cpp
+  engine/spectrum_capture.cpp
   engine/pipeline_model.cpp
   engine/resampler.cpp
   bridge/config_store.cpp

@@ -229,7 +229,8 @@ const publishInitialConfig = `            windowRef.appConfig = config;`;
 if (!app.includes(publishInitialConfig)) {
   throw new Error('Unable to locate the initial config publication in js/app.js');
 }
-app = app.replace(publishInitialConfig, `${publishInitialConfig}
+app = app.replace(publishInitialConfig, `            config.spectrumOverlayQuality = 'normal';
+${publishInitialConfig}
             if (Number.isInteger(config.columns) && config.columns >= 1 && config.columns <= 8) {
                 localStorage.setItem('pipelineColumns', String(config.columns));
             }`);

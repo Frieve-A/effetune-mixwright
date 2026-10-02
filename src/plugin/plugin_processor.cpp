@@ -1819,6 +1819,25 @@ void EffeTuneProcessor::appendExecutionStates(choc::value::Value &result) {
   result.addMember("executionStates", std::move(states));
 }
 
+void EffeTuneProcessor::appendCircuitFaults(choc::value::Value &result) {
+  auto events = choc::value::createEmptyArray();
+  constexpr std::array<const char *, 3> causes{
+      "none", "feedbackOscillation", "processingSafetyFailure"};
+  for (const auto &fault : engine_.circuitFaults()) {
+    if (fault.cause >= causes.size()) continue;
+    auto event = choc::value::createObject({});
+    event.addMember("type", "tubeSimulatorCircuitFault");
+    event.addMember("pluginId", static_cast<std::int64_t>(fault.pluginId));
+    event.addMember("pluginType", "TubeSimulatorPlugin");
+    event.addMember("instanceEpoch", static_cast<std::int64_t>(fault.instanceEpoch));
+    event.addMember("generation", static_cast<std::int64_t>(fault.generation));
+    event.addMember("latched", fault.latched);
+    event.addMember("cause", causes[fault.cause]);
+    events.addArrayElement(std::move(event));
+  }
+  result.addMember("runtimeEvents", std::move(events));
+}
+
 void EffeTuneProcessor::appendDeferredDiagnostics(choc::value::Value &result) {
   auto diagnostics = choc::value::createEmptyArray();
   const auto transactionSequence =
@@ -3653,6 +3672,7 @@ void EffeTuneProcessor::cancelBackupExport() {
 void EffeTuneProcessor::detachEditor(void *owner) noexcept {
   frequencyPreview_.setFrequency(0.0);
   outputAnalyzers_.stopCapture();
+  engine_.spectrumCapture().stopCapture();
   cancelBackupExport();
   std::shared_ptr<WebViewHost> webView;
   {
@@ -3816,6 +3836,7 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     if (message.startupHandshake) {
       frequencyPreview_.setFrequency(0.0);
       outputAnalyzers_.stopCapture();
+      engine_.spectrumCapture().stopCapture();
       cancelBackupExport();
       closeOpenHostGestures();
       std::scoped_lock resources(processingResourcesMutex_);
@@ -3872,6 +3893,7 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     result.addMember("contextGeneration",
                      static_cast<std::int64_t>(context.generation));
     result.addMember("version", std::string(EFFETUNE_PLUGIN_VERSION_STR));
+    appendCircuitFaults(result);
     appendExecutionStates(result);
     appendAutomationDeltas(result);
     appendDeferredDiagnostics(result);
@@ -3894,6 +3916,24 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     result.addMember("ok", true);
     result.addMember("exists", exists);
     return choc::json::toString(result);
+  }
+
+  if (message.action == UiAction::setSpectrumTap) {
+    // Admission is control-side only. The subscription never changes DSP
+    // topology or contends with processing ownership.
+    try {
+      std::scoped_lock resources(processingResourcesMutex_);
+      if (message.spectrumMode != SpectrumMode::off &&
+          (stateReplacementPending_.load(std::memory_order_acquire) ||
+           stateReplacementEpoch_.load(std::memory_order_acquire) != requestStateEpoch ||
+           uiPageGeneration_.load(std::memory_order_acquire) != requestPageGeneration ||
+           std::none_of(runtimePlugins_.begin(), runtimePlugins_.end(), [&](const RuntimePlugin &plugin) {
+             return plugin.logicalId == message.pluginId;
+           }))) return bridgeResult(false, "The plug-in is no longer available.");
+      return bridgeResult(engine_.spectrumCapture().setTap(message.pluginId, message.spectrumMode));
+    } catch (const std::exception &) {
+      return bridgeResult(false, "Unable to start the spectrum display. Try turning it on again.");
+    }
   }
 
   if (message.action == UiAction::setVisualizerSources) {
@@ -3922,6 +3962,28 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     result.addMember("ok", true);
     result.addMember("bytes", static_cast<std::int64_t>(bytes));
     result.addMember("droppedFrames", static_cast<std::int64_t>(droppedFrames));
+    std::uint32_t spectrumDropped = 0;
+    const auto frames = engine_.spectrumCapture().read(spectrumDropped);
+    auto overlays = choc::value::createEmptyArray();
+    for (const auto &frame : frames) {
+      auto overlay = choc::value::createObject({});
+      overlay.addMember("type", "spectrumOverlay");
+      overlay.addMember("spectrumPluginId", static_cast<std::int64_t>(frame.pluginId));
+      overlay.addMember("mode", frame.mode == SpectrumMode::compare ? "compare" : "after");
+      overlay.addMember("quality", "normal");
+      overlay.addMember("bufferPosition", static_cast<std::int64_t>(frame.bufferPosition));
+      overlay.addMember("sampleRate", frame.sampleRate);
+      static_assert(std::endian::native == std::endian::little);
+      overlay.addMember("outputBuffer", choc::base64::encodeToString(
+          frame.output.data(), frame.output.size() * sizeof(float)));
+      if (frame.mode == SpectrumMode::compare)
+        overlay.addMember("inputBuffer", choc::base64::encodeToString(
+            frame.input.data(), frame.input.size() * sizeof(float)));
+      overlays.addArrayElement(std::move(overlay));
+    }
+    result.addMember("spectrumOverlays", std::move(overlays));
+    result.addMember("spectrumDroppedFrames", static_cast<std::int64_t>(spectrumDropped));
+    appendCircuitFaults(result);
     result.addMember("masterBypass", bypass_.load(std::memory_order_acquire));
     result.addMember("contextGeneration",
                      static_cast<std::int64_t>(context.generation));
@@ -3951,6 +4013,7 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
   if (message.action == UiAction::discardTelemetry) {
     engine_.discardTelemetry();
     outputAnalyzers_.discardTelemetry();
+    engine_.spectrumCapture().invalidate();
     return bridgeResult(true);
   }
 
