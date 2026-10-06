@@ -23,18 +23,24 @@ smtg_add_vst3plugin(effetune_plugin
 
 find_program(EFFETUNE_NODE_EXECUTABLE node REQUIRED)
 set(effetune_webview_assets "${CMAKE_BINARY_DIR}/webview-assets")
+message(STATUS "Scanning EffeTune UI sources: ${EFFETUNE_UPSTREAM_SOURCE_DIR}")
 file(GLOB_RECURSE effetune_ui_source_files CONFIGURE_DEPENDS LIST_DIRECTORIES false
-  "${PROJECT_SOURCE_DIR}/external/effetune/effetune.html"
-  "${PROJECT_SOURCE_DIR}/external/effetune/css/*"
-  "${PROJECT_SOURCE_DIR}/external/effetune/js/*"
-  "${PROJECT_SOURCE_DIR}/external/effetune/plugins/*"
-  "${PROJECT_SOURCE_DIR}/external/effetune/presets/*"
-  "${PROJECT_SOURCE_DIR}/external/effetune/images/*")
+  "${EFFETUNE_UPSTREAM_SOURCE_DIR}/css/*"
+  "${EFFETUNE_UPSTREAM_SOURCE_DIR}/js/*"
+  "${EFFETUNE_UPSTREAM_SOURCE_DIR}/plugins/*"
+  "${EFFETUNE_UPSTREAM_SOURCE_DIR}/presets/*"
+  "${EFFETUNE_UPSTREAM_SOURCE_DIR}/images/*")
+list(APPEND effetune_ui_source_files
+  "${EFFETUNE_UPSTREAM_SOURCE_DIR}/effetune.html"
+  "${EFFETUNE_UPSTREAM_SOURCE_DIR}/features/measurement/dataStorage.js"
+  "${EFFETUNE_UPSTREAM_SOURCE_DIR}/features/measurement/measurement-model.js"
+  "${EFFETUNE_UPSTREAM_SOURCE_DIR}/features/measurement/audio-utils/channel-selection.js"
+  "${EFFETUNE_UPSTREAM_SOURCE_DIR}/features/measurement/audio-utils/output-routing.js")
 add_custom_command(
   OUTPUT "${effetune_webview_assets}/.stamp"
   COMMAND "${EFFETUNE_NODE_EXECUTABLE}"
           "${PROJECT_SOURCE_DIR}/tools/build-ui-assets.mjs"
-          --source "${PROJECT_SOURCE_DIR}/external/effetune"
+          --source "${EFFETUNE_UPSTREAM_SOURCE_DIR}"
           --out "${effetune_webview_assets}"
   DEPENDS
     "${PROJECT_SOURCE_DIR}/tools/build-ui-assets.mjs"

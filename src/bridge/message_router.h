@@ -90,6 +90,7 @@ struct RoutedUiMessage {
   std::vector<RoutedAutomationEdit> automationEdits;
   RuntimeAsset asset;
   std::uint64_t operationRevision = 0;
+  std::uint64_t nowPlayingRevision = 0;
   std::size_t assetByteSize = 0;
   std::size_t assetOffset = 0;
   char pipeline = 'A';
@@ -105,6 +106,7 @@ struct RoutedUiMessage {
   double normalizedValue = 0.0;
   double previewFrequency = 0.0;
   SpectrumMode spectrumMode = SpectrumMode::off;
+  SpectrumQuality spectrumQuality = SpectrumQuality::normal;
   std::string pluginType;
   std::string parameterKey;
   OversamplingSettings oversampling;

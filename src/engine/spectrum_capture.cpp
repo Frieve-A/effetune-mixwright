@@ -3,6 +3,8 @@
 
 #include <algorithm>
 
+#ifndef EFFETUNE_HAS_NATIVE_SPECTRUM_TAP
+
 namespace effetune::vst {
 namespace {
 constexpr std::uint32_t kBlockFrames = 256;
@@ -50,7 +52,7 @@ struct SpectrumCapture::Storage {
 SpectrumCapture::SpectrumCapture() : storage_(std::make_unique<Storage>()) {}
 SpectrumCapture::~SpectrumCapture() = default;
 
-void SpectrumCapture::prepare(std::uint32_t maxFrames) {
+void SpectrumCapture::prepare(std::uint32_t maxFrames, double) {
   storage_->input.resize(maxFrames);
   invalidate();
 }
@@ -59,8 +61,10 @@ void SpectrumCapture::invalidate() noexcept {
   epoch_.fetch_add(1, std::memory_order_acq_rel);
 }
 
-bool SpectrumCapture::setTap(std::uint32_t pluginId, SpectrumMode mode) {
-  if (pluginId == 0 || mode > SpectrumMode::compare) return false;
+bool SpectrumCapture::nativeAnalysisSupported() const noexcept { return false; }
+
+bool SpectrumCapture::setTap(std::uint32_t pluginId, SpectrumMode mode, SpectrumQuality quality) {
+  if (pluginId == 0 || mode > SpectrumMode::compare || quality != SpectrumQuality::normal) return false;
   std::scoped_lock lock(controlMutex_);
   auto &storage = *storage_;
   std::size_t selected = storage.taps.size();
@@ -109,7 +113,7 @@ void SpectrumCapture::beginBlock(bool masterBypass) noexcept {
 void SpectrumCapture::observe(std::uint32_t pluginId, const float *audio,
                               std::uint32_t channels, std::uint32_t frames,
                               std::uint32_t latency, double sampleRate,
-                              std::uint64_t firstFrame, bool before) noexcept {
+                              std::uint64_t firstFrame, bool before, std::uint32_t) noexcept {
   auto &storage = *storage_;
   if (before) {
     storage.pendingToken = 0;
@@ -217,3 +221,4 @@ std::vector<SpectrumFrame> SpectrumCapture::read(std::uint32_t &dropped) {
 }
 
 } // namespace effetune::vst
+#endif

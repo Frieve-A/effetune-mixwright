@@ -34,15 +34,26 @@ function argument(name) {
   return index >= 0 ? process.argv[index + 1] : null;
 }
 
+async function readText(file) {
+  return (await readFile(file, 'utf8')).replaceAll('\r\n', '\n');
+}
+
 const source = path.resolve(argument('--source') || path.join(projectRoot, 'external', 'effetune'));
 const output = path.resolve(argument('--out') || path.join(projectRoot, 'build', 'webview-assets'));
 const outputRelative = path.relative(projectRoot, output);
 if (!outputRelative || outputRelative.startsWith('..') || path.isAbsolute(outputRelative)) {
   throw new Error(`Refusing to replace an asset directory outside the project: ${output}`);
 }
-if (source === output || !source.endsWith(path.join('external', 'effetune'))) {
+const sourceRelative = path.relative(source, output);
+const outputToSource = path.relative(output, source);
+if (!sourceRelative || (!sourceRelative.startsWith('..') && !path.isAbsolute(sourceRelative)) ||
+    (!outputToSource.startsWith('..') && !path.isAbsolute(outputToSource))) {
   throw new Error(`Unexpected EffeTune source directory: ${source}`);
 }
+// Validate the explicit source before replacing any generated output. Local
+// upstream previews use the same generator as the pinned shipping submodule.
+await readFile(path.join(source, 'dsp', 'CMakeLists.txt'), 'utf8');
+await readFile(path.join(source, 'effetune.html'), 'utf8');
 
 await rm(output, { recursive: true, force: true });
 await mkdir(output, { recursive: true });
@@ -71,7 +82,7 @@ for (const entry of ['channel-selection.js', 'output-routing.js']) {
 await cp(path.join(projectRoot, 'THIRD-PARTY-NOTICES.txt'),
          path.join(output, 'THIRD-PARTY-NOTICES.txt'));
 
-let html = await readFile(path.join(source, 'effetune.html'), 'utf8');
+let html = await readText(path.join(source, 'effetune.html'));
 // The upstream currently loads JSZip lazily; retain compatibility with a classic-script entry.
 const legacyZipScript = 'src="js/vendor/jszip-3.10.1.min.js"';
 if (html.includes(legacyZipScript)) {
@@ -103,7 +114,7 @@ html = applyProductBranding(html)
   .replace('</head>', '    <script src="vst-bootstrap.js"></script>\n</head>');
 await writeFile(path.join(output, 'effetune.html'), html, 'utf8');
 const backupDialogPath = path.join(output, 'js', 'user-data-backup', 'dialog.js');
-let backupDialog = await readFile(backupDialogPath, 'utf8');
+let backupDialog = await readText(backupDialogPath);
 const backupDownload = '        downloadable(output.blob, output.fileName);';
 if (backupDialog.split(backupDownload).length - 1 !== 1) {
   throw new Error('Unable to locate the upstream backup download');
@@ -112,7 +123,7 @@ backupDialog = backupDialog.replace(backupDownload,
   '        await window.__effetuneExportBackup(output.blob, output.fileName, controller.signal);');
 await writeFile(backupDialogPath, backupDialog, 'utf8');
 const backupArchivePath = path.join(output, 'js', 'user-data-backup', 'archive.js');
-let backupArchive = await readFile(backupArchivePath, 'utf8');
+let backupArchive = await readText(backupArchivePath);
 const legacyZipLoader = "new URL('../vendor/jszip-3.10.1.min.js', import.meta.url)";
 if (backupArchive.split(legacyZipLoader).length - 1 !== 1) {
   throw new Error('Unable to locate the upstream JSZip backup loader');
@@ -127,7 +138,7 @@ await cp(path.join(projectRoot, 'ui-shim', 'vendor', 'jszip-3.10.2.min.js'),
          path.join(output, 'js', 'vendor', 'jszip-3.10.2.min.js'));
 
 const appPath = path.join(output, 'js', 'app.js');
-let app = await readFile(appPath, 'utf8');
+let app = await readText(appPath);
 const originalImport = `import { AudioManager } from './audio-manager.js';`;
 if (!app.includes(originalImport)) {
   throw new Error('Unable to locate the AudioManager import in js/app.js');
@@ -144,9 +155,20 @@ const startupViewPreference = /    applyStartupViewPreference\(\) \{[\s\S]*?\n  
 if (!startupViewPreference.test(app)) {
   throw new Error('Unable to locate the music-library startup preference');
 }
-app = app.replace(startupViewPreference, `    applyStartupViewPreference() {}
+app = app.replace(startupViewPreference, `    applyStartupViewPreference() {
+        this.startupViewPreferencePromise ??= this.openConfiguredStartupView();
+        return this.startupViewPreferencePromise;
+    }
 
-    async openConfiguredStartupView() {}
+    async openConfiguredStartupView() {
+        if (this.startupConfig?.startupView === 'visualizer') {
+            try { await this.uiManager?.showVisualizerView?.(); }
+            catch (error) {
+                console.error('Error opening Visualizer startup view:', error);
+                this.uiManager?.setError?.('Visualizer could not be opened. Please try the Visualizer button.', true);
+            }
+        }
+    }
 
     /**
      * Initialize and build pipeline`);
@@ -229,7 +251,7 @@ const publishInitialConfig = `            windowRef.appConfig = config;`;
 if (!app.includes(publishInitialConfig)) {
   throw new Error('Unable to locate the initial config publication in js/app.js');
 }
-app = app.replace(publishInitialConfig, `            config.spectrumOverlayQuality = 'normal';
+app = app.replace(publishInitialConfig, `            if (!windowRef.__effetuneNativeSpectrum) config.spectrumOverlayQuality = 'normal';
 ${publishInitialConfig}
             if (Number.isInteger(config.columns) && config.columns >= 1 && config.columns <= 8) {
                 localStorage.setItem('pipelineColumns', String(config.columns));
@@ -238,7 +260,7 @@ await writeFile(appPath, app, 'utf8');
 
 const routingDialogPath = path.join(
   output, 'js', 'ui', 'pipeline', 'pipeline-routing-dialog.js');
-let routingDialog = await readFile(routingDialogPath, 'utf8');
+let routingDialog = await readText(routingDialogPath);
 const upstreamChannelOptions = `        // Define channel options - changed for multi-channel support
         const channelOptions = [
             { text: 'Stereo', value: '' },  // Default - process first 2 channels only (null)
@@ -306,8 +328,23 @@ routingDialog = routingDialog.replace(upstreamChannelOptions, `        // The VS
         });`);
 await writeFile(routingDialogPath, routingDialog, 'utf8');
 
+const visualizerViewPath = path.join(output, 'js', 'visualizer', 'visualizer-view.js');
+let visualizerView = await readText(visualizerViewPath);
+const playerMetadata = `    metadata() {
+        const player = this.uiManager.audioPlayer;
+        const snapshot = player?.stateManager?.getStateSnapshot();
+        return snapshot?.currentTrack ? player.mediaSessionManager?.buildMetadata(snapshot) : null;
+    }`;
+if (visualizerView.split(playerMetadata).length - 1 !== 1) {
+  throw new Error('Unable to locate the Visualizer metadata provider');
+}
+visualizerView = visualizerView.replace(playerMetadata, `    metadata() {
+        return this.uiManager.audioManager.getNowPlayingMetadata();
+    }`);
+await writeFile(visualizerViewPath, visualizerView, 'utf8');
+
 const visualizerEditorPath = path.join(output, 'js', 'visualizer', 'visualizer-editor.js');
-let visualizerEditor = await readFile(visualizerEditorPath, 'utf8');
+let visualizerEditor = await readText(visualizerEditorPath);
 const visualizerChannels = `            const channels = [['', '1–2'], ['L', 'L'], ['R', 'R'], ...Array.from({ length: 7 }, (_, i) => [\`\${i * 2 + 3}\${i * 2 + 4}\`, \`\${i * 2 + 3}–\${i * 2 + 4}\`]), ...Array.from({ length: 16 }, (_, i) => [\`\${i + 1}\`, \`\${i + 1}\`])];
             this.field(properties, this.t('visualizer.channel', 'Channel'), 'select', item.channel || '', value => { item.channel = value || null; this.changed(); }, { values: channels });`;
 if (visualizerEditor.split(visualizerChannels).length - 1 !== 1) {
@@ -323,7 +360,7 @@ visualizerEditor = visualizerEditor.replace(visualizerChannels, `            con
 await writeFile(visualizerEditorPath, visualizerEditor, 'utf8');
 
 const fifteenBandGeqPath = path.join(output, 'plugins', 'eq', 'fifteen_band_geq.js');
-let fifteenBandGeq = await readFile(fifteenBandGeqPath, 'utf8');
+let fifteenBandGeq = await readText(fifteenBandGeqPath);
 const fifteenBandGeqRefresh = `            if (this.sliders && this.sliders[i]) {
                 this.sliders[i].value = this['b' + i];
                 window.uiManager?.refreshRangeFillStyling?.(this.sliders[i]);
@@ -347,7 +384,7 @@ fifteenBandGeq = fifteenBandGeq.replace(fifteenBandGeqRefresh, `            cons
 await writeFile(fifteenBandGeqPath, fifteenBandGeq, 'utf8');
 
 const tiltEqPath = path.join(output, 'plugins', 'eq', 'tilt_eq.js');
-let tiltEq = await readFile(tiltEqPath, 'utf8');
+let tiltEq = await readText(tiltEqPath);
 const tiltEqPivotRefresh = `            pivotLogSlider.value = this.f0;
             window.uiManager?.refreshRangeFillStyling?.(pivotLogSlider);
             // The Hz box only commits on change/Enter, so a half-typed entry lives
@@ -368,7 +405,7 @@ tiltEq = tiltEq.replace(tiltEqPivotRefresh, `            const pivotFrequencyHel
 await writeFile(tiltEqPath, tiltEq, 'utf8');
 
 const historyPath = path.join(output, 'js', 'ui', 'pipeline', 'history-manager.js');
-let history = await readFile(historyPath, 'utf8');
+let history = await readText(historyPath);
 const historySerialization =
   `this.pipelineManager.core.getSerializablePluginState(plugin, true, false, false)`;
 const historySerializationMatches = history.split(historySerialization).length - 1;
@@ -408,14 +445,14 @@ await writeFile(historyPath, history, 'utf8');
 await cp(path.join(source, 'js', 'ui', 'audio-player', 'playback-speed.js'),
          path.join(output, 'js', 'midi', 'playback-speed.js'));
 const appTargetsPath = path.join(output, 'js', 'midi', 'app-targets.js');
-let appTargets = await readFile(appTargetsPath, 'utf8');
+let appTargets = await readText(appTargetsPath);
 const speedImport = "from '../ui/audio-player/playback-speed.js'";
 if (appTargets.split(speedImport).length - 1 !== 1) {
   throw new Error('Expected one controller playback-speed utility import');
 }
 await writeFile(appTargetsPath, appTargets.replace(speedImport, "from './playback-speed.js'"), 'utf8');
 const controllerDialogPath = path.join(output, 'js', 'midi', 'midi-mapping-dialog.js');
-let controllerDialog = await readFile(controllerDialogPath, 'utf8');
+let controllerDialog = await readText(controllerDialogPath);
 const appChoices = 'for (const param of Object.keys(APP_TARGETS)) {';
 if (controllerDialog.split(appChoices).length - 1 !== 1) {
   throw new Error('Expected one controller application target choice list');
@@ -435,7 +472,7 @@ await writeFile(visualizerEditorPath,
   visualizerEditor.replace(viewportImport, "from '../ui/visualizer-shared.js'"), 'utf8');
 
 const pipelineManagerPath = path.join(output, 'js', 'ui', 'pipeline-manager.js');
-let pipelineManager = await readFile(pipelineManagerPath, 'utf8');
+let pipelineManager = await readText(pipelineManagerPath);
 const fileProcessorImport = `import { FileProcessor } from './pipeline/file-processor.js';\n`;
 const fileProcessorConstruction = `        this.fileProcessor = enableFileProcessing ? new FileProcessor(this) : null;`;
 const droppedAudioMethod = `    /**
@@ -458,7 +495,7 @@ pipelineManager = pipelineManager
 await writeFile(pipelineManagerPath, pipelineManager, 'utf8');
 
 const uiManagerPath = path.join(output, 'js', 'ui-manager.js');
-let uiManager = await readFile(uiManagerPath, 'utf8');
+let uiManager = await readText(uiManagerPath);
 const pipelineManagerConstruction = `        this.pipelineManager = new PipelineManager(audioManager, pluginManager, this.expandedPlugins, this.pluginListManager);`;
 if (uiManager.split(pipelineManagerConstruction).length - 1 !== 1) {
   throw new Error('Unable to locate the PipelineManager construction');
@@ -683,7 +720,7 @@ await writeFile(uiManagerPath, uiManager, 'utf8');
 await rm(path.join(output, 'js', 'ui', 'double-blind-test'), { recursive: true, force: true });
 
 const electronIntegrationPath = path.join(output, 'js', 'electron-integration.js');
-let electronIntegration = await readFile(electronIntegrationPath, 'utf8');
+let electronIntegration = await readText(electronIntegrationPath);
 const documentationLinkPatch = /  patchDocumentationLinks\(\) \{[\s\S]*?\n  \}\n\n  \/\*\*\n   \* Initialize event listeners/;
 if (!documentationLinkPatch.test(electronIntegration)) {
   throw new Error('Unable to locate the Electron documentation-link patch');
@@ -701,7 +738,7 @@ for (const relativePath of [
   ['js', 'ui', 'pipeline', 'pipeline-ai-dialog.js']
 ]) {
   const assetPath = path.join(output, ...relativePath);
-  const assetSource = await readFile(assetPath, 'utf8');
+  const assetSource = await readText(assetPath);
   await writeFile(assetPath, applyProductBranding(assetSource), 'utf8');
 }
 
@@ -709,7 +746,7 @@ const localesPath = path.join(output, 'js', 'locales');
 for (const localeFile of await readdir(localesPath)) {
   if (!localeFile.endsWith('.json5')) continue;
   const localePath = path.join(localesPath, localeFile);
-  const localeSource = await readFile(localePath, 'utf8');
+  const localeSource = await readText(localePath);
   let localized = applyProductBranding(localeSource);
   const additions = vstLocaleAdditions[path.basename(localeFile, '.json5')];
   if (additions) {
@@ -724,7 +761,7 @@ for (const localeFile of await readdir(localesPath)) {
 }
 
 const browserAudioManagerPath = path.join(output, 'js', 'audio-manager.js');
-let browserAudioManager = await readFile(browserAudioManagerPath, 'utf8');
+let browserAudioManager = await readText(browserAudioManagerPath);
 const audioEncoderImport = `import { AudioEncoder } from './audio/audio-encoder.js';\n`;
 if (browserAudioManager.includes(audioEncoderImport)) {
   browserAudioManager = browserAudioManager.replace(audioEncoderImport, '');
@@ -757,7 +794,7 @@ browserAudioManager = browserAudioManager.replace(offlineProcessMethod,
 await writeFile(browserAudioManagerPath, browserAudioManager, 'utf8');
 
 const configIntegrationPath = path.join(output, 'js', 'electron', 'configIntegration.js');
-let configIntegration = await readFile(configIntegrationPath, 'utf8');
+let configIntegration = await readText(configIntegrationPath);
 const libraryConfigImport = `import {
   MUSIC_LIBRARY_STARTUP_VIEWS,
   normalizeMusicLibraryStartupView
@@ -775,14 +812,14 @@ if (configIntegration.split(configCategories).length - 1 !== 1 ||
   throw new Error('Unable to locate categorized settings navigation and panels');
 }
 configIntegration = configIntegration.replace(configCategories,
-  "const categories = ['general', 'controllers'];");
+  "const categories = ['general', 'startup', 'display', 'controllers'];");
 // Keep nonselectable panels for upstream initialization and translated control IDs.
 configIntegration = configIntegration.replace(configPanels,
   '${Object.keys(categoryPanels).map(category => `\n          <div class="config-category-panel" id="config-panel-${category}" hidden>');
 await writeFile(configIntegrationPath, configIntegration, 'utf8');
 
 const clipboardPath = path.join(output, 'js', 'ui', 'pipeline', 'clipboard-manager.js');
-let clipboard = await readFile(clipboardPath, 'utf8');
+let clipboard = await readText(clipboardPath);
 const doubleBlindPaste = /\n                    \/\/ A Double Blind Test share URL[\s\S]*?\n                    }\n\n                    \/\/ Ignore all pipeline pasting while the Double Blind Test is open\.[\s\S]*?\n                    }\n/;
 if (!doubleBlindPaste.test(clipboard)) {
   throw new Error('Unable to locate Double Blind Test clipboard branches');
@@ -791,7 +828,7 @@ clipboard = clipboard.replace(doubleBlindPaste, '\n');
 await writeFile(clipboardPath, clipboard, 'utf8');
 
 const columnsPath = path.join(output, 'js', 'ui', 'pipeline', 'pipeline-column-manager.js');
-let columns = await readFile(columnsPath, 'utf8');
+let columns = await readText(columnsPath);
 const saveColumns = `            localStorage.setItem('pipelineColumns', columns);`;
 if (!columns.includes(saveColumns)) {
   throw new Error('Unable to locate column preference persistence');

@@ -29,6 +29,20 @@ The main build artifacts are:
 - Headless host: `build/windows-release/src/tools/effetune-headless.exe`
 - WebView assets: `build/windows-release/webview-assets`
 
+## Windows Editor Startup
+
+WebView resources retain extended path prefixes and use native path separators,
+including when the host loads the module through a `\\?\` path.
+WebView2 creation failures show `EFFETUNE-UI-RUNTIME` with installation or repair
+guidance. `EFFETUNE-UI-TIMEOUT` indicates an operation that did not finish within
+the editor's startup deadline; it does not imply that a browser process started.
+Detailed creation errors go to the Windows debugger output.
+
+Windows configuration generates a narrowly adapted CHOC WebView header with
+creation-error callbacks using [tools/build-choc-webview-header.mjs](tools/build-choc-webview-header.mjs).
+The pinned CHOC source, license, and version metadata remain intact. The generator
+rejects unexpected changes to the construction code when the dependency is updated.
+
 ## Visualizer and Saved Data
 
 Use the **Visualizer** header button to view and edit analyzer layouts fed by the
@@ -40,14 +54,28 @@ Use **Settings → Configuration → Controllers** to open controller mapping se
 Controller mappings can toggle master bypass, switch A/B, and step through saved
 presets. Player transport controls are omitted from the mapping choices.
 
+**Configuration → General** includes the upstream language and theme choices.
+**Startup** selects the Effect Pipeline or Visualizer view when the editor opens;
+the pipeline itself continues to come from the host's plug-in state.
+**Display** selects instantaneous or Peak Hold spectra for per-effect Spectrum
+Overlays. These preferences are saved in the Mixwright UI configuration.
+
 **Settings → Backup / Restore** transfers saved pipeline, effect and Visualizer
 presets, impulse responses and measurements in an `.effetune_backup` archive.
 Choose a destination in the native save dialog; restoration previews the selected
 items before writing them. Archive creation is limited to 256 MB. Native export
 stages the archive and replaces the chosen file only after all chunks arrive.
 
-Spectrum Overlay's per-effect HQ and Peak Hold controls are not available through
-the native transport. Visualizer analyzer sources have their own analysis settings.
+The pinned upstream uses Normal PCM transport for per-effect Spectrum Overlays.
+When built against upstream's native Spectrum Tap API, Mixwright uses the shared
+Normal/HQ analyzer in After/Compare modes and exposes the HQ quality setting.
+Availability depends on the analyzer accepting the engine's oversampled rate;
+unsupported capture rates disable spectrum analysis without interrupting audio.
+The bridge also publishes capture generations, positions, analysis window age and
+remaining tap delay. Visual synchronization is not enabled yet: mapping these
+positions to the host output clock, applying additional audio output delay and
+reporting that applied delay to the host are still required. Visualizer analyzer
+sources have their own analysis settings.
 
 ## Room EQ Measurements
 
@@ -84,6 +112,21 @@ node external/effetune/tools/dsp-parity/run.mjs --native \
 
 The relative path passed to `--native-runner` is resolved from `external/effetune`.
 
+To check unpublished upstream changes without editing the submodule, configure a
+separate local build with an explicit source directory:
+
+```sh
+cmake --preset windows-release -B build/spectrum-preview \
+  -DEFFETUNE_UPSTREAM_SOURCE_DIR=D:/program/proto/effetune
+cmake --build build/spectrum-preview --parallel 2
+ctest --test-dir build/spectrum-preview --output-on-failure --parallel 2 --timeout 1800
+```
+
+The override supplies both shared DSP and WebView sources. Shipping presets still
+default to the pinned submodule. Native Spectrum Tap builds can additionally run
+`node D:/program/proto/effetune/tools/verify-spectrum-tap.mjs build/spectrum-preview/external/effetune/dsp/effetune_dsp_spectrum_tap_tests.exe`
+to verify Normal/HQ parity with the browser.
+
 Latency-changing parameter and asset updates are serviced while audio callbacks continue,
 whether transport is playing or stopped. The audio owner captures the current pipeline;
 the control service prepares compensation and bypass storage; a later audio-block boundary
@@ -101,5 +144,9 @@ pluginval at strictness level 10, compatibility testing in target DAWs, testing 
 ## License
 
 Every distribution must include [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt).
+
+The notices include JSZip's bundled lie, immediate, setImmediate, and pako
+components, including the zlib-derived source notices. The bundle and the
+interface's third-party notices viewer contain the same complete text.
 
 VST is a registered trademark of Steinberg Media Technologies GmbH.

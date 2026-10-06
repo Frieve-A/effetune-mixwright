@@ -19,10 +19,15 @@ add_library(effetune_engine STATIC
 target_include_directories(effetune_engine
   PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}"
   PRIVATE
-    "${PROJECT_SOURCE_DIR}/external/effetune/dsp/core"
-    "${PROJECT_SOURCE_DIR}/external/effetune/dsp/generated/cpp")
+    "${EFFETUNE_UPSTREAM_SOURCE_DIR}/dsp/core"
+    "${EFFETUNE_UPSTREAM_SOURCE_DIR}/dsp/generated/cpp")
 target_link_libraries(effetune_engine PUBLIC effetune_dsp_core effetune_choc)
 target_compile_features(effetune_engine PUBLIC cxx_std_20)
+
+if(EXISTS "${EFFETUNE_UPSTREAM_SOURCE_DIR}/dsp/include/effetune/spectrum_tap.h")
+  target_sources(effetune_engine PRIVATE engine/native_spectrum_capture.cpp)
+  target_compile_definitions(effetune_engine PUBLIC EFFETUNE_HAS_NATIVE_SPECTRUM_TAP=1)
+endif()
 
 if(MSVC)
   target_compile_options(effetune_engine PRIVATE /W4 /WX /utf-8)

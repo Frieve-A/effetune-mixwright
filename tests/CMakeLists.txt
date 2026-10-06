@@ -13,8 +13,8 @@ add_test(NAME effetune_vst_unit_tests COMMAND effetune_vst_unit_tests)
 add_executable(effetune_upstream_integration_tests unit/upstream_integration_tests.cpp)
 target_link_libraries(effetune_upstream_integration_tests PRIVATE effetune_engine)
 target_include_directories(effetune_upstream_integration_tests PRIVATE
-  "${PROJECT_SOURCE_DIR}/external/effetune/dsp/core"
-  "${PROJECT_SOURCE_DIR}/external/effetune/dsp/generated/cpp")
+  "${EFFETUNE_UPSTREAM_SOURCE_DIR}/dsp/core"
+  "${EFFETUNE_UPSTREAM_SOURCE_DIR}/dsp/generated/cpp")
 target_compile_features(effetune_upstream_integration_tests PRIVATE cxx_std_20)
 if(MSVC)
   target_compile_options(effetune_upstream_integration_tests PRIVATE /W4 /WX /utf-8)
@@ -108,6 +108,26 @@ endif()
 add_test(NAME effetune_file_exchange_tests COMMAND effetune_file_exchange_tests)
 
 if(WIN32 AND TARGET effetune_plugin)
+  add_executable(effetune_now_playing_metadata_tests
+    unit/now_playing_metadata_tests.cpp
+    ${vst3sdk_SOURCE_DIR}/public.sdk/source/vst/vstsinglecomponenteffect.cpp
+    ${PROJECT_SOURCE_DIR}/src/plugin/automation_parameters.cpp
+    ${PROJECT_SOURCE_DIR}/src/plugin/external_url.cpp
+    ${PROJECT_SOURCE_DIR}/src/plugin/native_file_dialog.cpp
+    ${PROJECT_SOURCE_DIR}/src/plugin/plugin_processor.cpp
+    ${PROJECT_SOURCE_DIR}/src/plugin/plugin_view.cpp
+    ${PROJECT_SOURCE_DIR}/src/bridge/webview_host.cpp)
+  target_link_libraries(effetune_now_playing_metadata_tests PRIVATE
+    sdk sdk_hosting effetune_engine user32 ole32 shell32 shlwapi)
+  target_include_directories(effetune_now_playing_metadata_tests PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${EFFETUNE_UPSTREAM_SOURCE_DIR}/dsp/core)
+  target_compile_features(effetune_now_playing_metadata_tests PRIVATE cxx_std_20)
+  target_compile_options(effetune_now_playing_metadata_tests PRIVATE /W4 /WX /utf-8)
+  add_test(NAME effetune_now_playing_metadata_tests
+    COMMAND effetune_now_playing_metadata_tests)
+  set_tests_properties(effetune_now_playing_metadata_tests PROPERTIES TIMEOUT 120)
+
   add_executable(effetune_plugin_processing_lifecycle_tests
     unit/plugin_processing_lifecycle_tests.cpp
     ${vst3sdk_SOURCE_DIR}/public.sdk/source/vst/hosting/parameterchanges.cpp
@@ -122,7 +142,7 @@ if(WIN32 AND TARGET effetune_plugin)
     sdk effetune_engine user32 ole32 shell32 shlwapi)
   target_include_directories(effetune_plugin_processing_lifecycle_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src
-    ${PROJECT_SOURCE_DIR}/external/effetune/dsp/core)
+    ${EFFETUNE_UPSTREAM_SOURCE_DIR}/dsp/core)
   target_compile_features(effetune_plugin_processing_lifecycle_tests PRIVATE cxx_std_20)
   target_compile_definitions(effetune_plugin_processing_lifecycle_tests PRIVATE
     EFFETUNE_PROCESSOR_TEST_HOOKS=1)
@@ -143,6 +163,25 @@ if(WIN32 AND TARGET effetune_plugin)
 endif()
 
 if(WIN32 AND TARGET effetune_ui_assets)
+  add_library(effetune_webview_loader_fixture SHARED
+    webview/webview_loader_fixture.cpp
+    webview/webview_loader_fixture.def)
+  target_link_libraries(effetune_webview_loader_fixture PRIVATE effetune_choc)
+  target_compile_features(effetune_webview_loader_fixture PRIVATE cxx_std_20)
+  target_compile_options(effetune_webview_loader_fixture PRIVATE /W4 /WX /utf-8)
+
+  add_executable(effetune_webview_initialisation_tests
+    webview/webview_initialisation_tests.cpp)
+  target_link_libraries(effetune_webview_initialisation_tests PRIVATE
+    effetune_choc user32 ole32 shell32 shlwapi)
+  target_compile_features(effetune_webview_initialisation_tests PRIVATE cxx_std_20)
+  target_compile_options(effetune_webview_initialisation_tests PRIVATE /W4 /WX /utf-8)
+  target_compile_definitions(effetune_webview_initialisation_tests PRIVATE
+    EFFETUNE_WEBVIEW_LOADER_FIXTURE="$<TARGET_FILE:effetune_webview_loader_fixture>")
+  add_dependencies(effetune_webview_initialisation_tests effetune_webview_loader_fixture)
+  add_test(NAME effetune_webview_initialisation_tests COMMAND effetune_webview_initialisation_tests)
+  set_tests_properties(effetune_webview_initialisation_tests PROPERTIES TIMEOUT 120)
+
   add_executable(effetune_webview_smoke
     webview/webview_smoke.cpp
     ${PROJECT_SOURCE_DIR}/src/bridge/webview_host.cpp
@@ -155,9 +194,9 @@ if(WIN32 AND TARGET effetune_ui_assets)
   target_compile_options(effetune_webview_smoke PRIVATE /W4 /WX /utf-8)
   add_dependencies(effetune_webview_smoke effetune_ui_assets)
   add_test(NAME effetune_webview_smoke COMMAND effetune_webview_smoke)
-  # Local runs include the deliberate WebView2 timeout and take under 40 seconds.
-  # Leave at least ten times that duration, including child-process cleanup.
-  set_tests_properties(effetune_webview_smoke PROPERTIES TIMEOUT 600)
+  # Local runs have taken under four minutes, including concurrent analysis.
+  # Leave at least ten times that upper bound, including child-process cleanup.
+  set_tests_properties(effetune_webview_smoke PROPERTIES TIMEOUT 2400)
 endif()
 
 if(TARGET effetune_ui_assets)
@@ -171,7 +210,8 @@ if(TARGET effetune_ui_assets)
   add_test(NAME effetune_ui_asset_contract
     COMMAND "${EFFETUNE_NODE_EXECUTABLE}"
             "${PROJECT_SOURCE_DIR}/tools/verify-ui-assets.mjs"
-            --assets "${CMAKE_BINARY_DIR}/webview-assets")
+            --assets "${CMAKE_BINARY_DIR}/webview-assets"
+            --source "${EFFETUNE_UPSTREAM_SOURCE_DIR}")
 endif()
 
 if(TARGET effetune_plugin_bundle_assets)
@@ -179,7 +219,8 @@ if(TARGET effetune_plugin_bundle_assets)
     COMMAND "${EFFETUNE_NODE_EXECUTABLE}"
             "${PROJECT_SOURCE_DIR}/tools/verify-ui-assets.mjs"
             --assets
-            "${CMAKE_BINARY_DIR}/VST3/$<CONFIG>/${EFFETUNE_PLUGIN_PACKAGE_NAME}.vst3/Contents/Resources/webview")
+            "${CMAKE_BINARY_DIR}/VST3/$<CONFIG>/${EFFETUNE_PLUGIN_PACKAGE_NAME}.vst3/Contents/Resources/webview"
+            --source "${EFFETUNE_UPSTREAM_SOURCE_DIR}")
 endif()
 
 if(APPLE AND TARGET effetune_plugin)

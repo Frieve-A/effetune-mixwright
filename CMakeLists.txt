@@ -56,7 +56,9 @@ endif()
 
 include(cmake/Dependencies.cmake)
 
-if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/effetune/dsp/CMakeLists.txt")
+set(EFFETUNE_UPSTREAM_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/effetune"
+    CACHE PATH "EffeTune source tree (override only for local upstream integration checks)")
+if(NOT EXISTS "${EFFETUNE_UPSTREAM_SOURCE_DIR}/dsp/CMakeLists.txt")
   message(FATAL_ERROR
     "external/effetune is missing. Run: git submodule update --init --recursive")
 endif()
@@ -65,7 +67,7 @@ if(MSVC)
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/EHsc>)
 endif()
 
-add_subdirectory(external/effetune/dsp)
+add_subdirectory("${EFFETUNE_UPSTREAM_SOURCE_DIR}/dsp" external/effetune/dsp)
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/CMakeLists.txt")
   add_subdirectory(src)

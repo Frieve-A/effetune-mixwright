@@ -425,6 +425,18 @@ bool MessageRouter::decode(const std::string_view json, RoutedUiMessage &message
     const auto payload = root["payload"].isObject() ? root["payload"] : root.getView();
     RoutedUiMessage decoded;
 
+    if (type == "host/getInfo" || type == "telemetry/read") {
+      const auto revision = payload["nowPlayingRevision"];
+      if (!revision.isVoid()) {
+        const auto value = revision.getWithDefault<std::int64_t>(-1);
+        if (!revision.isInt() || value < 0 || value > 9007199254740991ll) {
+          setError(error, "Invalid Now Playing revision");
+          return false;
+        }
+        decoded.nowPlayingRevision = static_cast<std::uint64_t>(value);
+      }
+    }
+
     if (type == "host/getInfo") {
       decoded.action = UiAction::hostInfo;
       decoded.startupHandshake = payload["startup"].getWithDefault<bool>(false);
@@ -597,8 +609,11 @@ bool MessageRouter::decode(const std::string_view json, RoutedUiMessage &message
     } else if (type == "spectrum/setTap") {
       const auto id = payload["pluginId"].getWithDefault<std::int64_t>(0);
       const auto mode = payload["mode"].getWithDefault<std::string>("after");
+      const auto quality = payload["quality"].getWithDefault<std::string>("normal");
       if (!payload["pluginId"].isInt() || id <= 0 || id > 0xffffffffll ||
-          !payload["enabled"].isBool() || (mode != "after" && mode != "compare")) {
+          !payload["enabled"].isBool() || (mode != "after" && mode != "compare") ||
+          (!payload["quality"].isVoid() && !payload["quality"].isString()) ||
+          (quality != "normal" && quality != "hq")) {
         setError(error, "Invalid spectrum tap");
         return false;
       }
@@ -606,6 +621,7 @@ bool MessageRouter::decode(const std::string_view json, RoutedUiMessage &message
       decoded.pluginId = static_cast<std::uint32_t>(id);
       decoded.spectrumMode = !payload["enabled"].getBool() ? SpectrumMode::off
           : mode == "compare" ? SpectrumMode::compare : SpectrumMode::after;
+      decoded.spectrumQuality = quality == "hq" ? SpectrumQuality::hq : SpectrumQuality::normal;
     } else if (type == "telemetry/read") {
       decoded.action = UiAction::readTelemetry;
     } else if (type == "telemetry/discard") {

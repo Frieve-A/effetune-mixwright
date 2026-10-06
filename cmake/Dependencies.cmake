@@ -25,5 +25,25 @@ if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/choc/choc/gui/choc_WebVie
 endif()
 
 add_library(effetune_choc INTERFACE)
+if(WIN32 AND EFFETUNE_BUILD_PLUGIN)
+  find_program(EFFETUNE_NODE_EXECUTABLE node REQUIRED)
+  set(effetune_webview_include "${CMAKE_BINARY_DIR}/webview-include")
+  set(effetune_choc_webview
+      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/choc/choc/gui/choc_WebView.h")
+  set(effetune_webview_header_generator
+      "${CMAKE_CURRENT_SOURCE_DIR}/tools/build-choc-webview-header.mjs")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${effetune_choc_webview}" "${effetune_webview_header_generator}")
+  execute_process(
+    COMMAND "${EFFETUNE_NODE_EXECUTABLE}" "${effetune_webview_header_generator}"
+            --source "${effetune_choc_webview}"
+            --out "${effetune_webview_include}/choc/gui/choc_WebView.h"
+    RESULT_VARIABLE effetune_webview_header_result
+    ERROR_VARIABLE effetune_webview_header_error)
+  if(NOT effetune_webview_header_result EQUAL 0)
+    message(FATAL_ERROR "Preparing CHOC WebView failed: ${effetune_webview_header_error}")
+  endif()
+  target_include_directories(effetune_choc INTERFACE "${effetune_webview_include}")
+endif()
 target_include_directories(effetune_choc INTERFACE
   "${CMAKE_CURRENT_SOURCE_DIR}/third_party/choc")

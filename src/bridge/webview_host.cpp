@@ -84,7 +84,9 @@ constexpr std::string_view kWebViewHomeUri =
   };
   return std::all_of(required.begin(), required.end(), [&root](const auto *relative) {
     std::error_code error;
-    return std::filesystem::is_regular_file(root / relative, error);
+    auto candidate = root / relative;
+    candidate.make_preferred();
+    return std::filesystem::is_regular_file(candidate, error);
   });
 }
 
@@ -228,12 +230,13 @@ std::string WebViewHost::diagnosticText(const WebViewStatus status) {
     break;
   case WebViewStatus::initialisationTimedOut:
     message +=
-        "Microsoft Edge WebView2 started but did not finish loading within " +
+        "Microsoft Edge WebView2 did not finish starting within " +
         std::to_string(kWebViewInitialisationTimeout.count()) +
         " seconds.\r\n\r\n"
         "Close and reopen this window. If the interface still does not appear, "
-        "restart your host application and report this message together with "
-        "the host name and version.";
+        "install or repair the Microsoft Edge WebView2 Runtime and restart "
+        "your host application. If the problem persists, report this message "
+        "together with the host name and version.";
     code = "EFFETUNE-UI-TIMEOUT";
     break;
   case WebViewStatus::ready:
@@ -324,7 +327,9 @@ struct WebViewHostState : public std::enable_shared_from_this<WebViewHostState> 
       }
       return std::nullopt;
     }
-    const auto candidate = resourceRoot / relative;
+    auto candidate = resourceRoot / relative;
+    // Extended Windows paths do not translate URL-style forward slashes.
+    candidate.make_preferred();
     std::error_code error;
     if (!std::filesystem::is_regular_file(candidate, error)) {
       return std::nullopt;
@@ -612,7 +617,8 @@ struct WebViewGeneration : public std::enable_shared_from_this<WebViewGeneration
   }
 
   [[nodiscard]] bool usableOnOwner() const noexcept {
-    if (webView == nullptr || !webView->loadedOK() ||
+    if (currentStatus.load(std::memory_order_acquire) == WebViewStatus::runtimeUnavailable ||
+        webView == nullptr || !webView->loadedOK() ||
         webView->getViewHandle() == nullptr) {
       return false;
     }
@@ -645,6 +651,30 @@ struct WebViewGeneration : public std::enable_shared_from_this<WebViewGeneration
       options.customSchemeURI = std::string(kWebViewHomeUri);
       const auto weakState = hostState;
       const auto weakGeneration = weak_from_this();
+#if defined(_WIN32)
+      options.webviewInitialisationError =
+          [weakGeneration](const std::string &error) noexcept {
+        const auto generation = weakGeneration.lock();
+        if (generation == nullptr ||
+            generation->retiring.load(std::memory_order_acquire)) {
+          return;
+        }
+        OutputDebugStringA("EffeTune WebView2 initialisation failed: ");
+        try {
+          const auto detail = widen(error);
+          OutputDebugStringW(detail.c_str());
+        } catch (const std::exception &) {
+          OutputDebugStringA("The native error text could not be converted.");
+        }
+        OutputDebugStringA("\n");
+        generation->setLoaded(false);
+        generation->setStatus(WebViewStatus::runtimeUnavailable);
+        if (generation->parent != nullptr) {
+          (void)generation->showDiagnosticViewOnOwner();
+          generation->endInitialisationWatchOnOwner();
+        }
+      };
+#endif
       options.fetchResource =
           [weakState, weakGeneration](const std::string &path)
           -> std::optional<choc::ui::WebView::Options::Resource> {
@@ -680,7 +710,9 @@ struct WebViewGeneration : public std::enable_shared_from_this<WebViewGeneration
         }
       };
       webView = std::make_unique<choc::ui::WebView>(options);
-      setLoaded(webView != nullptr && webView->loadedOK());
+      setLoaded(webView != nullptr && webView->loadedOK() &&
+                currentStatus.load(std::memory_order_acquire) !=
+                    WebViewStatus::runtimeUnavailable);
     } catch (const std::exception &) {
       webView.reset();
       setLoaded(false);
@@ -708,6 +740,10 @@ struct WebViewGeneration : public std::enable_shared_from_this<WebViewGeneration
       replaceWebViewOnOwner();
       if (usableOnOwner()) {
         return true;
+      }
+      if (currentStatus.load(std::memory_order_acquire) ==
+          WebViewStatus::runtimeUnavailable) {
+        return false;
       }
       if (currentStatus.load(std::memory_order_acquire) ==
           WebViewStatus::unsupportedApartment) {

@@ -366,6 +366,17 @@ void testInstanceResetAndPreviewMeasurementGate() {
 void testSpectrumCapture() {
   auto engine = std::make_unique<EngineHost>();
   std::string error;
+  auto &capture = engine->spectrumCapture();
+#ifdef EFFETUNE_HAS_NATIVE_SPECTRUM_TAP
+  expect(capture.nativeAnalysisSupported(), "native analysis capability is available before preparation");
+  for (const auto quality : {SpectrumQuality::normal, SpectrumQuality::hq})
+    expect(!capture.setTap(1, SpectrumMode::after, quality), "unprepared native capture rejects active subscriptions");
+  std::uint32_t initialDropped = 0;
+  expect(!capture.capturing() && capture.read(initialDropped).empty() && initialDropped == 0,
+         "native capability does not enable capture before preparation");
+#else
+  expect(!capture.nativeAnalysisSupported(), "legacy capture does not advertise native analysis before preparation");
+#endif
   expect(engine->prepare(48000, 8, 257, EngineHost::kDefaultTelemetryBytes, &error), "prepare spectrum capture");
   const auto gainHash = engine->kernels().at("TestGainPlugin").paramsHash;
   const auto gain = [&](std::uint32_t id, float value) {
@@ -385,7 +396,6 @@ void testSpectrumCapture() {
   pipeline.plugins[2].inputBus = 4;
   pipeline.plugins[2].channel = "A";
   expect(engine->rebuild(pipeline, {gain(1, 2), gain(2, 3), gain(3, 4)}, &error), "build routed spectrum fixture");
-  auto &capture = engine->spectrumCapture();
   expect(capture.setTap(1, SpectrumMode::compare) && capture.setTap(2, SpectrumMode::compare) &&
          capture.setTap(3, SpectrumMode::after), "subscribe multiple node spectra");
   std::array<std::array<float, 257>, 8> audio{};
@@ -407,6 +417,19 @@ void testSpectrumCapture() {
   auto frames = capture.read(dropped);
   expect(frames.size() == 3 && dropped == 0, "all selected nodes produce normal spectra");
   for (const auto &frame : frames) {
+#ifdef EFFETUNE_HAS_NATIVE_SPECTRUM_TAP
+    const auto &analysis = frame.analysis;
+    const float input = frame.pluginId == 1 ? 4.5f : 7.0f;
+    const float output = frame.pluginId == 1 ? 9.0f : 21.0f;
+    expect(std::abs(analysis.output.current[0] - 20 * std::log10(output)) < 0.001f,
+           "native spectrum observes the routed node output before bus mixing");
+    if (frame.mode == SpectrumMode::compare)
+      expect(std::abs(analysis.input.current[0] - 20 * std::log10(input)) < 0.001f,
+             "native Compare observes the routed input channel mean");
+    expect(analysis.timing.captureEndFrame <= clock && analysis.timing.generation > 0 &&
+           analysis.timing.windowAgeFrames == 2048 && analysis.timing.tapDelayFrames == 0,
+           "native Normal publishes the capture timeline and analysis window contract");
+#else
     const auto index = (frame.bufferPosition + SpectrumFrame::kSamples - 1) % SpectrumFrame::kSamples;
     if (frame.pluginId == 1) expect(frame.input[index] == 4.5f && frame.output[index] == 9,
                                   "all-channel tap observes its own effect, not the final output");
@@ -414,6 +437,7 @@ void testSpectrumCapture() {
                                   "selected channel pair tap observes the send before destination mixing");
     if (frame.pluginId == 3) expect(frame.output[index] == 21,
                                   "return tap observes the routed bus before merging main output");
+#endif
   }
   expect(audio[2][0] == 78 && audio[0][0] == 2 && engine->pipelineLatency() == 0,
          "capture does not alter audio, buses or latency");
@@ -431,8 +455,27 @@ void testSpectrumCapture() {
   expect(capture.setTap(5, SpectrumMode::compare), "compare delayed effect");
   for (int block = 0; block < 32; ++block) render();
   frames = capture.read(dropped);
-  expect(frames.size() == 1 && frames[0].input == frames[0].output && engine->pipelineLatency() == 192,
+  expect(frames.size() == 1 && engine->pipelineLatency() == 192 &&
+#ifdef EFFETUNE_HAS_NATIVE_SPECTRUM_TAP
+         frames[0].analysis.input.current == frames[0].analysis.output.current,
+#else
+         frames[0].input == frames[0].output,
+#endif
          "Compare aligns input by intrinsic effect latency without adding host latency");
+#ifdef EFFETUNE_HAS_NATIVE_SPECTRUM_TAP
+  pipeline.plugins.insert(pipeline.plugins.begin(), PluginState{1, "Gain", true});
+  expect(engine->rebuild(pipeline, {gain(1, 2), delay}, &error), "build taps before and after intrinsic delay");
+  expect(capture.setTap(1, SpectrumMode::after), "observe early pipeline tap");
+  for (int block = 0; block < 32; ++block) render();
+  frames = capture.read(dropped);
+  expect(frames.size() == 2, "both delay-path taps produce a spectrum");
+  for (const auto &frame : frames)
+    expect(frame.analysis.timing.tapDelayFrames == (frame.pluginId == 1 ? 192u : 0u),
+           "bridge receives each tap's remaining delay rather than total pipeline latency");
+  expect(capture.setTap(1, SpectrumMode::off), "disable early delay-path tap");
+  pipeline.plugins.erase(pipeline.plugins.begin());
+  expect(engine->rebuild(pipeline, {delay}, &error), "restore isolated delay fixture");
+#endif
   render();
   render(true);
   expect(capture.read(dropped).empty(), "master bypass invalidates queued spectra");
@@ -469,8 +512,37 @@ void testSpectrumCapture() {
   expect(capture.setTap(7, SpectrumMode::compare), "enable real EQ spectrum");
   for (int block = 0; block < 32; ++block) render();
   frames = capture.read(dropped);
-  expect(frames.size() == 1 && frames[0].pluginId == 7 && frames[0].input == frames[0].output,
+  expect(frames.size() == 1 && frames[0].pluginId == 7 &&
+#ifdef EFFETUNE_HAS_NATIVE_SPECTRUM_TAP
+         frames[0].analysis.input.current == frames[0].analysis.output.current,
+#else
+         frames[0].input == frames[0].output,
+#endif
          "normal spectrum and Compare work for actual FiveBandPEQ");
+#ifdef EFFETUNE_HAS_NATIVE_SPECTRUM_TAP
+  const auto normalGeneration = frames[0].analysis.timing.generation;
+  for (const auto mode : {SpectrumMode::after, SpectrumMode::compare}) {
+    expect(capture.setTap(7, mode, SpectrumQuality::hq), "subscribe native HQ on actual EQ");
+    expect(capture.read(dropped).empty(), "quality/mode edits discard old analyses");
+    bool published = false;
+    for (int poll = 0; poll < 8; ++poll) {
+      for (int block = 0; block < 24; ++block) render();
+      frames = capture.read(dropped);
+      if (frames.empty()) continue;
+      const auto &hq = frames[0].analysis;
+      expect(frames.size() == 1 && dropped == 0 && hq.quality == effetune::SpectrumTapQuality::HQ &&
+             hq.mode == static_cast<effetune::SpectrumTapMode>(mode) && hq.timing.generation > normalGeneration &&
+             hq.timing.windowAgeFrames == 8192 && hq.timing.completionFrames > 0 &&
+             hq.output.validCellCount > 0 && hq.output.validCellCount <= 2048,
+             "HQ After/Compare publish native spectra and the shared timing profile");
+      if (mode == SpectrumMode::compare)
+        expect(hq.input.current == hq.output.current, "HQ Compare retains aligned input/output for flat EQ");
+      published = true;
+    }
+    expect(published, "actual HQ analysis reaches the polling consumer");
+  }
+  expect(capture.setTap(7, SpectrumMode::compare), "restore Normal after HQ");
+#endif
   for (int block = 0; block < 2200; ++block) render();
   expect(capture.read(dropped).empty() && dropped > 0, "queue saturation is bounded, observable and drops stale display data");
   for (int block = 0; block < 32; ++block) render();
@@ -478,6 +550,40 @@ void testSpectrumCapture() {
   capture.stopCapture();
   for (int block = 0; block < 32; ++block) render();
   expect(capture.read(dropped).empty(), "editor closure stops capture");
+#ifdef EFFETUNE_HAS_NATIVE_SPECTRUM_TAP
+  expect(capture.setTap(1, SpectrumMode::after), "retain an active tap across preparation changes");
+  expect(engine->prepare(192000 * 8, 8, 257, EngineHost::kDefaultTelemetryBytes, &error),
+         "a Spectrum Tap rate limit cannot prevent oversampled engine preparation");
+  pipeline.plugins = {PluginState{1, "Gain", true}};
+  expect(engine->rebuild(pipeline, {gain(1, 2)}, &error), "build high-rate audio independently of display support");
+  expect(capture.nativeAnalysisSupported(), "unsupported capture rates do not change native API capability");
+  for (const auto quality : {SpectrumQuality::normal, SpectrumQuality::hq})
+    expect(!capture.setTap(1, SpectrumMode::after, quality), "unsupported capture rate refuses the display subscription explicitly");
+  for (int block = 0; block < 32; ++block) render();
+  expect(capture.read(dropped).empty() && dropped == 0,
+         "unsupported-rate preparation prevents an existing tap from publishing analysis");
+  expect(audio[0][0] == 2 && engine->pipelineLatency() == 0,
+         "unavailable display analysis preserves high-rate processed audio and latency");
+  expect(engine->prepare(48000, 8, 257, EngineHost::kDefaultTelemetryBytes, &error),
+         "restore a valid native capture rate");
+  expect(engine->rebuild(pipeline, {gain(1, 2)}, &error), "restore audio after unsupported capture preparation");
+  for (const auto quality : {SpectrumQuality::normal, SpectrumQuality::hq}) {
+    expect(capture.nativeAnalysisSupported() && capture.setTap(1, SpectrumMode::after, quality),
+           "valid preparation admits Normal and HQ capture again");
+    bool published = false;
+    for (int poll = 0; poll < 8; ++poll) {
+      for (int block = 0; block < 24; ++block) render();
+      frames = capture.read(dropped);
+      expect(dropped == 0, "restored capture stays within the bounded polling queue");
+      if (frames.empty()) continue;
+      expect(frames.size() == 1 &&
+             frames[0].analysis.quality == static_cast<effetune::SpectrumTapQuality>(quality),
+             "restored analysis retains the requested quality");
+      published = true;
+    }
+    expect(published, "Normal and HQ analysis publish after valid preparation is restored");
+  }
+#endif
 }
 
 void testCircuitFaultPublication() {
@@ -540,10 +646,15 @@ void testSpectrumRouter() {
   expect(MessageRouter::decode(R"({"type":"spectrum/setTap","payload":{"pluginId":7,"enabled":true,"mode":"compare"}})", message, &error) &&
          message.action == UiAction::setSpectrumTap && message.pluginId == 7 && message.spectrumMode == SpectrumMode::compare,
          "route a Compare subscription");
+  expect(message.spectrumQuality == SpectrumQuality::normal, "older spectrum requests default to Normal");
+  expect(MessageRouter::decode(R"({"type":"spectrum/setTap","payload":{"pluginId":7,"enabled":true,"mode":"after","quality":"hq"}})", message, &error) &&
+         message.spectrumQuality == SpectrumQuality::hq, "route HQ quality independently of mode");
   for (const auto *request : {
       R"({"type":"spectrum/setTap","payload":{"pluginId":0,"enabled":true}})",
       R"({"type":"spectrum/setTap","payload":{"pluginId":1.5,"enabled":true}})",
       R"({"type":"spectrum/setTap","payload":{"pluginId":7,"enabled":"yes"}})",
+      R"({"type":"spectrum/setTap","payload":{"pluginId":7,"enabled":true,"quality":1}})",
+      R"({"type":"spectrum/setTap","payload":{"pluginId":7,"enabled":true,"quality":"ultra"}})",
       R"({"type":"spectrum/setTap","payload":{"pluginId":7,"enabled":true,"mode":"hq"}})"})
     expect(!MessageRouter::decode(request, message, &error), "reject malformed spectrum subscription");
 }

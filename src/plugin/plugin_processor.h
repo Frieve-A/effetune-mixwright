@@ -97,6 +97,8 @@ public:
   Steinberg::tresult PLUGIN_API setParamNormalized(
       Steinberg::Vst::ParamID tag,
       Steinberg::Vst::ParamValue value) SMTG_OVERRIDE;
+  Steinberg::tresult PLUGIN_API notify(
+      Steinberg::Vst::IMessage *message) SMTG_OVERRIDE;
 
   [[nodiscard]] std::string handleUiMessage(std::string_view message);
   [[nodiscard]] bool attachEditor(void *owner, void *parent, std::int32_t width,
@@ -110,6 +112,8 @@ public:
                                                void **obj) SMTG_OVERRIDE {
     QUERY_INTERFACE(iid, obj, Steinberg::Vst::IAutomationState::iid,
                     Steinberg::Vst::IAutomationState)
+    QUERY_INTERFACE(iid, obj, Steinberg::Vst::IConnectionPoint::iid,
+                    Steinberg::Vst::IConnectionPoint)
     return SingleComponentEffect::queryInterface(iid, obj);
   }
 
@@ -155,6 +159,16 @@ private:
     std::uint32_t oversamplingFactor = 1;
     std::uint64_t generation = 1;
   };
+
+  struct NowPlayingMetadata {
+    std::string title;
+    std::string album;
+    std::string artist;
+    std::string artworkDataUrl;
+  };
+
+  void appendNowPlayingSnapshot(choc::value::Value &result,
+                                std::uint64_t knownRevision);
 
   [[nodiscard]] bool configureDsp(std::string *error = nullptr,
                                   bool waitForUiRepack = false);
@@ -822,6 +836,11 @@ private:
   // Guards the pending automation deltas alone. The audio callback never
   // takes it, so the editor's frame-rate drain cannot stall a block.
   std::mutex automationDeltaMutex_;
+  // Transient host metadata is independent of pipeline state and never read
+  // by process(). Each UI page supplies its own revision when polling it.
+  std::mutex nowPlayingMutex_;
+  NowPlayingMetadata nowPlaying_;
+  std::uint64_t nowPlayingRevision_ = 1;
   std::mutex editorMutex_;
   std::mutex assetTransferMutex_;
   std::shared_ptr<WebViewHost> webView_;

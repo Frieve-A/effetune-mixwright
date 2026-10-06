@@ -12,6 +12,8 @@ if (assetsIndex < 0 || !args[assetsIndex + 1]) {
 }
 
 const assets = path.resolve(args[assetsIndex + 1]);
+const sourceIndex = args.indexOf('--source');
+const upstreamSource = path.resolve(sourceIndex < 0 ? path.join(projectRoot, 'external', 'effetune') : args[sourceIndex + 1]);
 const html = await readFile(path.join(assets, 'effetune.html'), 'utf8');
 const app = await readFile(path.join(assets, 'js', 'app.js'), 'utf8');
 const startup = await readFile(path.join(assets, 'js', 'startup.js'), 'utf8');
@@ -93,7 +95,7 @@ if (notices !== sourceNotices) {
   throw new Error('The generated UI does not contain the complete third-party notices');
 }
 const sharedDialogCss = await readFile(path.join(assets, 'css', 'effetune-library.css'), 'utf8');
-const upstreamDialogCss = await readFile(path.join(projectRoot, 'external', 'effetune', 'css', 'effetune-library.css'), 'utf8');
+const upstreamDialogCss = await readFile(path.join(upstreamSource, 'css', 'effetune-library.css'), 'utf8');
 if (sharedDialogCss !== upstreamDialogCss ||
     html.split('<link rel="stylesheet" href="css/effetune-library.css">').length - 1 !== 1) {
   throw new Error('Shared upstream dialog styling must be retained completely and loaded at startup');
@@ -164,8 +166,9 @@ for (const [label, source] of productBrandingSources) {
 if (html.indexOf('vst-bootstrap.js') > html.indexOf('js/startup.js')) {
   throw new Error('The VST bootstrap must load before the startup module');
 }
-if (!bootstrap.includes('html { background-color: #1e1e1e; }')) {
-  throw new Error('The VST document background does not match the dark UI');
+if (!bootstrap.includes('html { background-color: var(--et-base); }') ||
+    !bootstrap.includes('color-scheme: var(--et-color-scheme);')) {
+  throw new Error('The VST document and native controls do not follow the selected theme');
 }
 if (!bootstrap.includes('const needsHomeKeyForEditing = target => {') ||
     !bootstrap.includes("tagName === 'input'") ||
@@ -235,8 +238,8 @@ if (!history.includes('id: plugin.id') ||
     historyIdReservation > historyPluginCreation) {
   throw new Error('Undo/redo history IDs or single native synchronization contract is missing');
 }
-if (!app.includes('applyStartupViewPreference() {}') ||
-    !app.includes('async openConfiguredStartupView() {}') ||
+if (!app.includes("if (this.startupConfig?.startupView === 'visualizer')") ||
+    !app.includes('await this.uiManager?.showVisualizerView?.();') ||
     app.includes('applyInitialStartupViewClass(config, windowRef)') ||
     app.includes('this.uiManager?.showLibraryView?.(') ||
     uiManager.includes('this.toggleLibraryView();') ||
@@ -315,11 +318,16 @@ if (!bootstrap.includes('.subtitle-container,') ||
 }
 if (!bootstrap.includes('.config-dialog .device-section { display: none !important; }') ||
     !bootstrap.includes('.config-dialog .device-section:has(#language-select) { display: block !important; }') ||
+    !bootstrap.includes('.config-dialog .device-section:has(#theme-select),') ||
+    !bootstrap.includes('.config-dialog .device-section:has(#startup-view-effects),') ||
+    !bootstrap.includes('.config-dialog .device-section:has(#spectrum-overlay-display) { display: block !important; }') ||
+    !bootstrap.includes('.config-dialog .radio-container:has(#startup-view-library),') ||
+    !bootstrap.includes('.config-dialog .spectrum-overlay-row:has(#spectrum-overlay-quality) { display: none !important; }') ||
     !bootstrap.includes('.config-dialog #physical-control-section { display: block !important; }')) {
-  throw new Error('The VST settings dialog does not expose language and controller mapping sections');
+  throw new Error('The VST settings dialog does not expose supported UI preferences and controller mapping sections');
 }
 const configIntegration = await readFile(path.join(assets, 'js', 'electron', 'configIntegration.js'), 'utf8');
-if (!configIntegration.includes("const categories = ['general', 'controllers'];") ||
+if (!configIntegration.includes("const categories = ['general', 'startup', 'display', 'controllers'];") ||
     !configIntegration.includes('${Object.keys(categoryPanels).map(category => `') ||
     !configIntegration.includes('id="config-panel-${category}" hidden>')) {
   throw new Error('The VST settings navigation exposes unsupported standalone categories');
@@ -374,13 +382,13 @@ if (!audioAdapter.includes('name: plugin.name || logical?.name') ||
     !audioAdapter.includes("__effetuneHostCall('pipeline/masterBypass'")) {
   throw new Error('The VST display-name or telemetry byte-count contract is missing');
 }
-if (!app.includes("config.spectrumOverlayQuality = 'normal';") ||
+if (!app.includes("if (!windowRef.__effetuneNativeSpectrum) config.spectrumOverlayQuality = 'normal';") ||
     !audioAdapter.includes("message.type === 'setSpectrumTapRoute'") ||
     !audioAdapter.includes("__effetuneHostCall('spectrum/setTap'") ||
     !audioAdapter.includes('this.nativePort.dispatchSpectrumOverlays(result.spectrumOverlays, spectrumRevision);') ||
     audioAdapter.indexOf('this.nativePort.dispatchSpectrumOverlays(result.spectrumOverlays, spectrumRevision);') >
       audioAdapter.indexOf('if (!result.packet || !result.bytes) return;')) {
-  throw new Error('The normal spectrum overlay PCM route must run independently of DSP telemetry packets');
+  throw new Error('Spectrum delivery and capability-gated quality must run independently of DSP telemetry packets');
 }
 for (const fragment of [
   "message.type === 'setPluginAsset'",
@@ -651,11 +659,12 @@ if (!beginPointerGestureBody.includes('this.effectToggleAutomationTarget(event)'
 // reloaded page -- which starts with no gesture targets at all -- can never
 // name to close. The page announcing its own startup is the boundary that ends
 // it, and it is a boundary only because no other host/getInfo carries the flag.
-const startupHandshakes =
-  audioAdapter.split("__effetuneHostCall('host/getInfo', { startup: true })").length - 1;
-if (startupHandshakes !== 1 ||
-    !/initAudio\(\) \{[\s\S]{0,700}?__effetuneHostCall\('host\/getInfo', \{ startup: true \}\)/
-      .test(audioAdapter)) {
+const startupHandshakes = [...audioAdapter.matchAll(
+  /__effetuneHostCall\('host\/getInfo', \{[^{}]*\bstartup: true\b[^{}]*\}\)/g)];
+const initAudioIndex = audioAdapter.indexOf('  async initAudio() {');
+if (startupHandshakes.length !== 1 || initAudioIndex < 0 ||
+    startupHandshakes[0].index < initAudioIndex ||
+    startupHandshakes[0].index > initAudioIndex + 700) {
   throw new Error('A reloaded page does not announce itself, so a touch the ' +
     'destroyed context left open can never be ended');
 }

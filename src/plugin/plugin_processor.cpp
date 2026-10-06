@@ -153,6 +153,43 @@ void assignString128(TChar *destination, const std::string &value) noexcept {
   return text == nullptr ? std::string{} : std::string(text);
 }
 
+inline constexpr std::size_t kMaximumNowPlayingTextUnits = 4096;
+inline constexpr std::uint32_t kMaximumNowPlayingArtworkBytes = 8u * 1024u * 1024u;
+
+[[nodiscard]] bool readNowPlayingString(IAttributeList &attributes,
+                                       const char *key, std::string &value) {
+  std::array<TChar, kMaximumNowPlayingTextUnits + 1> characters{};
+  if (attributes.getString(key, characters.data(),
+                           static_cast<uint32>(sizeof(characters))) != kResultOk) {
+    // Missing fields clear the snapshot; a known field of the wrong type
+    // rejects it rather than silently clearing the previous track.
+    int64 integer = 0;
+    double floating = 0.0;
+    const void *binary = nullptr;
+    uint32 bytes = 0;
+    return attributes.getInt(key, integer) != kResultOk &&
+           attributes.getFloat(key, floating) != kResultOk &&
+           attributes.getBinary(key, binary, bytes) != kResultOk;
+  }
+  const auto end = std::find(characters.begin(), characters.end(), TChar{});
+  if (end == characters.end()) {
+    return false;
+  }
+  for (auto current = characters.begin(); current != end; ++current) {
+    const auto unit = static_cast<std::uint16_t>(*current);
+    if (unit >= 0xd800u && unit <= 0xdbffu) {
+      if (++current == end || static_cast<std::uint16_t>(*current) < 0xdc00u ||
+          static_cast<std::uint16_t>(*current) > 0xdfffu) {
+        return false;
+      }
+    } else if (unit >= 0xdc00u && unit <= 0xdfffu) {
+      return false;
+    }
+  }
+  value = utf8FromTChars(characters.data());
+  return true;
+}
+
 [[nodiscard]] std::string trimmed(const std::string &value) {
   const auto isSpace = [](const unsigned char character) noexcept {
     return character == ' ' || character == '\t' || character == '\r' ||
@@ -417,6 +454,11 @@ tresult PLUGIN_API EffeTuneProcessor::terminate() {
     retiredWebView->shutdown();
   }
   retiredWebView.reset();
+  {
+    std::scoped_lock metadataLock(nowPlayingMutex_);
+    nowPlaying_ = {};
+    ++nowPlayingRevision_;
+  }
   std::scoped_lock resources(processingResourcesMutex_);
   engineOutputBuffer_.clear();
   dryTransitionBuffer_.clear();
@@ -424,6 +466,91 @@ tresult PLUGIN_API EffeTuneProcessor::terminate() {
   // this teardown made would otherwise never be written.
   trace::flush();
   return SingleComponentEffect::terminate();
+}
+
+tresult PLUGIN_API EffeTuneProcessor::notify(IMessage *message) {
+  if (message == nullptr || message->getMessageID() == nullptr) {
+    return kInvalidArgument;
+  }
+  if (!FIDStringsEqual(message->getMessageID(), "EffeTune.NowPlaying")) {
+    if (FIDStringsEqual(message->getMessageID(), "TextMessage") &&
+        message->getAttributes() == nullptr) {
+      return kInvalidArgument;
+    }
+    return SingleComponentEffect::notify(message);
+  }
+
+  try {
+    NowPlayingMetadata replacement;
+    if (auto *attributes = message->getAttributes(); attributes != nullptr) {
+      std::string mimeType;
+      if (!readNowPlayingString(*attributes, "title", replacement.title) ||
+          !readNowPlayingString(*attributes, "album", replacement.album) ||
+          !readNowPlayingString(*attributes, "artist", replacement.artist) ||
+          !readNowPlayingString(*attributes, "artworkMimeType", mimeType)) {
+        return kInvalidArgument;
+      }
+      const void *artwork = nullptr;
+      uint32 artworkBytes = 0;
+      if (attributes->getBinary("artwork", artwork, artworkBytes) != kResultOk) {
+        TChar string = 0;
+        int64 integer = 0;
+        double floating = 0.0;
+        if (attributes->getString("artwork", &string, sizeof(string)) == kResultOk ||
+            attributes->getInt("artwork", integer) == kResultOk ||
+            attributes->getFloat("artwork", floating) == kResultOk) {
+          return kInvalidArgument;
+        }
+        artworkBytes = 0;
+      }
+      if (artworkBytes > kMaximumNowPlayingArtworkBytes ||
+          (artworkBytes != 0 && artwork == nullptr)) {
+        return kInvalidArgument;
+      }
+      if (artworkBytes != 0) {
+        if (mimeType != "image/png" && mimeType != "image/jpeg" &&
+            mimeType != "image/gif" && mimeType != "image/webp") {
+          return kInvalidArgument;
+        }
+        // IMessage owns the borrowed bytes. Encoding now keeps the snapshot
+        // self-contained without retaining a host object or doing work in process().
+        replacement.artworkDataUrl = "data:" + mimeType + ";base64," +
+            choc::base64::encodeToString(artwork, artworkBytes);
+      }
+    }
+    std::scoped_lock metadataLock(nowPlayingMutex_);
+    nowPlaying_ = std::move(replacement);
+    ++nowPlayingRevision_;
+    return kResultOk;
+  } catch (const std::exception &) {
+    return kResultFalse;
+  }
+}
+
+void EffeTuneProcessor::appendNowPlayingSnapshot(
+    choc::value::Value &result, const std::uint64_t knownRevision) {
+  std::scoped_lock metadataLock(nowPlayingMutex_);
+  result.addMember("nowPlayingRevision", static_cast<std::int64_t>(nowPlayingRevision_));
+  if (knownRevision == nowPlayingRevision_) {
+    return;
+  }
+  if (nowPlaying_.title.empty() && nowPlaying_.album.empty() &&
+      nowPlaying_.artist.empty() && nowPlaying_.artworkDataUrl.empty()) {
+    result.addMember("nowPlaying", choc::value::Value{});
+    return;
+  }
+  auto metadata = choc::value::createObject({});
+  metadata.addMember("title", nowPlaying_.title);
+  metadata.addMember("album", nowPlaying_.album);
+  metadata.addMember("artist", nowPlaying_.artist);
+  auto artwork = choc::value::createEmptyArray();
+  if (!nowPlaying_.artworkDataUrl.empty()) {
+    auto image = choc::value::createObject({});
+    image.addMember("src", nowPlaying_.artworkDataUrl);
+    artwork.addArrayElement(std::move(image));
+  }
+  metadata.addMember("artwork", std::move(artwork));
+  result.addMember("nowPlaying", std::move(metadata));
 }
 
 tresult PLUGIN_API EffeTuneProcessor::setActive(const TBool state) {
@@ -3862,6 +3989,7 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     result.addMember("ok", true);
     result.addMember("sampleRate", context.sampleRate);
     result.addMember("engineSampleRate", context.engineSampleRate);
+    result.addMember("nativeSpectrumTap", engine_.spectrumCapture().nativeAnalysisSupported());
     result.addMember("channels", static_cast<std::int64_t>(context.channels));
     result.addMember("oversamplingFactor",
                      static_cast<std::int64_t>(context.oversamplingFactor));
@@ -3897,6 +4025,7 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     appendExecutionStates(result);
     appendAutomationDeltas(result);
     appendDeferredDiagnostics(result);
+    appendNowPlayingSnapshot(result, message.nowPlayingRevision);
     return choc::json::toString(result);
   }
 
@@ -3930,7 +4059,8 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
            std::none_of(runtimePlugins_.begin(), runtimePlugins_.end(), [&](const RuntimePlugin &plugin) {
              return plugin.logicalId == message.pluginId;
            }))) return bridgeResult(false, "The plug-in is no longer available.");
-      return bridgeResult(engine_.spectrumCapture().setTap(message.pluginId, message.spectrumMode));
+      return bridgeResult(engine_.spectrumCapture().setTap(
+          message.pluginId, message.spectrumMode, message.spectrumQuality));
     } catch (const std::exception &) {
       return bridgeResult(false, "Unable to start the spectrum display. Try turning it on again.");
     }
@@ -3970,15 +4100,43 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
       overlay.addMember("type", "spectrumOverlay");
       overlay.addMember("spectrumPluginId", static_cast<std::int64_t>(frame.pluginId));
       overlay.addMember("mode", frame.mode == SpectrumMode::compare ? "compare" : "after");
+      static_assert(std::endian::native == std::endian::little);
+#ifdef EFFETUNE_HAS_NATIVE_SPECTRUM_TAP
+      const auto &analysis = frame.analysis;
+      overlay.addMember("quality", analysis.quality == effetune::SpectrumTapQuality::HQ ? "hq" : "normal");
+      overlay.addMember("sampleRate", analysis.sampleRate);
+      overlay.addMember("endFrame", static_cast<std::int64_t>(analysis.timing.captureEndFrame));
+      auto timing = choc::value::createObject({});
+      timing.addMember("version", static_cast<std::int64_t>(analysis.timing.version));
+      timing.addMember("generation", static_cast<std::int64_t>(analysis.timing.generation));
+      timing.addMember("frameIndex", static_cast<std::int64_t>(analysis.timing.frameIndex));
+      timing.addMember("captureEndFrame", static_cast<std::int64_t>(analysis.timing.captureEndFrame));
+      timing.addMember("windowAgeFrames", static_cast<std::int64_t>(analysis.timing.windowAgeFrames));
+      timing.addMember("completionFrames", static_cast<std::int64_t>(analysis.timing.completionFrames));
+      timing.addMember("tapDelayFrames", static_cast<std::int64_t>(analysis.timing.tapDelayFrames));
+      overlay.addMember("timing", std::move(timing));
+      const auto spectrumValue = [](const effetune::SpectrumTapSpectrum &spectrum) {
+        auto value = choc::value::createObject({});
+        value.addMember("current", choc::base64::encodeToString(
+            spectrum.current.data(), spectrum.current.size() * sizeof(float)));
+        value.addMember("peaks", choc::base64::encodeToString(
+            spectrum.peaks.data(), spectrum.peaks.size() * sizeof(float)));
+        value.addMember("validCellCount", static_cast<std::int64_t>(spectrum.validCellCount));
+        return value;
+      };
+      overlay.addMember("outputSpectrum", spectrumValue(analysis.output));
+      if (frame.mode == SpectrumMode::compare)
+        overlay.addMember("inputSpectrum", spectrumValue(analysis.input));
+#else
       overlay.addMember("quality", "normal");
       overlay.addMember("bufferPosition", static_cast<std::int64_t>(frame.bufferPosition));
       overlay.addMember("sampleRate", frame.sampleRate);
-      static_assert(std::endian::native == std::endian::little);
       overlay.addMember("outputBuffer", choc::base64::encodeToString(
           frame.output.data(), frame.output.size() * sizeof(float)));
       if (frame.mode == SpectrumMode::compare)
         overlay.addMember("inputBuffer", choc::base64::encodeToString(
             frame.input.data(), frame.input.size() * sizeof(float)));
+#endif
       overlays.addArrayElement(std::move(overlay));
     }
     result.addMember("spectrumOverlays", std::move(overlays));
@@ -4007,6 +4165,7 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
                                    : choc::base64::encodeToString(telemetryScratch_.data(), bytes));
     appendAutomationDeltas(result);
     appendDeferredDiagnostics(result);
+    appendNowPlayingSnapshot(result, message.nowPlayingRevision);
     return choc::json::toString(result);
   }
 

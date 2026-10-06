@@ -19,8 +19,8 @@
 // Thread rules:
 //   * emit() is wait-free and allocation-free, so the audio thread may call it.
 //     It claims a slot with one compare-exchange, writes a trivially copyable
-//     record into it and publishes the slot. A full ring drops the record and
-//     counts the drop rather than blocking.
+//     record into it and publishes the slot. A full ring or producer contention
+//     drops the record and counts the drop rather than blocking.
 //   * flush() writes the drained records to the file. It takes a mutex and
 //     performs I/O, so only control threads may call it -- the ~50 ms control
 //     service tick is what drives it.
@@ -343,20 +343,15 @@ inline void emit(Record record) noexcept {
     return;
   }
   auto claim = state->claimed.load(std::memory_order_relaxed);
-  for (;;) {
-    if (claim - state->drainedIndex.load(std::memory_order_acquire) >=
-        static_cast<std::uint64_t>(kRingCapacity)) {
-      // A full ring drops the record and counts it. Blocking here would be a
-      // priority inversion on the audio thread, and stalling a block to keep a
-      // diagnostic would change the very behaviour being measured.
-      state->drops.fetch_add(1u, std::memory_order_relaxed);
-      return;
-    }
-    if (state->claimed.compare_exchange_weak(claim, claim + 1u,
-                                             std::memory_order_acq_rel,
-                                             std::memory_order_relaxed)) {
-      break;
-    }
+  if (claim - state->drainedIndex.load(std::memory_order_acquire) >=
+          static_cast<std::uint64_t>(kRingCapacity) ||
+      !state->claimed.compare_exchange_strong(claim, claim + 1u,
+                                              std::memory_order_acq_rel,
+                                              std::memory_order_relaxed)) {
+    // A full ring or a competing producer drops the record and counts it.
+    // Retrying would make the audio thread wait on control-thread activity.
+    state->drops.fetch_add(1u, std::memory_order_relaxed);
+    return;
   }
   record.sequence = claim;
   record.timeNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -653,7 +648,7 @@ inline void flush() noexcept {
   }
   const auto drops = state->drops.load(std::memory_order_relaxed);
   if (drops != state->reportedDrops) {
-    std::fprintf(state->file, "# dropped %llu records (ring full)\n",
+    std::fprintf(state->file, "# dropped %llu records (ring full or producer contention)\n",
                  static_cast<unsigned long long>(drops - state->reportedDrops));
     state->reportedDrops = drops;
     wrote = true;

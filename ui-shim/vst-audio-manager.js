@@ -389,11 +389,14 @@ class NativePort {
     if (message.type === 'setSpectrumTapRoute' || message.type === 'setSpectrumTap') {
       if (!Number.isInteger(message.pluginId) || message.pluginId <= 0) return;
       const tap = this.spectrumTaps.get(message.pluginId) ||
-        { pluginId: message.pluginId, route: true, enabled: false, mode: 'after' };
+        { pluginId: message.pluginId, route: true, enabled: false, mode: 'after', quality: 'normal' };
       if (message.type === 'setSpectrumTapRoute') tap.route = message.enabled === true;
       else {
         tap.enabled = message.enabled === true;
-        if (tap.enabled) tap.mode = message.mode === 'compare' ? 'compare' : 'after';
+        if (tap.enabled) {
+          tap.mode = message.mode === 'compare' ? 'compare' : 'after';
+          tap.quality = message.quality === 'hq' ? 'hq' : 'normal';
+        }
       }
       this.spectrumTaps.set(tap.pluginId, tap);
       this.synchronizeSpectrumTaps();
@@ -851,19 +854,19 @@ class NativePort {
       const retained = all.some(plugin => plugin.id === id);
       const enabled = retained && tap.route && tap.enabled && !this.spectrumClosed &&
         !document.hidden && current.some(plugin => plugin.id === id);
-      const publication = `${enabled}:${tap.mode}`;
+      const publication = `${enabled}:${tap.mode}:${tap.quality}`;
       if (force || publication !== tap.publication) {
         tap.publication = publication;
         const revision = ++this.spectrumRevision;
-        const payload = { pluginId: id, enabled, mode: tap.mode };
+        const payload = { pluginId: id, enabled, mode: tap.mode, quality: tap.quality };
         // Preserve Off/After/Compare order even when bridge replies are delayed.
         this.spectrumRequests = this.spectrumRequests.then(() =>
           window.__effetuneHostCall('spectrum/setTap', payload)).then(result => {
-          if (result?.ok === false) throw new Error('Spectrum capture was not accepted');
+          if (result?.ok === false) throw new Error(result.error || 'The spectrum could not be started. Check the audio settings and try again.');
           this.spectrumPublishedRevision = revision;
         }).catch(error => {
           console.error('[EffeTune Mixwright] spectrum capture failed', error);
-          window.uiManager?.setError?.('The spectrum could not be updated. Turn it off and try again.', false);
+          window.uiManager?.setError?.('The spectrum could not be started. Check the audio settings and try again.', false);
         });
       }
       if (!retained || !tap.route) this.spectrumTaps.delete(id);
@@ -874,20 +877,35 @@ class NativePort {
     if (document.hidden || this.spectrumClosed || revision !== this.spectrumRevision ||
         revision !== this.spectrumPublishedRevision || !Array.isArray(frames)) return;
     const current = this.owner.getCurrentPipeline?.() || [];
-    const decode = encoded => {
+    const decode = (encoded, cells = 4096) => {
       if (typeof encoded !== 'string') return null;
       const binary = atob(encoded);
-      if (binary.length !== 4096 * Float32Array.BYTES_PER_ELEMENT) return null;
+      if (binary.length !== cells * Float32Array.BYTES_PER_ELEMENT) return null;
       const bytes = Uint8Array.from(binary, character => character.charCodeAt(0));
       return new Float32Array(bytes.buffer);
     };
     for (const frame of frames) {
       const tap = this.spectrumTaps.get(frame.spectrumPluginId);
       if (!tap?.route || !tap.enabled || tap.mode !== frame.mode ||
-          frame.quality !== 'normal' || !current.some(plugin => plugin.id === tap.pluginId) ||
-          !Number.isFinite(frame.sampleRate) || frame.sampleRate <= 0 ||
-          !Number.isInteger(frame.bufferPosition) || frame.bufferPosition < 0 || frame.bufferPosition >= 4096) continue;
+          frame.quality !== tap.quality || !current.some(plugin => plugin.id === tap.pluginId) ||
+          !Number.isFinite(frame.sampleRate) || frame.sampleRate <= 0) continue;
       try {
+        if (frame.outputSpectrum) {
+          if (globalThis.SpectrumTapContract?.valid(frame.timing) !== true) continue;
+          const spectrum = data => {
+            if (!data || !Number.isInteger(data.validCellCount) || data.validCellCount < 1 || data.validCellCount > 2048) return null;
+            const current = decode(data.current, 2048), peaks = decode(data.peaks, 2048);
+            if (!current || !peaks || !current.every(Number.isFinite) || !peaks.every(Number.isFinite)) return null;
+            return { current, peaks, validCellCount: data.validCellCount };
+          };
+          const outputSpectrum = spectrum(frame.outputSpectrum);
+          const inputSpectrum = frame.mode === 'compare' ? spectrum(frame.inputSpectrum) : undefined;
+          if (!outputSpectrum || (frame.mode === 'compare' && !inputSpectrum)) continue;
+          this.dispatch({ ...frame, type: 'spectrumOverlay', outputSpectrum, inputSpectrum });
+          continue;
+        }
+        if (frame.quality !== 'normal' || !Number.isInteger(frame.bufferPosition) ||
+            frame.bufferPosition < 0 || frame.bufferPosition >= 4096) continue;
         const outputBuffer = decode(frame.outputBuffer);
         const inputBuffer = frame.mode === 'compare' ? decode(frame.inputBuffer) : undefined;
         if (!outputBuffer || (frame.mode === 'compare' && !inputBuffer)) continue;
@@ -957,12 +975,15 @@ export class AudioManager extends BrowserAudioManager {
     window.workletNode = this.nativeNode;
     this.contextManager.workletNode = this.nativeNode;
     this.ioManager.sourceNode = fakeNode({ postMessage: noop });
+    this.nowPlayingRevision = 0;
+    this.nowPlayingMetadata = null;
     this.telemetryTimer = setInterval(() => this.pollNativeTelemetry(), 1000 / 60);
     this.nativeContextGeneration = 0;
     this.nativeExecutionStateGeneration = 0;
     this.pendingNativeExecutionStates = null;
     this.preserveReadyNativePipelineDuringStartup = false;
     this.nativeContextSync = null;
+    this.nativeContextSyncFailedGeneration = null;
     this.telemetryPoll = null;
     this.telemetryWasHidden = document.hidden;
     this.lastHiddenContextPoll = 0;
@@ -974,6 +995,20 @@ export class AudioManager extends BrowserAudioManager {
     this.hostAutomationApplyDepth = 0;
     this.hostDiagnosticTimer = null;
     this.shownHostDiagnostic = null;
+  }
+
+  getNowPlayingMetadata() {
+    return this.nowPlayingMetadata ?? null;
+  }
+
+  applyNativeNowPlaying(info) {
+    // Startup and telemetry replies can overlap. Keep the newest complete
+    // snapshot, and retain it when an unchanged revision omits the artwork.
+    if (!Number.isSafeInteger(info?.nowPlayingRevision) ||
+        info.nowPlayingRevision <= (this.nowPlayingRevision ?? 0) ||
+        !Object.prototype.hasOwnProperty.call(info, 'nowPlaying')) return;
+    this.nowPlayingMetadata = info.nowPlaying;
+    this.nowPlayingRevision = info.nowPlayingRevision;
   }
 
   pollNativeTelemetry() {
@@ -999,7 +1034,10 @@ export class AudioManager extends BrowserAudioManager {
       }
       const spectrumRevision = this.nativePort.spectrumPublishedRevision;
       const runtimePipeline = [...this.getCurrentPipeline()];
-      const result = await window.__effetuneHostCall(hidden ? 'host/getInfo' : 'telemetry/read');
+      const result = await window.__effetuneHostCall(hidden ? 'host/getInfo' : 'telemetry/read', {
+        nowPlayingRevision: this.nowPlayingRevision
+      });
+      this.applyNativeNowPlaying(result);
       this.applyNativePerformanceStatus(result);
       this.applyHostAutomationDeltas(result.automationDeltas);
       this.applyHostDiagnostics(result.diagnostics);
@@ -1008,8 +1046,10 @@ export class AudioManager extends BrowserAudioManager {
       // The startup pipeline is restored after AudioManager construction. Rebuilding for a
       // context change before App initialization would publish the temporary empty pipeline.
       if (window.app?.initialized === true && result.contextGeneration &&
-          result.contextGeneration !== this.nativeContextGeneration) {
-        void this.synchronizeNativeContext(result);
+          result.contextGeneration !== this.nativeContextGeneration &&
+          result.contextGeneration !== this.nativeContextSyncFailedGeneration) {
+        // Synchronization reports failures itself and leaves explicit retries available.
+        void this.synchronizeNativeContext(result).catch(() => {});
       }
       if (hidden) return;
       this.nativePort.dispatchSpectrumOverlays(result.spectrumOverlays, spectrumRevision);
@@ -1036,7 +1076,10 @@ export class AudioManager extends BrowserAudioManager {
       // announcement is the native side's only boundary for a touch the dying
       // page opened on its way out and can no longer release. Every other
       // host/getInfo is a poll and says nothing about which context sent it.
-      const info = await window.__effetuneHostCall('host/getInfo', { startup: true });
+      const info = await window.__effetuneHostCall('host/getInfo', {
+        startup: true, nowPlayingRevision: 0
+      });
+      this.applyNativeNowPlaying(info);
       this.contextManager.audioContext = fakeAudioContext(info.engineSampleRate, info.channels);
       this.nativeContextGeneration = info.contextGeneration || 0;
       this.preserveReadyNativePipelineDuringStartup =
@@ -1548,21 +1591,32 @@ export class AudioManager extends BrowserAudioManager {
       const latest = info?.engineSampleRate ? info : await window.__effetuneHostCall('host/getInfo');
       const generation = latest.contextGeneration || 0;
       if (generation === this.nativeContextGeneration) return;
-      this.nativeContextGeneration = generation;
-      if (this.audioContext) {
-        this.audioContext.sampleRate = latest.engineSampleRate;
-        this.audioContext.destination.channelCount = latest.channels;
-        this.audioContext.destination.maxChannelCount = latest.channels;
+      try {
+        if (this.audioContext) {
+          this.audioContext.sampleRate = latest.engineSampleRate;
+          this.audioContext.destination.channelCount = latest.channels;
+          this.audioContext.destination.maxChannelCount = latest.channels;
+        }
+        exposeAudioOutputChannelCount(this);
+        // The rebuild resolves every rate-derived parameter against the new engine
+        // rate while keeping the plug-in ids, so a baseline still describing the
+        // old rate would read those untouched targets as gestures and force them
+        // into automation slots the user never asked for. Reseeding first is what
+        // undo/redo does in the other order for the opposite reason: an undo means
+        // to move values, a rate change only re-expresses them.
+        this.seedRestoredAutomationBaseline();
+        const error = await this.rebuildPipeline();
+        if (error) throw new Error(error);
+      } catch (error) {
+        // A refused rebuild must not turn the telemetry timer into repeated topology edits.
+        this.nativeContextSyncFailedGeneration = generation;
+        console.error('[EffeTune Mixwright] audio context synchronization failed', error);
+        const message = 'Audio settings could not be applied. Retry the last change or reopen the project.';
+        window.uiManager?.setError?.(message, true);
+        throw new Error(message);
       }
-      exposeAudioOutputChannelCount(this);
-      // The rebuild resolves every rate-derived parameter against the new engine
-      // rate while keeping the plug-in ids, so a baseline still describing the
-      // old rate would read those untouched targets as gestures and force them
-      // into automation slots the user never asked for. Reseeding first is what
-      // undo/redo does in the other order for the opposite reason: an undo means
-      // to move values, a rate change only re-expresses them.
-      this.seedRestoredAutomationBaseline();
-      await this.rebuildPipeline();
+      this.nativeContextGeneration = generation;
+      this.nativeContextSyncFailedGeneration = null;
       this.applyNativeReadiness(latest);
       window.uiManager?.updateSampleRateDisplay?.();
     })().finally(() => { this.nativeContextSync = null; });

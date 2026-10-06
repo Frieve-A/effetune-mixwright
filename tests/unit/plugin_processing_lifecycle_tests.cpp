@@ -6999,6 +6999,13 @@ void testVisualizerCapturesFinalHostOutput() {
 void testSpectrumOverlayBridgeLifecycle() {
   auto processor = std::make_unique<EffeTuneProcessor>();
   expect(processor->initialize(nullptr) == kResultOk, "initialize spectrum overlay bridge");
+#ifdef EFFETUNE_HAS_NATIVE_SPECTRUM_TAP
+  expect(hostInfo(*processor)["nativeSpectrumTap"].getBool(),
+         "native API capability reaches configuration startup before setupProcessing");
+#else
+  expect(!hostInfo(*processor)["nativeSpectrumTap"].getBool(),
+         "legacy builds advertise Normal-only capability before setupProcessing");
+#endif
   auto processSetup = setup(48000, 64);
   expect(processor->setupProcessing(processSetup) == kResultOk, "prepare spectrum overlay bridge");
   installGainPipeline(*processor);
@@ -7030,6 +7037,51 @@ void testSpectrumOverlayBridgeLifecycle() {
          overlay["spectrumPluginId"].getInt64() == 1 && overlay["mode"].getString() == "compare" &&
          overlay["quality"].getString() == "normal" && overlay["sampleRate"].get<double>() == 48000,
          "overlay payload follows the upstream receiver contract");
+#ifdef EFFETUNE_HAS_NATIVE_SPECTRUM_TAP
+  expect(hostInfo(*processor)["nativeSpectrumTap"].getBool(), "native API capability reaches configuration startup");
+  const auto normalGeneration = overlay["timing"]["generation"].getInt64();
+  expect(overlay["timing"]["version"].getInt64() == 1 && normalGeneration > 0 &&
+         overlay["timing"]["windowAgeFrames"].getInt64() == 2048 &&
+         overlay["endFrame"].getInt64() == overlay["timing"]["captureEndFrame"].getInt64(),
+         "serialized Normal timing retains the native capture position and generation");
+  for (const auto *field : {"inputSpectrum", "outputSpectrum"}) {
+    std::vector<std::uint8_t> bytes;
+    expect(choc::base64::decodeToContainer(bytes, overlay[field]["current"].getString()) && bytes.size() == 2048 * sizeof(float),
+           "native spectra serialize exact 2048-cell Float32 arrays");
+    float level;
+    std::memcpy(&level, bytes.data(), sizeof(level));
+    const auto expected = 20 * std::log10(.25f) - (std::string_view(field) == "outputSpectrum" ? 6.0f : 0.0f);
+    expect(std::abs(level - expected) < .001f, "native Normal serializes actual pre/post effect levels");
+  }
+  for (const auto *mode : {"after", "compare"}) {
+    const std::string json = std::string{R"({"type":"spectrum/setTap","payload":{"pluginId":1,"enabled":true,"quality":"hq","mode":")"} + mode + "\"}}";
+    expect(request(json.c_str())["ok"].getBool(), "subscribe native HQ through the VST bridge");
+    bool published = false;
+    for (int poll = 0; poll < 8; ++poll) {
+      render();
+      const auto telemetry = request(R"({"type":"telemetry/read"})");
+      if (telemetry["spectrumOverlays"].size() == 0) continue;
+      const auto hq = telemetry["spectrumOverlays"][0];
+      expect(hq["quality"].getString() == "hq" && hq["mode"].getString() == mode &&
+             hq["timing"]["generation"].getInt64() > normalGeneration &&
+             hq["timing"]["windowAgeFrames"].getInt64() == 8192 &&
+             hq["timing"]["completionFrames"].getInt64() == 2096 &&
+             hq["timing"]["tapDelayFrames"].getInt64() == 0,
+             "HQ mode, generation and timing survive JSON transport");
+      expect(hq["inputSpectrum"].isVoid() == (std::string_view(mode) == "after"),
+             "HQ After omits input analysis and Compare supplies it");
+      for (const auto *field : {"current", "peaks"}) {
+        std::vector<std::uint8_t> bytes;
+        expect(choc::base64::decodeToContainer(bytes, hq["outputSpectrum"][field].getString()) && bytes.size() == 2048 * sizeof(float),
+               "HQ levels and peaks use the complete native analysis payload");
+      }
+      published = true;
+    }
+    expect(published, "native HQ reaches the actual VST telemetry bridge");
+  }
+  subscribe();
+#else
+  expect(!hostInfo(*processor)["nativeSpectrumTap"].getBool(), "legacy builds retain the Normal quality capability");
   for (const auto *field : {"inputBuffer", "outputBuffer"}) {
     std::vector<std::uint8_t> pcm;
     expect(choc::base64::decodeToContainer(pcm, overlay[field].getString()) && pcm.size() == 4096 * sizeof(float),
@@ -7039,6 +7091,7 @@ void testSpectrumOverlayBridgeLifecycle() {
     const auto expected = std::string_view(field) == "inputBuffer" ? .25f : .25f * std::pow(10.0f, -6.0f / 20.0f);
     expect(std::abs(sample - expected) < .0001f, "Compare carries actual pre/post effect PCM");
   }
+#endif
   render();
   processor->detachEditor(nullptr);
   expect(request(R"({"type":"telemetry/read"})")["spectrumOverlays"].size() == 0,

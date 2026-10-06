@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { pathToFileURL } from 'node:url';
 import vm from 'node:vm';
+import { createFakeDocument } from '../../external/effetune/tests/helpers/fake-dom.mjs';
 
 const assetsIndex = process.argv.indexOf('--assets');
 assert.ok(assetsIndex >= 0, 'Pass --assets <generated WebView directory>');
@@ -92,30 +93,144 @@ test('bundled Visualizer module graph retains viewport menu clamping', async () 
   } finally { globalThis.window = previousWindow; }
 });
 
-test('categorized settings select only supported panels and retain controller selection', async () => {
+test('bundled Visualizer reads transient host metadata without an internal player', async () => {
+  const { VisualizerView } = await assetModule('js/visualizer/visualizer-view.js');
+  let metadata = null;
+  const view = { uiManager: { audioManager: { getNowPlayingMetadata: () => metadata } } };
+  assert.equal(VisualizerView.prototype.metadata.call(view), null);
+  metadata = { title: '曲名 🎵', album: 'アルバム', artist: '演奏者',
+    artwork: [{ src: 'data:image/png;base64,iVBORw0KGgo=' }] };
+  assert.equal(VisualizerView.prototype.metadata.call(view), metadata);
+  metadata = { title: '', album: 'Album only', artist: '', artwork: [] };
+  assert.equal(VisualizerView.prototype.metadata.call(view), metadata, 'partial tags do not require a title');
+  metadata = null;
+  assert.equal(VisualizerView.prototype.metadata.call(view), null);
+});
+
+test('categorized settings select supported UI panels and retain category selection', async () => {
   const source = await assetText('js/electron/configIntegration.js');
   const selectCategory = source.match(/  function selectCategory\(category\) \{[\s\S]*?\n  \}/)?.[0];
   assert.ok(selectCategory);
-  assert.ok(source.includes("const categories = ['general', 'controllers'];"));
+  const categories = ['general', 'startup', 'display', 'controllers'];
+  assert.ok(source.includes(`const categories = ${JSON.stringify(categories).replaceAll('"', "'").replaceAll(',', ', ')};`));
   assert.ok(source.includes('id="config-panel-${category}" hidden>'));
-  const nodes = Object.fromEntries(['general', 'controllers', 'startup', 'display', 'audio', 'power'].flatMap(category => {
+  const unsupported = ['powerSaving', 'offlineOutput', 'remoteControl'];
+  const nodes = Object.fromEntries([...categories, ...unsupported].flatMap(category => {
     const panel = new Element('div');
     panel.hidden = true;
     return [[`config-panel-${category}`, panel], [`config-category-${category}`, new Element('button')]];
   }));
   const context = { document: { getElementById: id => nodes[id] } };
-  vm.runInNewContext(`const categories = ['general', 'controllers']; let selectedConfigCategory = 'general';
+  vm.runInNewContext(`const categories = ${JSON.stringify(categories)}; let selectedConfigCategory = 'general';
     ${selectCategory}
     this.select = selectCategory; this.selected = () => selectedConfigCategory;`, context);
   context.select('general');
   assert.equal(nodes['config-panel-general'].hidden, false);
+  for (const category of ['startup', 'display']) {
+    context.select(category);
+    assert.equal(nodes[`config-panel-${category}`].hidden, false);
+    assert.equal(nodes['config-panel-general'].hidden, true);
+  }
   context.select('controllers');
   assert.equal(nodes['config-panel-general'].hidden, true);
   assert.equal(nodes['config-panel-controllers'].hidden, false);
   assert.equal(context.selected(), 'controllers');
   context.select(context.selected());
   assert.equal(nodes['config-panel-controllers'].hidden, false);
-  for (const category of ['startup', 'display', 'audio', 'power']) assert.equal(nodes[`config-panel-${category}`].hidden, true);
+  for (const category of [...unsupported, 'startup', 'display']) assert.equal(nodes[`config-panel-${category}`].hidden, true);
+});
+
+test('VST config loads supported startup views and normal PCM quality without losing preferences', async () => {
+  for (const startupView of ['effects', 'visualizer', 'library', undefined]) {
+    const context = await bootstrap(async () => ({ ok: true,
+      config: { startupView, theme: 'paper', spectrumOverlayQuality: 'hq', spectrumOverlayPeakHold: true, future: 42 } }));
+    const { config } = await context.window.electronAPI.loadConfig();
+    assert.equal(config.startupView, startupView === 'visualizer' ? 'visualizer' : 'effects');
+    assert.equal(config.spectrumOverlayQuality, 'normal');
+    assert.equal(config.spectrumOverlayPeakHold, true);
+    assert.equal(config.theme, 'paper');
+    assert.equal(config.future, 42);
+  }
+});
+
+test('Visualizer startup preference opens once without changing host pipeline state', async () => {
+  const source = await assetText('js/app.js');
+  const methods = ['applyStartupViewPreference', 'openConfiguredStartupView'].map(name => {
+    const match = source.match(new RegExp(`    (?:async )?${name}\\([^\\n]*\\) \\{[\\s\\S]*?\\n    \\}`));
+    assert.ok(match);
+    return match[0];
+  });
+  const App = vm.runInNewContext(`(class { ${methods.join('\n')} })`);
+  for (const startupView of ['effects', 'visualizer', 'library', undefined]) {
+    const app = new App();
+    let opened = 0;
+    app.startupConfig = { startupView };
+    app.uiManager = { async showVisualizerView() { opened++; } };
+    await Promise.all([app.applyStartupViewPreference(), app.applyStartupViewPreference()]);
+    assert.equal(opened, startupView === 'visualizer' ? 1 : 0);
+  }
+});
+
+test('a native Spectrum Tap build preserves HQ configuration and reveals the quality control', async () => {
+  const context = await bootstrap(async serialized => JSON.parse(serialized).type === 'host/getInfo'
+    ? { ok: true, nativeSpectrumTap: true }
+    : { ok: true, config: { spectrumOverlayQuality: 'hq', spectrumOverlayPeakHold: true } });
+  const { config } = await context.window.electronAPI.loadConfig();
+  assert.equal(config.spectrumOverlayQuality, 'hq');
+  assert.equal(config.spectrumOverlayPeakHold, true);
+  assert.equal(context.window.__effetuneNativeSpectrum, true);
+  assert.equal(context.document.documentElement.classList.contains('effetune-vst-native-spectrum'), true);
+});
+
+test('bundled settings persist themes, startup view and Peak Hold and restore rejected edits', async () => {
+  const { showConfigDialog } = await assetModule('js/electron/configIntegration.js');
+  const previous = { window: globalThis.window, document: globalThis.document };
+  try {
+    for (const success of [true, false]) {
+      let saved = { theme: 'midnight', startupView: 'effects', spectrumOverlayPeakHold: false,
+        spectrumOverlayQuality: 'normal', future: 42 };
+      const calls = [];
+      const applied = [];
+      const context = await bootstrap(async serialized => {
+        const call = JSON.parse(serialized);
+        calls.push(call);
+        if (call.type === 'config/load') return { ok: true, config: saved };
+        if (call.type === 'host/getInfo') return { ok: true, nativeSpectrumTap: false };
+        if (success) saved = call.payload.config;
+        return { ok: true, success, error: success ? undefined : 'Test save rejection' };
+      });
+      globalThis.window = context.window;
+      globalThis.document = createFakeDocument();
+      window.uiManager = { t: key => key, setThemePreference: theme => applied.push(['theme', theme]), setError() {} };
+      window.SpectrumOverlay = { setSettings: settings => applied.push(['spectrum', settings]) };
+      await showConfigDialog(true, {});
+      const theme = document.getElementById('theme-select');
+      assert.deepEqual(theme.children.map(option => option.value), ['graphite', 'paper', 'midnight', 'ember', 'mint']);
+      const originalError = console.error;
+      try {
+        if (!success) console.error = () => {};
+        theme.value = 'paper';
+        await theme.dispatchEvent('change');
+        await document.getElementById('startup-view-visualizer').dispatchEvent('change');
+        const display = document.getElementById('spectrum-overlay-display');
+        display.value = 'peakHold';
+        await display.dispatchEvent('change');
+        assert.equal(display.value, success ? 'peakHold' : 'instant');
+      } finally { console.error = originalError; }
+      assert.equal(theme.value, success ? 'paper' : 'midnight');
+      assert.equal(saved.startupView, success ? 'visualizer' : 'effects');
+      assert.equal(saved.spectrumOverlayPeakHold, success);
+      assert.equal(saved.future, 42);
+      assert.equal(calls.filter(call => call.type === 'config/save').length, 3);
+      assert.deepEqual(applied, success ? [['theme', 'paper'], ['spectrum', { quality: 'normal', peakHold: true }]] : []);
+      await document.getElementById('close-btn').dispatchEvent('click');
+      await showConfigDialog(true, {});
+      assert.equal(document.getElementById('theme-select').value, saved.theme);
+      assert.equal(document.getElementById('startup-view-visualizer').checked, success);
+      assert.equal(document.getElementById('spectrum-overlay-display').value, success ? 'peakHold' : 'instant');
+      await document.getElementById('close-btn').dispatchEvent('click');
+    }
+  } finally { Object.assign(globalThis, previous); }
 });
 
 async function bundledZip() {
@@ -184,6 +299,7 @@ const until = async predicate => {
 
 async function bootstrap(hostMessage) {
   const document = Object.assign(new Element('document'), {
+    documentElement: new Element('html'),
     head: new Element('head'), body: new Element('body'),
     createElement: tag => new Element(tag),
     createTextNode: text => Object.assign(new Element('text'), { textContent: text }),
@@ -263,7 +379,8 @@ test('VST backup export chunks binary data and cancels incomplete transfers', as
 test('Visualizer choices match eight channels and preserve an imported wider selection', async () => {
   const source = await assetText('js/visualizer/visualizer-editor.js');
   const start = source.indexOf('            const channels =');
-  const end = source.indexOf('\n        }\n        this.styleToggles', start);
+  const end = source.indexOf('\n        }', start);
+  assert.ok(start >= 0 && end > start, 'Visualizer channel controls are missing');
   const create = vm.runInNewContext(`(function(item) {
     const properties = {};
     ${source.slice(start, end)}

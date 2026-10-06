@@ -792,11 +792,14 @@ int main(const int argc, char **argv) {
     int thirdEditorOwner = 0;
     int fourthEditorOwner = 0;
     void *activeEditorOwner = &firstEditorOwner;
+    const auto nativeAssetRoot =
+        std::filesystem::absolute(EFFETUNE_WEBVIEW_ASSET_DIR).make_preferred();
+    const std::filesystem::path extendedAssetRoot(L"\\\\?\\" + nativeAssetRoot.native());
     effetune::vst::WebViewHost webView(
         [&smokeState](const std::string_view request) {
           return responseFor(request, smokeState);
         },
-        std::filesystem::path(EFFETUNE_WEBVIEW_ASSET_DIR), false);
+        extendedAssetRoot, false);
     attached = webView.attach(activeEditorOwner, parent,
                               effetune::vst::plugin::kDefaultEditorWidth,
                               effetune::vst::plugin::kDefaultEditorHeight);
@@ -1151,8 +1154,10 @@ int main(const int argc, char **argv) {
             "const settings = document.querySelector('.settings-menu-container'); "
             "const themeColorProbe = document.createElement('span'); "
             "themeColorProbe.style.color = 'var(--et-text-secondary)'; "
+            "themeColorProbe.style.borderTopColor = 'var(--et-border-strong)'; "
             "document.body.appendChild(themeColorProbe); "
             "const themeColor = getComputedStyle(themeColorProbe).color; "
+            "const themeBorderColor = getComputedStyle(themeColorProbe).borderTopColor; "
             "themeColorProbe.remove(); "
             "return !!controls && controls.nextElementSibling === settings && "
             "labels.join('|') === 'Upsampling Factor:|Phase:|Quality:' && "
@@ -1162,7 +1167,7 @@ int main(const int argc, char **argv) {
             "firstLabelStyle.color === themeColor && "
             "firstSelectStyle.fontSize === '14px' && "
             "firstSelectStyle.backgroundImage !== 'none' && "
-            "firstSelectStyle.borderTopColor === 'rgb(86, 86, 86)' && "
+            "firstSelectStyle.borderTopColor === themeBorderColor && "
             "getComputedStyle(controls.querySelector('.vst-os-control')).flexDirection === "
             "'row' && "
             "getComputedStyle(document.querySelector('.subtitle-container')).display === "
@@ -1438,14 +1443,53 @@ int main(const int argc, char **argv) {
                 getComputedStyle(element).display !== 'none';
               const buttons = [...document.querySelectorAll('.config-category-button')];
               if (buttons.map(button => button.id).join(',') !==
-                  'config-category-general,config-category-controllers') throw new Error('Settings categories');
+                  'config-category-general,config-category-startup,config-category-display,config-category-controllers') throw new Error('Settings categories');
               const sections = [...document.querySelectorAll('.config-dialog .device-section')];
               const generalVisible = sections.filter(visible);
-              if (generalVisible.length !== 1 || !generalVisible[0].contains(
-                  document.getElementById('language-select'))) throw new Error('General visibility');
+              if (generalVisible.length !== 2 || !visible(document.getElementById('language-select')) ||
+                  !visible(document.getElementById('theme-select'))) throw new Error('General visibility');
               const unsupported = [...document.querySelectorAll('.config-category-panel')].filter(
-                panel => !['config-panel-general', 'config-panel-controllers'].includes(panel.id));
+                panel => !['general', 'startup', 'display', 'controllers'].some(category => panel.id === `config-panel-${category}`));
               if (unsupported.some(visible)) throw new Error('Unsupported panel visible');
+              const waitFor = async predicate => {
+                const deadline = Date.now() + 60000;
+                while (!predicate()) {
+                  if (Date.now() >= deadline) throw new Error('Settings update did not complete');
+                  await new Promise(resolve => setTimeout(resolve, 20));
+                }
+              };
+              const theme = document.getElementById('theme-select');
+              if ([...theme.options].map(option => option.value).join(',') !==
+                  'graphite,paper,midnight,ember,mint') throw new Error('Theme choices');
+              for (const value of ['paper', 'midnight', 'ember', 'mint', 'graphite']) {
+                theme.value = value;
+                theme.dispatchEvent(new Event('change', { bubbles: true }));
+                await waitFor(() => document.documentElement.dataset.theme === value);
+                if (window.appConfig.theme !== value) throw new Error('Theme config not published');
+                const expectedScheme = ['paper', 'mint'].includes(value) ? 'light' : 'dark';
+                if (getComputedStyle(document.querySelector('.vst-os-control select')).colorScheme !==
+                    expectedScheme) throw new Error('Native controls ignore theme');
+              }
+              document.getElementById('config-category-startup').click();
+              if (!visible(document.getElementById('startup-view-effects')) ||
+                  !visible(document.getElementById('startup-view-visualizer')) ||
+                  visible(document.getElementById('startup-view-library')) ||
+                  visible(document.getElementById('pl-last')) || visible(document.getElementById('auto-launch')))
+                throw new Error('Startup visibility');
+              document.getElementById('startup-view-visualizer').dispatchEvent(new Event('change', { bubbles: true }));
+              await waitFor(() => window.appConfig.startupView === 'visualizer');
+              document.getElementById('startup-view-effects').dispatchEvent(new Event('change', { bubbles: true }));
+              await waitFor(() => window.appConfig.startupView === 'effects');
+              document.getElementById('config-category-display').click();
+              const display = document.getElementById('spectrum-overlay-display');
+              if (!visible(display) || visible(document.getElementById('spectrum-overlay-quality')) ||
+                  visible(document.getElementById('visual-sync'))) throw new Error('Display visibility');
+              for (const value of ['peakHold', 'instant']) {
+                display.value = value;
+                display.dispatchEvent(new Event('change', { bubbles: true }));
+                await waitFor(() => window.appConfig.spectrumOverlayPeakHold === (value === 'peakHold'));
+                if (window.SpectrumOverlay.quality !== 'normal') throw new Error('Unsupported spectrum quality');
+              }
               document.getElementById('config-category-controllers').click();
               if (visible(document.getElementById('config-panel-general')) ||
                   !visible(document.getElementById('physical-control-section')) ||
@@ -1918,12 +1962,9 @@ int main(const int argc, char **argv) {
     }
     webViewProfile.captureChildProcesses();
   }
-  // CHOC discards the result of every asynchronous WebView2 construction step, so
-  // a runtime that starts but never completes leaves an editor that is attached,
-  // reports success, and stays empty forever. Pointing the loader at a runtime
-  // that does not exist reproduces exactly that, and the editor has to end up
-  // showing readable native text instead.
-  bool initialisationTimeoutDiagnosed = false;
+  // An invalid runtime path must surface the loader's creation failure directly,
+  // without waiting for the watchdog or claiming that a browser started.
+  bool runtimeFailureDiagnosed = false;
   {
     constexpr wchar_t browserFolderVariable[] = L"WEBVIEW2_BROWSER_EXECUTABLE_FOLDER";
     const auto stalledParent = createParent();
@@ -1939,10 +1980,9 @@ int main(const int argc, char **argv) {
                            effetune::vst::plugin::kDefaultEditorWidth,
                            effetune::vst::plugin::kDefaultEditorHeight)) {
           ShowWindow(stalledParent, SW_SHOWNOACTIVATE);
-          const auto deadline = std::chrono::steady_clock::now() +
-                                effetune::vst::kWebViewInitialisationTimeout * 10 +
-                                kCompletionTimeout;
-          while (!initialisationTimeoutDiagnosed &&
+          const auto deadline = std::chrono::steady_clock::now() + kCompletionTimeout;
+          while (!runtimeFailureDiagnosed &&
+                 stalled.status() != effetune::vst::WebViewStatus::initialisationTimedOut &&
                  std::chrono::steady_clock::now() < deadline) {
             // Dispatch everything, including the null-window WM_TIMER the editor
             // watchdog relies on.
@@ -1958,10 +1998,12 @@ int main(const int argc, char **argv) {
               const auto length = GetWindowTextW(diagnostic, text.data(),
                                                  static_cast<int>(text.size()));
               text.resize(static_cast<std::size_t>(length));
-              initialisationTimeoutDiagnosed =
+              runtimeFailureDiagnosed =
                   stalled.status() ==
-                      effetune::vst::WebViewStatus::initialisationTimedOut &&
-                  text.find(L"EFFETUNE-UI-TIMEOUT") != std::wstring::npos;
+                      effetune::vst::WebViewStatus::runtimeUnavailable &&
+                  !stalled.loaded() &&
+                  text.find(L"EFFETUNE-UI-RUNTIME") != std::wstring::npos &&
+                  text.find(L"Install or repair") != std::wstring::npos;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(25));
           }
@@ -1972,6 +2014,55 @@ int main(const int argc, char **argv) {
     }
     if (stalledParent != nullptr) {
       DestroyWindow(stalledParent);
+    }
+    webViewProfile.captureChildProcesses();
+  }
+
+  // A valid runtime still needs its owner STA to dispatch completion callbacks.
+  // Deliberately pause that loop to exercise a real pending operation, then
+  // verify both the timeout guidance and recovery when dispatch resumes.
+  bool initialisationTimeoutDiagnosed = false;
+  bool delayedInitialisationRecovered = false;
+  {
+    const auto delayedParent = createParent();
+    if (delayedParent != nullptr) {
+      int delayedOwner = 0;
+      {
+        effetune::vst::WebViewHost delayed(
+            [](const std::string_view) { return R"({"ok":true})"; },
+            std::filesystem::path(EFFETUNE_WEBVIEW_ASSET_DIR), false);
+        if (delayed.attach(&delayedOwner, delayedParent, 900, 650)) {
+          std::this_thread::sleep_for(
+              effetune::vst::kWebViewInitialisationTimeout + std::chrono::seconds(1));
+          delayed.serviceInitialisation();
+          const auto diagnostic = FindWindowExW(delayedParent, nullptr, L"EDIT", nullptr);
+          std::wstring text(4096, L'\0');
+          if (diagnostic != nullptr) {
+            const auto length = GetWindowTextW(diagnostic, text.data(),
+                                               static_cast<int>(text.size()));
+            text.resize(static_cast<std::size_t>(length));
+          }
+          initialisationTimeoutDiagnosed =
+              delayed.status() == effetune::vst::WebViewStatus::initialisationTimedOut &&
+              text.find(L"EFFETUNE-UI-TIMEOUT") != std::wstring::npos &&
+              text.find(L"repair the Microsoft Edge WebView2 Runtime") != std::wstring::npos;
+          const auto deadline = std::chrono::steady_clock::now() + kCompletionTimeout;
+          while (delayed.status() != effetune::vst::WebViewStatus::ready &&
+                 std::chrono::steady_clock::now() < deadline) {
+            MSG message{};
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE) != 0) {
+              TranslateMessage(&message);
+              DispatchMessageW(&message);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+          }
+          delayedInitialisationRecovered =
+              delayed.status() == effetune::vst::WebViewStatus::ready &&
+              FindWindowExW(delayedParent, nullptr, L"EDIT", nullptr) == nullptr;
+          delayed.detach(&delayedOwner);
+        }
+      }
+      DestroyWindow(delayedParent);
     }
     webViewProfile.captureChildProcesses();
   }
@@ -2293,6 +2384,14 @@ int main(const int argc, char **argv) {
   if (!initialisationTimeoutDiagnosed) {
     std::cerr << "A WebView2 construction that never completed left an unexplained "
                  "empty editor\n";
+    return 1;
+  }
+  if (!runtimeFailureDiagnosed) {
+    std::cerr << "A WebView2 creation failure did not show runtime repair guidance\n";
+    return 1;
+  }
+  if (!delayedInitialisationRecovered) {
+    std::cerr << "A pending WebView2 creation did not recover after dispatch resumed\n";
     return 1;
   }
   if (smokeState.prematureEmptyRebuildCalls.load(std::memory_order_relaxed) != 0) {

@@ -21,7 +21,7 @@
 
   const style = document.createElement('style');
   style.textContent = `
-    html { background-color: #1e1e1e; }
+    html { background-color: var(--et-base); }
     html.effetune-vst-host, html.effetune-vst-host body { min-width: 720px !important; }
     .subtitle-container,
     #openMusicButton, #openLibraryButton, #whatsThisLink,
@@ -31,6 +31,11 @@
     .config-dialog { width: min(640px, calc(100vw - 32px)) !important; }
     .config-dialog .device-section { display: none !important; }
     .config-dialog .device-section:has(#language-select) { display: block !important; }
+    .config-dialog .device-section:has(#theme-select),
+    .config-dialog .device-section:has(#startup-view-effects),
+    .config-dialog .device-section:has(#spectrum-overlay-display) { display: block !important; }
+    .config-dialog .radio-container:has(#startup-view-library),
+    html:not(.effetune-vst-native-spectrum) .config-dialog .spectrum-overlay-row:has(#spectrum-overlay-quality) { display: none !important; }
     .config-dialog #physical-control-section { display: block !important; }
     .vst-os-controls {
       display: inline-flex;
@@ -50,12 +55,12 @@
       min-width: 66px;
       height: 30px;
       padding: 4px;
-      border: 1px solid #565656;
+      border: 1px solid var(--et-border-strong);
       border-radius: 4px;
       background: var(--et-input-gradient);
       color: var(--et-text-primary);
       font: inherit;
-      color-scheme: dark;
+      color-scheme: var(--et-color-scheme);
       box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.24),
                   inset 0 1px 0 rgba(255, 255, 255, 0.035);
       transition: background var(--et-transition-fast),
@@ -69,16 +74,16 @@
       box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.24), var(--et-focus-ring);
     }
     .vst-os-control select option {
-      background-color: #373737;
+      background-color: var(--et-surface-13);
       color: var(--et-text-primary);
     }
     .vst-os-control select option:hover {
-      background-color: #454545;
-      color: #fff;
+      background-color: var(--et-surface-20);
+      color: var(--et-text-primary);
     }
     .vst-os-control select option:checked {
       background-color: var(--et-accent-pressed);
-      color: #fff;
+      color: var(--et-on-accent);
     }
     .vst-os-warning {
       align-self: center;
@@ -323,8 +328,16 @@
     getAppVersion: async () => (await window.__effetuneHostCall('host/getInfo')).version,
     isFirstLaunch: async () => false,
     loadConfig: async () => {
-      const result = await window.__effetuneHostCall('config/load');
-      return { success: true, config: { ...(result.config || {}), startupView: 'effects' } };
+      const [result, info] = await Promise.all([
+        window.__effetuneHostCall('config/load'),
+        window.__effetuneHostCall('host/getInfo')
+      ]);
+      window.__effetuneNativeSpectrum = info.nativeSpectrumTap === true;
+      document.documentElement.classList.toggle('effetune-vst-native-spectrum', window.__effetuneNativeSpectrum);
+      const config = result.config || {};
+      return { success: true, config: { ...config,
+        startupView: config.startupView === 'visualizer' ? 'visualizer' : 'effects',
+        spectrumOverlayQuality: window.__effetuneNativeSpectrum && config.spectrumOverlayQuality === 'hq' ? 'hq' : 'normal' } };
     },
     saveConfig: async config => window.__effetuneHostCall('config/save', { config }),
     loadAudioPreferences: async () => ({ success: true, preferences: {} }),

@@ -37,6 +37,9 @@ const topologyCommitStart = source.indexOf('  commitPowerTopologyMutation(');
 const topologyCommitEnd = source.indexOf('\n  registerPipelineProcessors()', topologyCommitStart);
 const masterBypassStart = source.indexOf('  setMasterBypass(');
 const masterBypassEnd = source.indexOf('\n  applyNativeBypass(', masterBypassStart);
+const nowPlayingStart = source.indexOf('  getNowPlayingMetadata()');
+const nowPlayingEnd = source.indexOf('\n  pollNativeTelemetry()', nowPlayingStart);
+const nowPlayingMethods = source.slice(nowPlayingStart, nowPlayingEnd);
 const readinessMethod = source.slice(source.indexOf('  applyNativeReadiness(info) {'),
   source.lastIndexOf('\n}'));
 
@@ -49,6 +52,8 @@ assert.notEqual(topologyCommitEnd, -1,
   'AudioManager.commitPowerTopologyMutation boundary is missing');
 assert.notEqual(masterBypassStart, -1, 'AudioManager.setMasterBypass is missing');
 assert.notEqual(masterBypassEnd, -1, 'AudioManager.setMasterBypass boundary is missing');
+assert.notEqual(nowPlayingStart, -1, 'AudioManager metadata getter is missing');
+assert.notEqual(nowPlayingEnd, -1, 'AudioManager metadata methods boundary is missing');
 
 function catalogExports() {
   const transformed = generatedCatalogSource
@@ -133,6 +138,7 @@ function createNativePort() {
   const catalog = catalogExports();
   Object.assign(context, catalog);
   vm.runInNewContext(`${source.slice(classStart, classEnd)}\n` +
+    `this.NowPlayingManager = class { ${nowPlayingMethods} };\n` +
     'this.NativePort = NativePort; this.normalizePlugin = normalizePlugin;', context);
   const owner = {
     preserveReadyNativePipelineDuringStartup: true,
@@ -145,7 +151,11 @@ function createNativePort() {
     applyHostAutomationDeltas() {},
     applyNativeExecutionStates() {},
     synchronizeNativeAssetMembership() {},
-    scheduleLatencyService() {}
+    scheduleLatencyService() {},
+    nowPlayingRevision: 0,
+    nowPlayingMetadata: null,
+    getNowPlayingMetadata: context.NowPlayingManager.prototype.getNowPlayingMetadata,
+    applyNativeNowPlaying: context.NowPlayingManager.prototype.applyNativeNowPlaying
   };
   const port = new context.NativePort(owner);
   const node = { port };
@@ -153,10 +163,10 @@ function createNativePort() {
   return { context, hostCalls, node, port };
 }
 
-function spectrumFrame(mode = 'after', id = 7) {
+function spectrumFrame(mode = 'after', id = 7, amplitude = .5) {
   const encode = level => Buffer.from(new Float32Array(4096).fill(level).buffer).toString('base64');
   return { type: 'spectrumOverlay', spectrumPluginId: id, mode, quality: 'normal',
-    outputBuffer: encode(.5), ...(mode === 'compare' ? { inputBuffer: encode(1) } : {}),
+    outputBuffer: encode(amplitude), ...(mode === 'compare' ? { inputBuffer: encode(amplitude * 2) } : {}),
     bufferPosition: 0, sampleRate: 48000 };
 }
 
@@ -170,6 +180,49 @@ function installSpectrumPolling({ context, port }) {
     telemetryHub: { handleMessage() { assert.fail('empty DSP packets must not enter TelemetryHub'); } } });
   return () => context.poll.call(port.owner);
 }
+
+test('host track metadata replaces and clears without DSP packets and reuses unchanged artwork', async () => {
+  const fixture = createNativePort();
+  const { context, port } = fixture;
+  vm.runInNewContext('Object.hasOwn = undefined;', context);
+  assert.equal(vm.runInNewContext('Object.hasOwn', context), undefined);
+  const poll = installSpectrumPolling(fixture);
+  const calls = [];
+  let revision = 1;
+  let metadata = null;
+  context.window.__effetuneHostCall = async (type, payload) => {
+    calls.push({ type, payload });
+    return { bytes: 0, nowPlayingRevision: revision,
+      ...(payload.nowPlayingRevision !== revision && { nowPlaying: metadata }) };
+  };
+  try {
+    await poll();
+    assert.equal(port.owner.getNowPlayingMetadata(), null, 'ordinary hosts have no track metadata');
+    assert.equal(calls[0].payload.nowPlayingRevision, 0);
+    metadata = { title: '曲名 🎵', album: 'アルバム', artist: '演奏者',
+      artwork: [{ src: 'data:image/png;base64,iVBORw0KGgo=' }] };
+    revision++;
+    await poll();
+    assert.equal(port.owner.getNowPlayingMetadata(), metadata);
+    assert.equal(calls.at(-1).payload.nowPlayingRevision, 1);
+    await poll();
+    assert.equal(calls.at(-1).payload.nowPlayingRevision, 2);
+    assert.equal(port.owner.getNowPlayingMetadata(), metadata, 'unchanged replies retain the cached image');
+    metadata = { title: 'Next track', album: '', artist: '', artwork: [] };
+    revision++;
+    await poll();
+    assert.equal(port.owner.getNowPlayingMetadata(), metadata, 'a new track cannot retain old artwork or tags');
+    metadata = null;
+    revision++;
+    context.document.hidden = true;
+    await poll();
+    assert.equal(calls.at(-1).type, 'host/getInfo');
+    assert.equal(calls.at(-1).payload.nowPlayingRevision, 3);
+    assert.equal(port.owner.getNowPlayingMetadata(), null, 'an empty snapshot clears while the editor is hidden');
+    port.owner.applyNativeNowPlaying({ nowPlayingRevision: 2, nowPlaying: { title: 'Stale startup reply' } });
+    assert.equal(port.owner.getNowPlayingMetadata(), null, 'an overlapping old reply cannot restore a cleared track');
+  } finally { port.close(); }
+});
 
 test('real upstream spectrum button renders native After and Compare PCM with no DSP packet', async () => {
   const fixture = createNativePort();
@@ -211,6 +264,85 @@ test('real upstream spectrum button renders native After and Compare PCM with no
   assert.equal(port.spectrumTaps.size, 0);
   instance.dispose();
   port.close();
+});
+
+test('Peak Hold retains and decays both native PCM spectra and clears when disabled', async () => {
+  const { port, node } = createNativePort();
+  const h = createOverlayHarness();
+  installThemePaletteStub(h.window);
+  h.window.workletNode = node;
+  h.window.audioManager = port.owner;
+  port.owner.pipelineA = [h.plugin];
+  const { instance } = h.attach();
+  try {
+    instance.setMode('compare');
+    await port.spectrumRequests;
+    h.overlay.setSettings({ quality: 'normal', peakHold: true });
+    port.dispatchSpectrumOverlays([spectrumFrame('compare')], port.spectrumRevision);
+    h.frame();
+    const inputPeak = instance.inputPeaks[0];
+    const outputPeak = instance.peaks[0];
+    assert.ok(Math.abs(inputPeak) < .01);
+    assert.ok(Math.abs(outputPeak + 6.0206) < .01);
+    h.advance(84);
+    port.dispatchSpectrumOverlays([spectrumFrame('compare', 7, .005)], port.spectrumRevision);
+    h.frame();
+    assert.ok(Math.abs(instance.inputPeaks[0] - inputPeak + 2) < .01);
+    assert.ok(Math.abs(instance.peaks[0] - outputPeak + 2) < .01);
+    assert.ok(instance.levels[0] < -46);
+    h.overlay.setSettings({ peakHold: false });
+    assert.equal(instance.peaks, null);
+    assert.equal(instance.inputPeaks, null);
+  } finally { instance.dispose(); port.close(); }
+});
+
+test('native HQ subscriptions decode analyzed spectra and preserve timing without a DSP packet', async () => {
+  const fixture = createNativePort();
+  const { context, port, node, hostCalls } = fixture;
+  const poll = installSpectrumPolling(fixture);
+  const h = createOverlayHarness();
+  installThemePaletteStub(h.window);
+  h.window.workletNode = node;
+  h.window.audioManager = port.owner;
+  port.owner.pipelineA = [h.plugin];
+  // The contract provider belongs to upstream. Verify that the bridge delegates
+  // validation before it publishes either analysis array to the overlay.
+  const timing = { version: 1, generation: 3, frameIndex: 2, captureEndFrame: 24000,
+    windowAgeFrames: 8192, completionFrames: 2096, tapDelayFrames: 192 };
+  let validations = 0;
+  context.SpectrumTapContract = { valid(value) { validations++; return value === timing; } };
+  const encode = level => Buffer.from(new Float32Array(2048).fill(level).buffer).toString('base64');
+  const spectrum = level => ({ current: encode(level), peaks: encode(level + 2), validCellCount: 1900 });
+  const frame = { spectrumPluginId: 7, quality: 'hq', mode: 'compare', sampleRate: 48000,
+    endFrame: timing.captureEndFrame, timing, inputSpectrum: spectrum(-12), outputSpectrum: spectrum(-18) };
+  const hostCall = context.window.__effetuneHostCall;
+  context.window.__effetuneHostCall = (type, payload) => type === 'telemetry/read'
+    ? Promise.resolve({ bytes: 0, spectrumOverlays: [frame] }) : hostCall(type, payload);
+  const { instance } = h.attach();
+  const delivered = [];
+  port.addEventListener('message', event => { if (event.data.type === 'spectrumOverlay') delivered.push(event.data); });
+  try {
+    h.overlay.setSettings({ quality: 'hq', peakHold: true });
+    instance.setMode('compare');
+    await port.spectrumRequests;
+    assert.equal(hostCalls.at(-1).payload.quality, 'hq');
+    await poll();
+    h.frame();
+    assert.equal(validations, 1);
+    assert.equal(delivered[0].timing, timing);
+    assert.equal(instance.levels[100], -18);
+    assert.equal(instance.inputLevels[100], -12);
+    assert.equal(instance.peaks[100], -16);
+    assert.equal(instance.inputPeaks[100], -10);
+    port.dispatchSpectrumOverlays([{ ...frame, timing: { ...timing, version: 99 } },
+      { ...frame, outputSpectrum: { ...frame.outputSpectrum, current: 'bad' } },
+      { ...frame, inputSpectrum: undefined }], port.spectrumRevision);
+    assert.equal(delivered.length, 1);
+    h.overlay.setSettings({ quality: 'normal' });
+    await port.spectrumRequests;
+    port.dispatchSpectrumOverlays([frame], port.spectrumRevision);
+    assert.equal(delivered.length, 1, 'an old HQ reply cannot reach a Normal subscription');
+  } finally { instance.dispose(); port.close(); }
 });
 
 test('spectrum suspension, A/B membership and removal never deliver stale or misrouted PCM', async () => {
@@ -675,6 +807,7 @@ test('startup rebuilds a pending state replacement but preserves an ordinary rea
       const calls = [];
       const appliedExecutionStates = [];
       const preparedPipelines = [];
+      const nowPlaying = { title: 'Host track', album: '', artist: '', artwork: [] };
       const executionStates = [{
         pluginId: 17,
         pluginType: 'AMRadioSimulatorPlugin',
@@ -697,6 +830,8 @@ test('startup rebuilds a pending state replacement but preserves an ordinary rea
               channels: 2,
               contextGeneration: 7,
               masterBypass: false,
+              nowPlayingRevision: 5,
+              nowPlaying,
               executionStates
             };
           }
@@ -704,7 +839,7 @@ test('startup rebuilds a pending state replacement but preserves an ordinary rea
       };
       vm.runInNewContext(
         `this.Manager = class {${source.slice(initStart, initEnd)}\n` +
-          `${source.slice(rebuildStart, rebuildEnd)}\n};`, context);
+          `${source.slice(rebuildStart, rebuildEnd)}\n${nowPlayingMethods}\n};`, context);
       const plugin = {
         id: 17,
         name: 'Offset',
@@ -719,6 +854,8 @@ test('startup rebuilds a pending state replacement but preserves an ordinary rea
         contextManager: {},
         ioManager: {},
         nativeNode: {},
+        nowPlayingRevision: 0,
+        nowPlayingMetadata: null,
         currentPipeline: 'A',
         pipelineA: [plugin],
         getCurrentPipeline() { return this.pipelineA; },
@@ -741,6 +878,8 @@ test('startup rebuilds a pending state replacement but preserves an ordinary rea
       });
 
       assert.equal(await manager.initAudio(), '');
+      assert.equal(manager.getNowPlayingMetadata(), nowPlaying);
+      assert.equal(manager.nowPlayingRevision, 5, 'each fresh editor receives the retained host track at startup');
       await manager.rebuildPipeline();
       return { calls, appliedExecutionStates, executionStates, preparedPipelines };
     };
@@ -750,7 +889,7 @@ test('startup rebuilds a pending state replacement but preserves an ordinary rea
     assert.deepEqual(pendingCalls.map(call => call.type),
       ['host/getInfo', 'updatePlugins'],
       'a ready retained DSP with pending restored state receives one startup rebuild');
-    assert.deepEqual({ ...pendingCalls[0].payload }, { startup: true },
+    assert.deepEqual({ ...pendingCalls[0].payload }, { startup: true, nowPlayingRevision: 0 },
       'the pending decision comes from the page startup handshake');
 
     assert.deepEqual(pendingStartup.appliedExecutionStates, [],
@@ -3354,6 +3493,68 @@ test('a sample rate change reseeds the baseline for rate-derived targets', async
 
   assert.deepEqual(automationEditPayloads(hostCalls).map(edit => edit.parameterKey), ['gn'],
     'a target recomputed by the rate change never claims an automation slot');
+});
+
+test('a refused context rebuild stays incomplete and can be retried explicitly', async () => {
+  const fixture = createNativePort();
+  const { context, port } = fixture;
+  const syncStart = source.indexOf('  async synchronizeNativeContext(');
+  const syncEnd = source.indexOf('\n  scheduleLatencyService()', syncStart);
+  vm.runInNewContext(`this.ContextManager = class {\n` +
+    `${source.slice(syncStart, syncEnd)}\n` +
+    `${source.slice(rebuildStart, rebuildEnd)}\n${readinessMethod}\n};`, context);
+  const manager = port.owner;
+  const errors = [];
+  const events = [];
+  Object.assign(manager, {
+    nativePort: port,
+    nativeNode: fixture.node,
+    nativeContextGeneration: 1,
+    nativeContextSync: null,
+    audioContext: { sampleRate: 96000, destination: { channelCount: 2, maxChannelCount: 2 } },
+    _dspCapabilitiesByNode: new Map(),
+    preserveReadyNativePipelineDuringStartup: false,
+    seedRestoredAutomationBaseline() {},
+    dispatchEvent(type, event) { events.push({ type, event }); },
+    rebuildPipeline: context.ContextManager.prototype.rebuildPipeline,
+    synchronizeNativeContext: context.ContextManager.prototype.synchronizeNativeContext,
+    applyNativeReadiness: context.ContextManager.prototype.applyNativeReadiness
+  });
+  context.console = { error() {} };
+  context.window.uiManager = { setError(message) { errors.push(message); } };
+  context.window.app.initialized = true;
+  let info = { engineSampleRate: 48000, channels: 8, contextGeneration: 2, dspReady: true };
+  let rebuilds = 0;
+  context.window.__effetuneHostCall = async type => {
+    if (type !== 'pipeline/rebuild') return info;
+    if (++rebuilds === 1) throw new Error('internal native rebuild diagnostic');
+    return { ok: true };
+  };
+
+  await assert.rejects(manager.synchronizeNativeContext(info), /Retry|reopen/);
+  assert.equal(manager.nativeContextGeneration, 1, 'a refused image is never acknowledged');
+  assert.equal(manager.nativeContextSync, null, 'the failed request releases its in-flight guard');
+  assert.equal(errors.length, 1, 'the failure is visible to the user');
+  assert.ok(!errors[0].includes('internal native'), 'native details stay in the developer log');
+  assert.equal(events.filter(event => event.type === 'dspReady').length, 0);
+
+  const poll = installSpectrumPolling(fixture);
+  await poll();
+  await poll();
+  assert.equal(rebuilds, 1, 'telemetry never repeatedly rebuilds a refused image');
+
+  await manager.synchronizeNativeContext(info);
+  assert.equal(rebuilds, 2, 'an explicit retry republishes the same context generation');
+  assert.equal(manager.nativeContextGeneration, 2);
+  assert.equal(manager.audioContext.sampleRate, 48000);
+  assert.equal(manager.outputChannelCount, 8);
+  assert.equal(events.filter(event => event.type === 'dspReady').length, 1);
+
+  info = { engineSampleRate: 96000, channels: 2, contextGeneration: 3, dspReady: true };
+  await poll();
+  await manager.nativeContextSync;
+  assert.equal(rebuilds, 3, 'a subsequent host context still synchronizes automatically');
+  assert.equal(manager.nativeContextGeneration, 3);
 });
 
 function preparedIrResult({ frames = 4, channels = 1, sampleRate = 48000,

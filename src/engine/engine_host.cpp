@@ -179,9 +179,17 @@ EngineHost::EngineHost()
                                   std::uint32_t latency, bool before) noexcept {
     auto &host = *static_cast<EngineHost *>(context);
     const auto found = host.spectrumInstanceIds_.find(instance);
-    if (found != host.spectrumInstanceIds_.end())
+    if (found != host.spectrumInstanceIds_.end()) {
+      std::uint32_t tapDelay = 0;
+#ifdef EFFETUNE_HAS_NATIVE_SPECTRUM_TAP
+      if (!before && host.spectrumCapture_.capturing()) {
+        effetune::Engine::PipelineTapLatency timing;
+        if (host.engine_->pipelineTapLatency(instance, timing)) tapDelay = timing.output;
+      }
+#endif
       host.spectrumCapture_.observe(found->second, audio, channels, frames, latency,
-          host.sampleRate_, static_cast<std::uint64_t>(host.processedFrames_), before);
+          host.sampleRate_, static_cast<std::uint64_t>(host.processedFrames_), before, tapDelay);
+    }
   }, this);
   discoverKernels();
 }
@@ -250,7 +258,7 @@ bool EngineHost::prepare(const double sampleRate, const std::uint32_t channels,
   sampleRate_ = sampleRate;
   channels_ = channels;
   maxProcessFrames_ = maxFrames;
-  spectrumCapture_.prepare(maxFrames);
+  spectrumCapture_.prepare(maxFrames, sampleRate);
   processedFrames_ = 0.0;
   prepared_ = true;
   activeDescriptorByteCount_ = 0;
