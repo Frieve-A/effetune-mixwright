@@ -379,7 +379,8 @@ class NativePort {
     if (message.type === 'frequencyPreview') {
       this.frequencyPreviewActive = Number.isFinite(message.frequency) && message.frequency > 0;
       return window.__effetuneHostCall('audio/frequencyPreview', {
-        frequency: this.frequencyPreviewActive ? message.frequency : null
+        frequency: this.frequencyPreviewActive ? message.frequency : null,
+        sound: message.sound === 'bandpassNoise' ? 'bandpassNoise' : 'sine'
       }).catch(error => console.error('[EffeTune Mixwright] frequency preview failed', error));
     }
     // Everything except a coalesced plug-in image keeps its issue order across
@@ -1161,7 +1162,8 @@ export class AudioManager extends BrowserAudioManager {
     if (!Array.isArray(events)) return;
     const current = this.getCurrentPipeline();
     for (const data of events) {
-      if (data?.type !== 'tubeSimulatorCircuitFault') continue;
+      if (data?.type !== 'tubeSimulatorCircuitFault' &&
+          data?.type !== 'adaptivePredictionFault') continue;
       const plugin = current.find(candidate => candidate.id === data.pluginId);
       // An old poll must not target an inactive A/B instance or a new JS
       // plug-in reusing the same ID. The upstream validator owns epoch ordering.
@@ -1226,6 +1228,16 @@ export class AudioManager extends BrowserAudioManager {
         type: 'updatePlugins',
         plugins
       }, 'audio-manager-rebuild');
+      // Rebuild acknowledgements and telemetry omit readiness. Settle the first
+      // graph from an authoritative snapshot before the startup view opens.
+      // Context synchronization owns its generation change after its rebuild.
+      if (window.app?.initialized !== true && !this.nativeContextSync && !this.isDspReady()) {
+        const info = await window.__effetuneHostCall('host/getInfo');
+        if ((info.contextGeneration || 0) !== this.nativeContextGeneration) {
+          await this.synchronizeNativeContext(info);
+        }
+        this.applyNativePerformanceStatus(info);
+      }
     } catch (error) {
       return `Audio Error: ${error?.message || String(error)}`;
     }

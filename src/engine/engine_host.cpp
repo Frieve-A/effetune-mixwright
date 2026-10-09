@@ -3,10 +3,15 @@
 #include "engine/latency.h"
 #include "engine.h"
 #include "TonalBalanceEQPluginParams.h"
+#include "NoteSpectrogramPluginParams.h"
+#include "SFZNotePlayerPluginParams.h"
+#include "RhythmAnalyzerPluginParams.h"
+#include "DisplayDspPolicy.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <new>
 #include <stdexcept>
@@ -281,11 +286,14 @@ void EngineHost::reset() {
     refreshCircuitFaultsUnlocked();
     combined_ = engine_->combined();
     processedFrames_ = 0.0;
+    analysisSourcesDirty_ = true;
   }
 }
 
 void EngineHost::clearInstancesUnlocked() noexcept {
   spectrumCapture_.invalidate();
+  analysisNodes_.fill(nullptr);
+  analysisSourcesDirty_ = true;
   spectrumInstanceIds_.clear();
   for (const auto &[logicalId, entry] : instances_) {
     (void)logicalId;
@@ -382,10 +390,25 @@ bool EngineHost::rebuild(const PipelineState &pipeline,
                                         : runtime.paramsHash;
     InstanceEntry instanceEntry{instance, runtime.paramsHash, kernel->second.index,
                         runtime.contextuallyBypassed, {}, nullptr};
+    if (runtime.type == "NoteSpectrogramPlugin") {
+      instanceEntry.analysisRole = AnalysisRole::producer;
+    } else if (runtime.type == "SFZNotePlayerPlugin") {
+      instanceEntry.analysisRole = AnalysisRole::consumer;
+    } else if (runtime.type == "RhythmAnalyzerPlugin") {
+      instanceEntry.analysisRole = AnalysisRole::rhythm;
+    } else if (std::find(std::begin(kPureDisplayDspTypes), std::end(kPureDisplayDspTypes),
+                         runtime.type) != std::end(kPureDisplayDspTypes)) {
+      instanceEntry.analysisRole = AnalysisRole::display;
+    }
     try {
-      if (!runtime.contextuallyBypassed && runtime.type == "TubeSimulatorPlugin") {
+      instanceEntry.assetBudget = runtime.type == "SFZNotePlayerPlugin"
+                                      ? kSfzAssetBudgetBytes : kAggregateAssetBudgetBytes;
+      if (!runtime.contextuallyBypassed &&
+          (runtime.type == "TubeSimulatorPlugin" || runtime.type == "AdaptivePredictionEffectPlugin")) {
         instanceEntry.circuitFault = std::make_unique<CircuitFaultProjection>();
         instanceEntry.circuitFault->instanceEpoch = ++nextCircuitFaultEpoch_;
+        instanceEntry.circuitFault->kind = runtime.type == "AdaptivePredictionEffectPlugin"
+            ? RuntimeFaultKind::adaptivePrediction : RuntimeFaultKind::tubeCircuit;
       }
       if (!runtime.contextuallyBypassed && runtime.type == "TonalBalanceEQPlugin") {
         instanceEntry.measurementParameters.resize(generated::TonalBalanceEQPluginParams::kFloatCount);
@@ -594,8 +617,39 @@ bool EngineHost::stageFloatsUnlocked(InstanceEntry &entry,
     entry.measurementParameters[pauseOffset] = frequencyPreviewActive_ ? 1.0f : 0.0f;
     packed = entry.measurementParameters;
   }
-  return engine_->setInstanceParams(entry.instance, packed.empty() ? nullptr : packed.data(),
-                                   static_cast<std::uint32_t>(packed.size()), paramsHash, 0) == ET_OK;
+  if (engine_->setInstanceParams(entry.instance, packed.empty() ? nullptr : packed.data(),
+                                static_cast<std::uint32_t>(packed.size()), paramsHash, 0) != ET_OK)
+    return false;
+  if (!entry.contextuallyBypassed) {
+    const auto rememberRange = [&](const auto &params) {
+      if (entry.minimumMidi != params.minimumMidi || entry.maximumMidi != params.maximumMidi) {
+        entry.minimumMidi = params.minimumMidi;
+        entry.maximumMidi = params.maximumMidi;
+        analysisSourcesDirty_ = true;
+      }
+    };
+    if (entry.analysisRole == AnalysisRole::producer &&
+        packed.size() == generated::NoteSpectrogramPluginParams::kFloatCount) {
+      generated::NoteSpectrogramPluginParams params;
+      std::memcpy(&params, packed.data(), sizeof(params));
+      rememberRange(params);
+    } else if (entry.analysisRole == AnalysisRole::consumer &&
+               packed.size() == generated::SFZNotePlayerPluginParams::kFloatCount) {
+      generated::SFZNotePlayerPluginParams params;
+      std::memcpy(&params, packed.data(), sizeof(params));
+      rememberRange(params);
+    } else if (entry.analysisRole == AnalysisRole::rhythm &&
+               packed.size() == generated::RhythmAnalyzerPluginParams::kFloatCount) {
+      constexpr auto clickOffset = offsetof(generated::RhythmAnalyzerPluginParams, metronomeClick) /
+                                   sizeof(float);
+      const auto click = packed[clickOffset] > 0.5f;
+      if (entry.metronomeClick != click) {
+        entry.metronomeClick = click;
+        analysisSourcesDirty_ = true;
+      }
+    }
+  }
+  return true;
 }
 
 bool EngineHost::updateParametersUnlocked(const std::uint32_t logicalId,
@@ -642,6 +696,26 @@ bool EngineHost::updateParameters(const std::uint32_t logicalId,
   return updated;
 }
 
+EngineHost::AssetLimits EngineHost::assetLimits(const std::uint32_t logicalId,
+                                                const std::uint32_t slot) const {
+  std::scoped_lock lock(engineMutex_);
+  const auto found = instances_.find(logicalId);
+  if (found == instances_.end()) return {};
+  return {et_kernel_asset_capacity(found->second.kernelIndex, slot), found->second.assetBudget};
+}
+
+std::uint64_t EngineHost::assetFootprint(const std::uint32_t budget,
+                                        const std::span<const std::uint64_t> excludedKeys) const {
+  std::scoped_lock lock(engineMutex_);
+  std::uint64_t total = 0;
+  for (const auto &[key, entry] : assets_) {
+    if (entry.budget == budget &&
+        std::find(excludedKeys.begin(), excludedKeys.end(), key) == excludedKeys.end())
+      total += entry.asset.footprintBytes;
+  }
+  return total;
+}
+
 bool EngineHost::stageAssetUnlocked(const RuntimeAsset &asset, std::string *error) {
   const auto found = instances_.find(asset.logicalId);
   if (found == instances_.end()) {
@@ -649,10 +723,7 @@ bool EngineHost::stageAssetUnlocked(const RuntimeAsset &asset, std::string *erro
     return false;
   }
   const auto capacity = et_kernel_asset_capacity(found->second.kernelIndex, asset.slot);
-  if (capacity == 0u || asset.payload.empty() || asset.payload.size() > capacity ||
-      asset.payload.size() > kMaximumAssetPayloadBytes ||
-      asset.footprintBytes < asset.payload.size() ||
-      asset.footprintBytes > capacity) {
+  if (!AssetLimits{capacity, found->second.assetBudget}.accepts(asset.payload.size(), asset.footprintBytes)) {
     setError(error, "DSP asset exceeds the plug-in capacity");
     return false;
   }
@@ -706,18 +777,23 @@ bool EngineHost::refreshAssetStatesUnlocked() noexcept {
 bool EngineHost::setAsset(RuntimeAsset asset, std::string *error) {
   std::scoped_lock lock(engineMutex_);
   const auto key = (static_cast<std::uint64_t>(asset.logicalId) << 32u) | asset.slot;
+  const auto instance = instances_.find(asset.logicalId);
+  if (instance == instances_.end()) {
+    setError(error, "DSP asset target is unavailable");
+    return false;
+  }
+  const auto budget = instance->second.assetBudget;
   std::uint64_t aggregate = asset.footprintBytes;
   for (const auto &[cachedKey, cached] : assets_) {
-    if (cachedKey != key) {
+    if (cachedKey != key && cached.budget == budget) {
       aggregate += cached.asset.footprintBytes;
     }
   }
-  if (aggregate > kAggregateAssetBudgetBytes) {
+  if (aggregate > budget) {
     setError(error, "DSP asset budget exceeded");
     return false;
   }
   const auto cached = assets_.find(key);
-  const auto instance = instances_.find(asset.logicalId);
   if (cached != assets_.end() && instance != instances_.end() &&
       sameAsset(cached->second.asset, asset)) {
     if (instance->second.contextuallyBypassed) {
@@ -738,6 +814,7 @@ bool EngineHost::setAsset(RuntimeAsset asset, std::string *error) {
   const auto slot = asset.slot;
   try {
     assets_[key].asset = std::move(asset);
+    assets_[key].budget = budget;
   } catch (const std::bad_alloc &) {
     const auto found = instances_.find(logicalId);
     if (found != instances_.end() && !found->second.contextuallyBypassed) {
@@ -843,12 +920,14 @@ bool EngineHost::applyCommandUnlocked(const AudioCommand &command,
     // control service and are rejected from ProcessBatch.
     return false;
   case AudioCommandType::reset:
+    analysisSourcesDirty_ = true;
     return engine_->reset() == ET_OK;
   case AudioCommandType::resetInstance: {
     const auto found = instances_.find(command.logicalId);
     // A topology edit may have removed or replaced this queued target.
     if (found == instances_.end() || found->second.paramsHash != command.paramsHash ||
         found->second.contextuallyBypassed) return true;
+    analysisSourcesDirty_ = true;
     return engine_->resetInstance(found->second.instance) == ET_OK;
   }
   }
@@ -998,6 +1077,11 @@ bool EngineHost::ProcessBatch::processChunk(const float *const *input, float *co
     }
   }
   et_status status = ET_ERR_STATE;
+  if (!host_->refreshAnalysisSourcesUnlocked(channelCount, masterBypass)) {
+    host_->recordProcessFailure(ProcessError::commandRejected);
+    failed_ = true;
+    return false;
+  }
   host_->spectrumCapture_.beginBlock(masterBypass);
   {
 #if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
@@ -1133,7 +1217,8 @@ std::vector<EngineHost::CircuitFaultSnapshot> EngineHost::circuitFaults() const 
     if (!inPipeline) continue;
     const auto state = entry.circuitFault->state.load(std::memory_order_acquire);
     result.push_back({id, entry.circuitFault->instanceEpoch, static_cast<std::uint32_t>(state),
-                      ((state >> 32u) & 1u) != 0, static_cast<std::uint32_t>(state >> 33u)});
+                      ((state >> 32u) & 1u) != 0, static_cast<std::uint32_t>(state >> 33u),
+                      entry.circuitFault->kind});
   }
   return result;
 }
@@ -1183,6 +1268,7 @@ bool EngineHost::refreshPipelinePlan(std::uint64_t &refreshedRevision,
     return false;
   }
   refreshedRevision = pipelinePlanRevision_.load(std::memory_order_acquire);
+  analysisSourcesDirty_ = true;
   (void)refreshLatencyUnlocked();
   return true;
 }
@@ -1215,6 +1301,7 @@ bool EngineHost::applyPipelineLatencyUpdate(std::uint64_t &revision) noexcept {
     return false;
   }
   revision = latencyUpdate_->revision;
+  analysisSourcesDirty_ = true;
   (void)refreshLatencyUnlocked();
   return true;
 }
@@ -1226,12 +1313,87 @@ void EngineHost::discardPipelineLatencyUpdate() noexcept {
 void EngineHost::storeActiveDescriptorUnlocked(const std::uint8_t *descriptor,
                                                const std::uint32_t byteCount) noexcept {
   spectrumCapture_.invalidate();
+  analysisSourcesDirty_ = true;
+  analysisNodes_.fill(nullptr);
   if (!validDescriptor(descriptor, byteCount) || byteCount > activeDescriptor_.size()) {
     activeDescriptorByteCount_ = 0;
     return;
   }
   std::copy_n(descriptor, byteCount, activeDescriptor_.begin());
   activeDescriptorByteCount_ = byteCount;
+  const auto nodeCount = readUint32(descriptor + 4u);
+  for (std::uint32_t index = 0; index < nodeCount; ++index) {
+    const auto instance = readUint32(descriptor + kPipelineDescriptorHeaderBytes +
+                                    index * kPipelineDescriptorNodeBytes);
+    const auto logical = spectrumInstanceIds_.find(instance);
+    if (logical != spectrumInstanceIds_.end()) {
+      const auto entry = instances_.find(logical->second);
+      if (entry != instances_.end()) analysisNodes_[index] = &entry->second;
+    }
+  }
+}
+
+bool EngineHost::refreshAnalysisSourcesUnlocked(const std::uint32_t channels,
+                                                const bool masterBypass) noexcept {
+  if (!analysisSourcesDirty_ && channels == analysisChannels_ &&
+      masterBypass == analysisMasterBypass_) return true;
+  for (auto &[id, entry] : instances_) {
+    (void)id;
+    entry.pendingAnalysisSource = 0;
+  }
+  // Match findNoteAnalysisSources() against the descriptor actually being rendered.
+  // Control-side edits and a pending latency plan cannot change this audio-owned view.
+  InstanceEntry *producer = nullptr;
+  const std::uint8_t *producerNode = nullptr;
+  bool inputUnchanged = false;
+  if (!masterBypass && validDescriptor(activeDescriptor_.data(), activeDescriptorByteCount_)) {
+    const auto nodeCount = readUint32(activeDescriptor_.data() + 4u);
+    for (std::uint32_t index = 0; index < nodeCount; ++index) {
+      const auto *node = activeDescriptor_.data() + kPipelineDescriptorHeaderBytes +
+                         index * kPipelineDescriptorNodeBytes;
+      auto *entry = analysisNodes_[index];
+      if (node[4] == 0 || node[8] == 0 || entry == nullptr) continue;
+      if (entry->analysisRole == AnalysisRole::consumer && !entry->contextuallyBypassed &&
+          producer != nullptr && !producer->contextuallyBypassed && inputUnchanged &&
+          producerNode[5] == node[5] && producerNode[7] == node[7] &&
+          producer->minimumMidi == entry->minimumMidi &&
+          producer->maximumMidi == entry->maximumMidi) {
+        const auto spec = static_cast<std::int8_t>(node[7]);
+        const auto requiredChannels = spec == -2 ? channels : spec == -1 ? 2u :
+            spec >= 16 ? static_cast<std::uint32_t>(spec - 16) * 2u + 2u :
+                         static_cast<std::uint32_t>(spec) + 1u;
+        effetune::Engine::PipelineTapLatency sourceTiming, consumerTiming;
+        if (requiredChannels <= channels &&
+            engine_->pipelineTapLatency(producer->instance, sourceTiming) &&
+            engine_->pipelineTapLatency(entry->instance, consumerTiming) &&
+            sourceTiming.input == consumerTiming.input) {
+          entry->pendingAnalysisSource = producer->instance;
+        }
+      }
+      if (entry->analysisRole == AnalysisRole::producer) {
+        // An incompatible nearest producer must not expose an older candidate.
+        producer = entry;
+        producerNode = node;
+        inputUnchanged = true;
+      } else if (producer != nullptr && node[6] == producerNode[5]) {
+        const auto pureDisplay = entry->analysisRole == AnalysisRole::display ||
+            (entry->analysisRole == AnalysisRole::rhythm && !entry->metronomeClick);
+        if (node[5] != node[6] || !pureDisplay) inputUnchanged = false;
+      }
+    }
+  }
+  for (auto &[id, entry] : instances_) {
+    (void)id;
+    if (entry.analysisRole != AnalysisRole::consumer || entry.contextuallyBypassed ||
+        entry.analysisSource == entry.pendingAnalysisSource) continue;
+    if (engine_->setInstanceAnalysisSource(entry.instance, entry.pendingAnalysisSource) != ET_OK)
+      return false;
+    entry.analysisSource = entry.pendingAnalysisSource;
+  }
+  analysisSourcesDirty_ = false;
+  analysisChannels_ = channels;
+  analysisMasterBypass_ = masterBypass;
+  return true;
 }
 
 bool EngineHost::refreshLatencyUnlocked(bool *instanceLatencyChanged) noexcept {

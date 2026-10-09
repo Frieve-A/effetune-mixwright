@@ -11,6 +11,10 @@
 #include "TonalBalanceEQPluginParams.h"
 #include "FiveBandPEQPluginParams.h"
 #include "TubeSimulatorPluginParams.h"
+#include "NoteSpectrogramPluginParams.h"
+#include "SFZNotePlayerPluginParams.h"
+#include "../../external/effetune/dsp/plugins/others/sfz_note_player/bank.h"
+#include <bit>
 #include "allocation_guard.h"
 #include <choc/memory/choc_Base64.h>
 
@@ -27,6 +31,18 @@
 #include <stdexcept>
 #include <thread>
 #include <unordered_set>
+
+namespace effetune::vst {
+class EngineHostTestAccess {
+public:
+  static bool analysisSource(const EngineHost &host, std::uint32_t consumer,
+                             std::uint32_t producer) {
+    const auto found = host.instances_.find(consumer);
+    return found != host.instances_.end() &&
+        found->second.analysisSource == (producer == 0 ? 0 : host.resolveInstance(producer));
+  }
+};
+}
 
 namespace {
 using namespace effetune::vst;
@@ -102,7 +118,7 @@ void testOutputAnalyzers() {
       {0xf0000002u, "SpectrogramPlugin", "R", {-96, 10, 0}, 0x3e6e0819u, 1},
       {0xf0000003u, "OscilloscopePlugin", "1", {.01f, 0, 0, 0, .0001f, 0, 0}, effetune::generated::OscilloscopePluginParams::kHash, 1},
       {0xf0000004u, "StereoMeterPlugin", "", {.1f}, 0xb0de3212u, 1},
-      {0xf0000005u, "NoteSpectrogramPlugin", "", {60, 72, 2}, 0x0c9bdf4eu, 1},
+      {0xf0000005u, "NoteSpectrogramPlugin", "", {60, 72}, effetune::generated::NoteSpectrogramPluginParams::kHash, 1},
       {0xf0000006u, "ChromaSpiralPlugin", "", {}, 0x811c9dc5u, 1},
       {0xf0000007u, "PhaseSelectEqPlugin", "", std::vector<float>(effetune::generated::PhaseSelectEqPluginParams::kFloatCount), effetune::generated::PhaseSelectEqPluginParams::kHash, 1},
       {0xf0000008u, "AnalogMeterPlugin", "", {0, .3f, 5, 1.5f}, effetune::generated::AnalogMeterPluginParams::kHash, 1},
@@ -132,6 +148,15 @@ void testOutputAnalyzers() {
       }
       const auto payload = static_cast<std::uint32_t>(packet[offset + 12]) |
                            (static_cast<std::uint32_t>(packet[offset + 13]) << 8);
+      if (tap == sources[5].tapId) {
+        expect(packet[offset] == 24 && packet[offset + 2] == 5 && payload == 8840,
+               "Note/Guitar source forwards the current revision-rich note packet");
+        expect(u32(packet.data() + offset + 36) == 5,
+               "note telemetry retains five fine pitch divisions");
+      }
+      if (tap == sources[9].tapId)
+        expect(packet[offset] == 28 && packet[offset + 2] == 4 && payload == 1496,
+               "rhythm telemetry forwards current beat and preview layout");
       offset += (16u + payload + 3u) & ~3u;
     }
   }
@@ -659,6 +684,294 @@ void testSpectrumRouter() {
     expect(!MessageRouter::decode(request, message, &error), "reject malformed spectrum subscription");
 }
 
+
+RuntimeAsset sfzTestAsset(std::uint32_t id) {
+  using namespace effetune::plugins::others::sfz;
+  constexpr std::uint32_t samples = 1024;
+  std::vector<float> words(8u + kHeader + kStride + samples, .25f);
+  auto *bytes = reinterpret_cast<std::uint8_t *>(words.data());
+  std::fill_n(bytes, 32u, std::uint8_t{0});
+  const auto write = [&](std::size_t offset, std::uint32_t value) { std::memcpy(bytes + offset, &value, 4); };
+  write(0, 0x31415445u); write(4, 1); write(8, static_cast<std::uint32_t>(words.size()) - 8u); write(12, 1);
+  const std::array<std::uint32_t, 8> header{kMagic, kVersion, 1, kStride, kHeader + kStride,
+      static_cast<std::uint32_t>(words.size() - 8u), 1, 0};
+  for (std::size_t i = 0; i < header.size(); ++i) write(32u + 4u * i, header[i]);
+  std::array<float, kStride> region{};
+  region[Frames] = samples; region[Channels] = 1; region[Rate] = 48000;
+  region[HighKey] = 127; region[LowVelocity] = 1; region[HighVelocity] = 127;
+  region[HighRandom] = 1; region[SequenceLength] = region[SequencePosition] = 1;
+  region[KeyCenter] = 60; region[KeyTrack] = 100; region[End] = samples - 1;
+  region[LoopMode] = 2; region[LoopEnd] = samples - 1; region[Sustain] = 100; region[Release] = .005f;
+  for (std::uint32_t field = 0; field < kStride; ++field)
+    words[8u + kHeader + field] = isIndexField(field)
+        ? std::bit_cast<float>(static_cast<std::uint32_t>(region[field])) : region[field];
+  const auto byteSize = words.size() * sizeof(float);
+  const auto footprint = byteSize + 4u * (131u + 128u);
+  RuntimeAsset asset;
+  asset.logicalId = id;
+  asset.formatTag = 1;
+  asset.channels = asset.rateDivider = asset.processingChannels = 1;
+  asset.frames = static_cast<std::uint32_t>(words.size() - 8u);
+  asset.headBlock = 128;
+  asset.footprintBytes = static_cast<std::uint32_t>(footprint);
+  asset.payload.assign(bytes, bytes + byteSize);
+  return asset;
+}
+
+void testSfzAssetAdmissionAndReplay() {
+  using namespace effetune::plugins::others::sfz;
+  auto engine = std::make_unique<EngineHost>();
+  std::string error;
+  expect(engine->prepare(48000, 2, 1024, EngineHost::kDefaultTelemetryBytes, &error), "prepare SFZ");
+  effetune::generated::SFZNotePlayerPluginParams params{
+      .5f, -30, 3, 28, 91, 32, 0, 100, 0, 0, 1, 1, 1, 0, 18, 0};
+  RuntimePlugin runtime;
+  runtime.logicalId = 55;
+  runtime.type = "SFZNotePlayerPlugin";
+  runtime.paramsHash = params.kHash;
+  const auto *floats = reinterpret_cast<const float *>(&params);
+  runtime.packedParameters.assign(floats, floats + params.kFloatCount);
+  PipelineState pipeline;
+  pipeline.plugins = {PluginState{55, "SFZ Note Player", true}};
+  expect(engine->rebuild(pipeline, {runtime}, &error), "rebuild SFZ");
+  const auto limits = engine->assetLimits(55, 0);
+  expect(limits.capacity == kCapacity && limits.budget == EngineHost::kSfzAssetBudgetBytes,
+         "SFZ uses authoritative native capacity and separate allowance");
+  for (const auto mib : {64u, 128u, 256u, 512u, 1024u})
+    expect(limits.accepts(mib * 1024u * 1024u, mib * 1024u * 1024u), "supported SFZ size admission");
+  expect(!limits.accepts(kCapacity + 1u, kCapacity + 1u) &&
+         !engine->assetLimits(55, 1).accepts(32, 32) && !engine->assetLimits(999, 0).accepts(32, 32),
+         "SFZ admission rejects oversize and unavailable targets without allocation");
+  const auto asset = sfzTestAsset(55);
+  const auto footprint = asset.footprintBytes;
+  MessageRouter router;
+  RoutedUiMessage message;
+  const auto metadata = std::string(R"({"type":"pipeline/assetBegin","payload":{"pluginId":55,"slot":0,"formatTag":1,"channels":1,"frames":)") +
+      std::to_string(asset.frames) + R"(,"topology":0,"headBlock":128,"rateDivider":1,"pathCount":0,"inputCount":0,"processingChannels":1,"footprintBytes":)" +
+      std::to_string(footprint) + R"(,"byteSize":)" + std::to_string(asset.payload.size()) + R"(,"operationRevision":1}})";
+  expect(router.decode(metadata, message, &error), "router admits real SFZ topology-zero metadata");
+  message.asset.payload = asset.payload;
+  expect(engine->setAsset(message.asset, &error), "native SFZ asset commits");
+  std::array<float, 1024> left{}, right{};
+  float *channels[]{left.data(), right.data()};
+  const auto activate = [&] {
+    for (int block = 0; block < 8 && (engine->assetState(55, 0) & 0xffu) != ET_ASSET_STATE_ACTIVE; ++block) {
+      bool ok;
+      { effetune::allocation_guard::Scope guard; ok = engine->tryProcessBlock(channels, 2, 1024, 0, false); }
+      expect(ok, "SFZ preparation processes without audio allocations");
+    }
+    expect((engine->assetState(55, 0) & 0xffu) == ET_ASSET_STATE_ACTIVE, "SFZ reaches ACTIVE");
+  };
+  activate();
+  expect(engine->assetFootprint(limits.budget, {}) == footprint &&
+         engine->assetFootprint(EngineHost::kAggregateAssetBudgetBytes, {}) == 0,
+         "resident SFZ is charged only to SFZ budget");
+  expect(engine->rebuild(pipeline, {runtime}, &error), "rebuild with cached SFZ");
+  activate();
+  expect(engine->clearAsset(55, 0) && engine->assetState(55, 0) == ET_ASSET_STATE_NONE &&
+         engine->assetFootprint(limits.budget, {}) == 0, "clear SFZ releases resident allowance");
+  expect(engine->rebuild(pipeline, {runtime}, &error) && engine->assetState(55, 0) == ET_ASSET_STATE_NONE,
+         "cleared SFZ never reappears on rebuild");
+}
+
+void testNoteAnalysisSharing() {
+  auto engine = std::make_unique<EngineHost>();
+  std::string error;
+  expect(engine->prepare(48000, 2, 128, EngineHost::kDefaultTelemetryBytes, &error),
+         "prepare note analysis routing");
+  const auto runtime = [&](std::uint32_t id, const char *type, std::vector<float> parameters) {
+    RuntimePlugin result;
+    result.logicalId = id;
+    result.type = type;
+    result.paramsHash = engine->kernels().at(type).paramsHash;
+    result.packedParameters = std::move(parameters);
+    return result;
+  };
+  std::vector<RuntimePlugin> plugins{
+      runtime(1, "NoteSpectrogramPlugin", {28, 91}),
+      runtime(2, "SFZNotePlayerPlugin", {.5f, -30, 3, 28, 91, 32, 0, 100, 0, 0, 1, 1, 1, 0, 18, 0}),
+      runtime(3, "VolumePlugin", {0}), runtime(4, "NoteSpectrogramPlugin", {29, 91}),
+      runtime(5, "RhythmAnalyzerPlugin", {60, 180, 0}), runtime(6, "LevelMeterPlugin", {})};
+  const PluginState note{1, "Note Spectrogram", true}, sfz{2, "SFZ Note Player", true};
+  PipelineState pipeline;
+  pipeline.plugins = {note, sfz};
+  expect(engine->rebuild(pipeline, plugins, &error), "build note analysis routing");
+  std::array<float, 128> left{}, right{};
+  float *channels[]{left.data(), right.data()};
+  double time = 0;
+  const auto render = [&](std::uint32_t source, bool bypass = false, std::uint32_t count = 2) {
+    bool ok;
+    { effetune::allocation_guard::Scope guard;
+      ok = engine->tryProcessBlock(channels, count, 128, time, bypass); }
+    time += 128.0 / 48000.0;
+    expect(ok, "analysis routing updates without allocating or losing a block");
+    expect(EngineHostTestAccess::analysisSource(*engine, 2, source), "expected native analysis source");
+  };
+  const auto route = [&](std::vector<PluginState> nodes, std::uint32_t source) {
+    pipeline.plugins = std::move(nodes);
+    expect(engine->updateDescriptor(pipeline, &error), "update analysis descriptor");
+    render(source);
+  };
+  render(1);
+  render(0, true);
+  render(1);
+  render(0, false, 1);
+  render(1);
+  engine->reset();
+  render(1);
+  route({sfz, note}, 0);
+  route({note, sfz}, 1);
+  auto disabled = note;
+  disabled.enabled = false;
+  route({disabled, sfz}, 0);
+  route({PluginState{10, "Section", false}, note,
+         PluginState{11, "Section", true}, sfz}, 0);
+  route({note, PluginState{11, "Section", false}, sfz}, 0);
+  auto different = sfz;
+  different.inputBus = 1;
+  route({note, different}, 0);
+  different = sfz;
+  different.channel = "1";
+  route({note, different}, 0);
+  auto monoNote = note;
+  monoNote.channel = "1";
+  route({monoNote, different}, 1);
+  auto sendNote = note;
+  sendNote.outputBus = 1;
+  route({sendNote, sfz}, 1);
+  sendNote.inputBus = 1;
+  sendNote.outputBus = 0;
+  different = sfz;
+  different.inputBus = 1;
+  route({PluginState{3, "Volume", true, 0, 1}, sendNote, different}, 1);
+  route({note, PluginState{4, "Note Spectrogram", true}, sfz}, 0);
+  auto mutedNearest = PluginState{4, "Note Spectrogram", false};
+  route({note, mutedNearest, sfz}, 1);
+  expect(engine->updateParameters(4, plugins[0].packedParameters, plugins[3].paramsHash),
+         "match nearest producer range");
+  route({note, PluginState{4, "Note Spectrogram", true}, sfz}, 4);
+  route({PluginState{4, "Note Spectrogram", true}, sfz}, 4);
+  route({note, PluginState{3, "Volume", true}, sfz}, 0);
+  route({note, PluginState{3, "Volume", false}, sfz}, 1);
+  route({note, PluginState{3, "Volume", true, 0, 1}, sfz}, 1);
+  route({note, PluginState{6, "Level Meter", true}, sfz}, 1);
+  route({note, PluginState{6, "Level Meter", true, 1, 0}, sfz}, 0);
+  route({note, PluginState{5, "Rhythm Analyzer", true}, sfz}, 1);
+  EngineHost::ResolvedParameterTarget rhythm;
+  {
+    EngineHost::ProcessBatch batch;
+    expect(engine->beginProcessBatch(batch) &&
+           batch.resolveParameterTarget(5, plugins[4].paramsHash, rhythm), "resolve rhythm automation");
+    const std::array<float, 3> clickOn{60, 180, 1}, clickOff{60, 180, 0};
+    bool ok;
+    { effetune::allocation_guard::Scope guard;
+      ok = batch.stageParameters(rhythm, clickOn) && batch.processChunk(channels, 2, 128, time, false); }
+    expect(ok && EngineHostTestAccess::analysisSource(*engine, 2, 0), "live metronome writes invalidate sharing");
+    time += 128.0 / 48000.0;
+    { effetune::allocation_guard::Scope guard;
+      ok = batch.stageParameters(rhythm, clickOff) && batch.processChunk(channels, 2, 128, time, false) && batch.finish(); }
+    expect(ok && EngineHostTestAccess::analysisSource(*engine, 2, 1), "automation restores pure rhythm sharing");
+    time += 128.0 / 48000.0;
+  }
+  route({note, sfz}, 1);
+  const std::array<float, 2> changedRange{29, 91}, restoredRange{28, 91};
+  expect(engine->updateParameters(1, changedRange, plugins[0].paramsHash), "update source MIDI range");
+  render(0);
+  auto commands = std::make_unique<AudioCommandQueue>();
+  AudioCommand parameters;
+  parameters.type = AudioCommandType::setParameters;
+  parameters.logicalId = 1;
+  parameters.paramsHash = plugins[0].paramsHash;
+  parameters.floatCount = 2;
+  std::copy(restoredRange.begin(), restoredRange.end(), parameters.packed.begin());
+  expect(commands->push(parameters), "enqueue restored analysis range");
+  expect(engine->tryProcessBlock(channels, 2, 128, time, false, commands.get()), "apply queued range");
+  time += 128.0 / 48000.0;
+  expect(EngineHostTestAccess::analysisSource(*engine, 2, 1), "queued range restores sharing");
+  auto consumerParameters = plugins[1].packedParameters;
+  consumerParameters[offsetof(effetune::generated::SFZNotePlayerPluginParams, maximumMidi) / sizeof(float)] = 90;
+  expect(engine->updateParameters(2, consumerParameters, plugins[1].paramsHash), "change consumer MIDI range");
+  render(0);
+  expect(engine->updateParameters(2, plugins[1].packedParameters, plugins[1].paramsHash), "restore consumer range");
+  render(1);
+  AudioCommand descriptor;
+  pipeline.plugins = {sfz};
+  expect(engine->makeDescriptorCommand(pipeline, plugins, descriptor, &error), "prepare topology change");
+  render(1);
+  std::uint64_t revision = 0;
+  expect(engine->applyDescriptorCommand(descriptor, revision, &error), "apply topology change");
+  render(0);
+  route({note, sfz}, 1);
+  expect(engine->capturePipelineLatencyUpdate(), "capture sharing latency plan");
+  std::uint32_t latency = 0;
+  expect(engine->preparePipelineLatencyUpdate(latency), "prepare sharing latency plan");
+  render(1);
+  { effetune::allocation_guard::Scope guard;
+    expect(engine->applyPipelineLatencyUpdate(revision), "apply sharing latency plan"); }
+  render(1);
+  engine->discardPipelineLatencyUpdate();
+  for (const std::size_t bypassed : {0u, 1u}) {
+    plugins[bypassed].contextuallyBypassed = true;
+    expect(engine->rebuild(pipeline, plugins, &error), "rebuild incompatible analysis execution");
+    render(0);
+    plugins[bypassed].contextuallyBypassed = false;
+  }
+  expect(engine->rebuild(pipeline, plugins, &error), "rebuild restores analysis source");
+  render(1);
+  pipeline.plugins = {note, PluginState{4, "Note Spectrogram", true}, sfz};
+  plugins[3].contextuallyBypassed = true;
+  expect(engine->rebuild(pipeline, plugins, &error), "rebuild incompatible nearest producer");
+  render(0);
+  plugins[3].contextuallyBypassed = false;
+  pipeline.plugins = {note, sfz};
+  expect(engine->rebuild(pipeline, plugins, &error), "rebuild restores eligible pair");
+  render(1);
+
+  // A unity writer prevents sharing without changing the reference input signal.
+  auto own = std::make_unique<EngineHost>();
+  expect(own->prepare(48000, 2, 128, EngineHost::kDefaultTelemetryBytes, &error), "prepare self-analysis reference");
+  auto reference = pipeline;
+  reference.plugins.insert(reference.plugins.begin() + 1, PluginState{3, "Volume", true});
+  expect(own->rebuild(reference, plugins, &error), "build self-analysis reference");
+  expect(engine->setAsset(sfzTestAsset(2), &error) && own->setAsset(sfzTestAsset(2), &error),
+         "load shared and self-analysis banks");
+  std::array<float, 128> referenceLeft{}, referenceRight{};
+  float *referenceChannels[]{referenceLeft.data(), referenceRight.data()};
+  for (int pass = 0; pass < 2; ++pass) {
+    engine->reset();
+    own->reset();
+    bool heard = false;
+    for (std::uint32_t at = 0; at < 24000;) {
+      const auto frames = at % 192 == 0 ? 64u : 128u;
+      for (std::uint32_t frame = 0; frame < frames; ++frame) {
+        const auto seconds = (at + frame) / 48000.0;
+        double value = 0;
+        if (seconds >= .1 && seconds < .3) {
+          for (int harmonic = 1; harmonic <= 8; ++harmonic)
+            value += .1 / harmonic * std::sin(6.283185307179586 * 261.625565 * harmonic * seconds +
+                                               .37 * harmonic * harmonic);
+        }
+        left[frame] = right[frame] = referenceLeft[frame] = referenceRight[frame] = static_cast<float>(value);
+      }
+      bool ok;
+      { effetune::allocation_guard::Scope guard;
+        ok = engine->tryProcessBlock(channels, 2, frames, at / 48000.0, false) &&
+             own->tryProcessBlock(referenceChannels, 2, frames, at / 48000.0, false); }
+      expect(ok, "shared and self-analysis variable blocks remain allocation-free");
+      expect(EngineHostTestAccess::analysisSource(*engine, 2, 1) &&
+             EngineHostTestAccess::analysisSource(*own, 2, 0), "comparison actually uses distinct analysis paths");
+      expect(engine->pipelineLatency() == own->pipelineLatency(), "sharing preserves advertised latency");
+      for (std::uint32_t frame = 0; frame < frames; ++frame) {
+        expect(left[frame] == referenceLeft[frame] && right[frame] == referenceRight[frame],
+               "sharing preserves exact SFZ samples and onset including reset");
+        heard = heard || left[frame] != 0;
+      }
+      at += frames;
+    }
+    expect(heard, "shared SFZ comparison renders detected notes");
+  }
+}
+
 void testBackupExport() {
   const auto directory = std::filesystem::temp_directory_path() /
       ("effetune-backup-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
@@ -698,6 +1011,8 @@ int main() {
     testSpectrumCapture();
     testSpectrumRouter();
     testCircuitFaultPublication();
+    testSfzAssetAdmissionAndReplay();
+    testNoteAnalysisSharing();
     testBackupExport();
     std::cout << "Upstream integration tests passed\n";
   } catch (const std::exception &error) {

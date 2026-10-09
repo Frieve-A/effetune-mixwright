@@ -430,6 +430,11 @@ test('frequency audition forwards start, retune and stop and ends on editor tear
     await port.postMessage({ type: 'frequencyPreview', frequency });
     assert.equal(hostCalls.at(-1).type, 'audio/frequencyPreview');
     assert.equal(hostCalls.at(-1).payload.frequency, frequency);
+    assert.equal(hostCalls.at(-1).payload.sound, 'sine');
+  }
+  for (const sound of ['bandpassNoise', 'sine', 'unsupported', null]) {
+    await port.postMessage({ type: 'frequencyPreview', frequency: 1000, sound });
+    assert.equal(hostCalls.at(-1).payload.sound, sound === 'bandpassNoise' ? sound : 'sine');
   }
   for (const teardown of [
     () => context.window.dispatch('pagehide'),
@@ -734,7 +739,7 @@ test('native Tube fault snapshots use the real upstream validator and HUD across
       _safetyReductionDb() { return 0; }, _refreshHudState() { this.hudText = this._hudStatusText(); } });
     const events = [];
     Object.assign(port.owner, { nativeNode: node, pipelineA: [plugin], pipelineB: [],
-      _tubeRuntimeEventsByNode: new WeakMap(), _getPrimaryWorkletNode: () => node,
+      _dspRuntimeEventsByNode: new WeakMap(), _getPrimaryWorkletNode: () => node,
       _isActiveDspWorklet: candidate => candidate === node,
       handleWorkletMessage: context.RuntimeManager.prototype.handleWorkletMessage,
       applyNativeRuntimeEvents: context.RuntimeManager.prototype.applyNativeRuntimeEvents,
@@ -794,6 +799,57 @@ test('native Tube fault snapshots use the real upstream validator and HUD across
   assert.match(reusedId.hudText, /is active/);
   first.port.close();
   reopened.port.close();
+});
+
+test('native Adaptive Prediction faults use upstream validation and reject stale pipeline snapshots', async () => {
+  const upstreamAudio = await readFile(path.join(projectRoot, 'external/effetune/js/audio-manager.js'), 'utf8');
+  const pluginSource = await readFile(path.join(projectRoot,
+    'external/effetune/plugins/resonator/adaptive_prediction_effect.js'), 'utf8');
+  const dispatcher = upstreamAudio.slice(upstreamAudio.indexOf('    handleWorkletMessage('),
+    upstreamAudio.indexOf('    updateExposedProperties()', upstreamAudio.indexOf('    handleWorkletMessage(')));
+  const receiver = pluginSource.slice(pluginSource.indexOf('    onMessage(message)'),
+    pluginSource.indexOf('    getParameters()', pluginSource.indexOf('    onMessage(message)')));
+  const adapter = source.slice(source.indexOf('  applyNativeRuntimeEvents('), source.indexOf('  applyNativeExecutionStates('));
+  const { context, node, port } = createNativePort();
+  vm.runInNewContext(`this.RuntimeManager = class { ${adapter}\n${dispatcher} };\n` +
+    `this.AdaptivePredictionEffectPlugin = class AdaptivePredictionEffectPlugin { ${receiver} };`, context);
+  const plugin = new context.AdaptivePredictionEffectPlugin();
+  Object.assign(plugin, { id: 7, predictionFault: false, executionState: { state: 'active' },
+    _statusElement: { textContent: '', hidden: true } });
+  const manager = new context.RuntimeManager();
+  const events = [];
+  Object.assign(manager, { nativeNode: node, pipelineA: [plugin], pipelineB: [], currentPipeline: 'A',
+    getCurrentPipeline() { return this.currentPipeline === 'A' ? this.pipelineA : this.pipelineB; },
+    _dspRuntimeEventsByNode: new WeakMap(), _getPrimaryWorkletNode: () => node,
+    _isActiveDspWorklet: candidate => candidate === node,
+    dispatchEvent: (type, data) => events.push({ type, data }) });
+  const fault = { type: 'adaptivePredictionFault', pluginId: 7,
+    pluginType: 'AdaptivePredictionEffectPlugin', instanceEpoch: 1, generation: 1,
+    latched: true, cause: 'numericalFailure' };
+  manager.applyNativeRuntimeEvents([{ ...fault, cause: 'feedbackOscillation' }], [plugin]);
+  assert.equal(events.length, 0, 'upstream rejects another effect fault cause');
+  manager.applyNativeRuntimeEvents([fault], [plugin]);
+  assert.equal(plugin.predictionFault, true);
+  assert.match(plugin._statusElement.textContent, /Press Reset/);
+  assert.equal(events.at(-1).data.validated, true);
+  manager.applyNativeRuntimeEvents([fault, { ...fault, generation: 0 }], [plugin]);
+  assert.equal(events.length, 1, 'duplicates and stale generations do not redraw');
+  const recovery = { ...fault, instanceEpoch: 2, generation: 0, latched: false, cause: 'none' };
+  manager.currentPipeline = 'B';
+  manager.applyNativeRuntimeEvents([recovery], [plugin]);
+  assert.equal(plugin.predictionFault, true, 'late A response cannot update inactive A');
+  manager.currentPipeline = 'A';
+  const replacement = new context.AdaptivePredictionEffectPlugin();
+  Object.assign(replacement, plugin, { predictionFault: true });
+  manager.pipelineA = [replacement];
+  manager.applyNativeRuntimeEvents([recovery], [plugin]);
+  assert.equal(events.length, 1, 'captured object identity rejects a replacement with the same ID');
+  manager.applyNativeRuntimeEvents([recovery], [replacement]);
+  assert.equal(replacement.predictionFault, false);
+  assert.equal(replacement._statusElement.hidden, true);
+  manager.applyNativeRuntimeEvents([{ ...fault, generation: 99 }], [replacement]);
+  assert.equal(replacement.predictionFault, false, 'a prior native instance epoch cannot relatch the effect');
+  port.close();
 });
 
 test('startup rebuilds a pending state replacement but preserves an ordinary ready DSP',
@@ -867,6 +923,7 @@ test('startup rebuilds a pending state replacement but preserves an ordinary rea
           postMessage(message) { calls.push({ type: message.type, payload: message }); }
         },
         applyNativePerformanceStatus() {},
+        isDspReady: () => true,
         applyNativeBypass() {},
         applyNativeExecutionStates(states) { appliedExecutionStates.push(states); },
         applyHostAutomationDeltas() {},
@@ -880,7 +937,7 @@ test('startup rebuilds a pending state replacement but preserves an ordinary rea
       assert.equal(await manager.initAudio(), '');
       assert.equal(manager.getNowPlayingMetadata(), nowPlaying);
       assert.equal(manager.nowPlayingRevision, 5, 'each fresh editor receives the retained host track at startup');
-      await manager.rebuildPipeline();
+      assert.equal(await manager.rebuildPipeline(), '');
       return { calls, appliedExecutionStates, executionStates, preparedPipelines };
     };
 
@@ -907,6 +964,84 @@ test('startup rebuilds a pending state replacement but preserves an ordinary rea
     assert.deepEqual(ordinaryStartup.preparedPipelines.map(pipeline => pipeline.map(p => p.id)),
       [[17]], 'preserved startup prepares the restored logical image before state validation');
   });
+
+test('initial native rebuild settles authoritative readiness before publishing graph success', async () => {
+  const browserSource = await readFile(path.join(projectRoot, 'external', 'effetune', 'js', 'audio-manager.js'), 'utf8');
+  const method = name => browserSource.match(new RegExp(`    ${name}\\(\\) \\{[\\s\\S]*?\\n    \\}`))[0];
+  const initStart = source.indexOf('  async initAudio()');
+  const initEnd = source.indexOf('\n  async initializeAudioWorklet()', initStart);
+  const statusStart = source.indexOf('  applyNativePerformanceStatus(');
+  const statusEnd = source.indexOf('\n  applyNativeRuntimeEvents(', statusStart);
+  const syncStart = source.indexOf('  async synchronizeNativeContext(');
+  const syncEnd = source.indexOf('\n  scheduleLatencyService()', syncStart);
+  for (const scenario of ['ready', 'unavailable', 'rebuild-failed', 'refresh-failed',
+    'preserved', 'other-generation', 'runtime', 'context-sync']) {
+    const { context, port, node } = createNativePort();
+    const calls = [], events = [];
+    const snapshot = Promise.withResolvers();
+    context.console = { ...console, error() {} };
+    Object.assign(context, { noop() {}, fakeNode: port => ({ port }),
+      fakeAudioContext: (sampleRate, channels) => ({ sampleRate,
+        destination: { channelCount: channels, maxChannelCount: channels } }) });
+    vm.runInNewContext(`this.Manager = class { ${source.slice(initStart, initEnd)}
+      ${source.slice(statusStart, statusEnd)} ${readinessMethod}
+      ${source.slice(rebuildStart, rebuildEnd)} ${nowPlayingMethods}
+      ${source.slice(syncStart, syncEnd)}
+      ${method('_getPrimaryWorkletNode')} ${method('isDspReady')} };`, context);
+    const pipelineA = [{ id: 17 }], pipelineB = [{ id: 42, name: 'DC Offset', enabled: true,
+      getParameters: () => ({ of: .25 }),
+      getWorkletPluginData(parameters) { return { id: this.id, type: 'DCOffsetPlugin', enabled: true, parameters }; } }];
+    const manager = Object.assign(new context.Manager(), {
+      contextManager: {}, ioManager: {}, nativePort: port, nativeNode: node,
+      _dspCapabilitiesByNode: new Map(), pipelineA, pipelineB, currentPipeline: 'B',
+      getCurrentPipeline() { return this.pipelineB; },
+      getTotalPipelineLatencySamples: () => 0,
+      applyNativeBypass() {}, applyHostAutomationDeltas() {}, applyHostDiagnostics() {},
+      applyNativeExecutionStates() {}, updateExposedProperties() { this.audioContext = this.contextManager.audioContext; },
+      seedRestoredAutomationBaseline() {}, synchronizeNativeAssetMembership() {}, scheduleLatencyService() {},
+      dispatchEvent: type => events.push(type)
+    });
+    port.owner = manager;
+    context.window.__effetuneHostCall = async (type, payload) => {
+      calls.push(type);
+      if (type === 'pipeline/rebuild') {
+        if (scenario === 'rebuild-failed') throw new Error('Test rebuild rejected');
+        return { ok: true };
+      }
+      assert.equal(type, 'host/getInfo');
+      if (!payload?.startup) return snapshot.promise;
+      return { dspReady: scenario === 'preserved', contextGeneration: 7, engineSampleRate: 48000, channels: 2 };
+    };
+    assert.equal(await manager.initAudio(), '');
+    assert.equal(manager.isDspReady(), scenario === 'preserved');
+    if (scenario === 'runtime') context.window.app.initialized = true;
+    if (scenario === 'context-sync') manager.nativeContextSync = Promise.resolve();
+    const rebuilt = manager.rebuildPipeline();
+    if (['ready', 'unavailable', 'refresh-failed', 'other-generation'].includes(scenario)) {
+      await new Promise(resolve => setTimeout(resolve, 0));
+      assert.deepEqual(calls, ['host/getInfo', 'pipeline/rebuild', 'host/getInfo']);
+      assert.equal(events.includes('audioGraphRebuilt'), false, 'startup awaits its authoritative snapshot');
+      assert.equal(manager.isDspReady(), false);
+    }
+    if (scenario === 'refresh-failed') snapshot.reject(new Error('Test snapshot rejected'));
+    else snapshot.resolve({ dspReady: scenario !== 'unavailable',
+      contextGeneration: scenario === 'other-generation' ? 8 : 7, engineSampleRate: 48000, channels: 2 });
+    assert.equal(await rebuilt, scenario === 'rebuild-failed' ? 'Audio Error: Test rebuild rejected'
+      : scenario === 'refresh-failed' ? 'Audio Error: Test snapshot rejected' : '');
+    assert.equal(manager.isDspReady(), ['ready', 'preserved', 'other-generation'].includes(scenario));
+    assert.equal(events.includes('audioGraphRebuilt'), !scenario.endsWith('-failed'));
+    if (scenario === 'preserved') assert.deepEqual(calls, ['host/getInfo']);
+    if (['runtime', 'context-sync', 'rebuild-failed'].includes(scenario))
+      assert.deepEqual(calls, ['host/getInfo', 'pipeline/rebuild']);
+    assert.equal(manager.currentPipeline, 'B');
+    assert.equal(manager.pipelineA, pipelineA);
+    assert.equal(manager.pipelineB, pipelineB);
+    if (scenario === 'other-generation')
+      assert.deepEqual(calls, ['host/getInfo', 'pipeline/rebuild', 'host/getInfo', 'pipeline/rebuild']);
+    assert.equal(manager.nativeContextGeneration, scenario === 'other-generation' ? 8 : 7);
+    port.close();
+  }
+});
 
 test('audio graph rebuild waits for native success and propagates native failure', async () => {
   const { context, port } = createNativePort();

@@ -849,9 +849,9 @@ void testMessageRouter() {
              message, &error) && message.action == UiAction::readPluginAssetState,
          "DSP asset state routing");
   expect(!MessageRouter::decode(
-             R"({"type":"pipeline/assetBegin","payload":{"pluginId":44,"slot":0,"formatTag":1,"channels":1,"frames":600,"topology":1,"headBlock":128,"rateDivider":1,"pathCount":0,"inputCount":0,"processingChannels":2,"footprintBytes":33554433,"byteSize":2432,"operationRevision":7}})",
+             R"({"type":"pipeline/assetBegin","payload":{"pluginId":44,"slot":0,"formatTag":1,"channels":1,"frames":600,"topology":1,"headBlock":128,"rateDivider":1,"pathCount":0,"inputCount":0,"processingChannels":2,"footprintBytes":1073741825,"byteSize":2432,"operationRevision":7}})",
              message, &error),
-         "DSP asset footprint above the native limit must be rejected");
+         "DSP asset footprint above the transport ceiling must be rejected");
   expect(!MessageRouter::decode(
              R"({"type":"pipeline/assetCommit","payload":{"pluginId":44,"slot":0}})",
              message, &error),
@@ -1629,11 +1629,59 @@ void testFrequencyPreviewChannelsAndEnvelope() {
   }
 }
 
+
+void testBandpassNoisePreview() {
+  using Preview = effetune::vst::FrequencyPreview;
+  Preview preview;
+  std::array<float, 48000> samples{};
+  float *channels[]{samples.data()};
+  preview.setFrequency(1000, Preview::Sound::bandpassNoise);
+  expect(preview.mix(channels, 1, static_cast<std::uint32_t>(samples.size()), 48000), "noise preview is active");
+  double energy = 0, halfCycle = 0, fullCycle = 0;
+  for (std::size_t frame = 480; frame + 48 < samples.size(); ++frame) {
+    energy += samples[frame] * samples[frame];
+    halfCycle += samples[frame] * samples[frame + 24];
+    fullCycle += samples[frame] * samples[frame + 48];
+  }
+  const auto rms = std::sqrt(energy / (samples.size() - 528));
+  expect(rms > .14 && rms < .21 && halfCycle < -.4 * energy && fullCycle > .2 * energy,
+         "upstream Q=4 noise has sine-matched RMS and energy around the requested band");
+  for (const auto frequency : {12000.0, 20.0, 18000.0, 1000.0}) {
+    preview.setFrequency(frequency, Preview::Sound::bandpassNoise);
+    samples.fill(0);
+    expect(preview.mix(channels, 1, 480, 48000), "retuned noise remains active");
+    expect(std::all_of(samples.begin(), samples.begin() + 480,
+                      [](float value) { return std::isfinite(value) && std::abs(value) < 2; }),
+           "crossfading fixed band-pass filters bounds high-to-low retune transients");
+  }
+  preview.setFrequency(0);
+  samples.fill(0);
+  expect(preview.mix(channels, 1, 480, 48000), "noise release block retains the measurement gate");
+  expect(std::all_of(samples.begin() + 240, samples.begin() + 480, [](float value) { return value == 0; }) &&
+         !preview.mix(channels, 1, 480, 48000), "noise stops within the upstream release ramp");
+}
+
+void testSfzMessageRouting() {
+  for (const auto operation : {"select", "list", "remove", "openRead", "readChunk", "closeRead"}) {
+    RoutedUiMessage message;
+    const auto request = std::string(R"({"type":"sfz/)") + operation +
+        R"(","payload":{"id":"0123456789abcdef01234567","relativePath":"samples/tone.wav","maxBytes":4096}})";
+    expect(MessageRouter::decode(request, message) && message.action == UiAction::sfzLibrary &&
+               message.path == operation, "SFZ routes through one control-side service action");
+    expect(choc::json::parse(message.content)["relativePath"].getString() == "samples/tone.wav",
+           "SFZ request data reaches service validation intact");
+  }
+  RoutedUiMessage message;
+  expect(!MessageRouter::decode(R"({"type":"sfz/unknown","payload":{}})", message),
+         "unknown SFZ operations are not admitted");
+}
+
 int main() {
   effetune::vst::testing::suppressCrtModalDialogs();
   try {
     testDescriptor();
     testFrequencyPreviewChannelsAndEnvelope();
+    testBandpassNoisePreview();
     testQueue();
     testOutputTransition();
     testDryDelayLine();
@@ -1643,6 +1691,7 @@ int main() {
     testLatency();
     testStateCodec();
     testMessageRouter();
+    testSfzMessageRouting();
     testPresetStoreRouting();
     testResampler();
     testEngineHost();

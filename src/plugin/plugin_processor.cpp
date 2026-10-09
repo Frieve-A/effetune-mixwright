@@ -438,6 +438,7 @@ tresult PLUGIN_API EffeTuneProcessor::initialize(FUnknown *context) {
 tresult PLUGIN_API EffeTuneProcessor::terminate() {
   frequencyPreview_.setFrequency(0.0);
   cancelBackupExport();
+  closeSfzReads();
   // Before the component handler goes away with the base class: an edit left
   // open past it can never be ended at all.
   closeOpenHostGestures();
@@ -1951,15 +1952,16 @@ void EffeTuneProcessor::appendCircuitFaults(choc::value::Value &result) {
   constexpr std::array<const char *, 3> causes{
       "none", "feedbackOscillation", "processingSafetyFailure"};
   for (const auto &fault : engine_.circuitFaults()) {
-    if (fault.cause >= causes.size()) continue;
+    const auto adaptive = fault.kind == EngineHost::RuntimeFaultKind::adaptivePrediction;
+    if (fault.cause >= (adaptive ? 2u : causes.size())) continue;
     auto event = choc::value::createObject({});
-    event.addMember("type", "tubeSimulatorCircuitFault");
+    event.addMember("type", adaptive ? "adaptivePredictionFault" : "tubeSimulatorCircuitFault");
     event.addMember("pluginId", static_cast<std::int64_t>(fault.pluginId));
-    event.addMember("pluginType", "TubeSimulatorPlugin");
+    event.addMember("pluginType", adaptive ? "AdaptivePredictionEffectPlugin" : "TubeSimulatorPlugin");
     event.addMember("instanceEpoch", static_cast<std::int64_t>(fault.instanceEpoch));
     event.addMember("generation", static_cast<std::int64_t>(fault.generation));
     event.addMember("latched", fault.latched);
-    event.addMember("cause", causes[fault.cause]);
+    event.addMember("cause", adaptive && fault.cause == 1 ? "numericalFailure" : causes[fault.cause]);
     events.addArrayElement(std::move(event));
   }
   result.addMember("runtimeEvents", std::move(events));
@@ -3790,6 +3792,12 @@ bool EffeTuneProcessor::attachEditor(void *owner, void *parent,
   }
 }
 
+void EffeTuneProcessor::closeSfzReads() {
+  std::scoped_lock lock(sfzMutex_);
+  ++sfzGeneration_;
+  sfzLibrary_.closeReads();
+}
+
 void EffeTuneProcessor::cancelBackupExport() {
   std::scoped_lock lock(backupExportMutex_);
   ++backupExportGeneration_;
@@ -3797,17 +3805,28 @@ void EffeTuneProcessor::cancelBackupExport() {
 }
 
 void EffeTuneProcessor::detachEditor(void *owner) noexcept {
+  std::shared_ptr<WebViewHost> webView;
+  {
+    std::scoped_lock editorLock(editorMutex_);
+    if (editorTerminating_) return;
+    webView = webView_;
+  }
+  auto attached = webView != nullptr && webView->isAttachedTo(owner);
+#if defined(EFFETUNE_PROCESSOR_TEST_HOOKS)
+  if (attachedEditorOwnerForTesting_.has_value()) {
+    attached = owner != nullptr && owner == *attachedEditorOwnerForTesting_;
+    if (attached) attachedEditorOwnerForTesting_ = nullptr;
+  }
+#endif
+  // A host may remove an old IPlugView after attaching its replacement. The
+  // platform rejects that old owner; its cleanup must also leave the live
+  // page's reads, previews, captures, exports and gestures untouched.
+  if (!attached) return;
   frequencyPreview_.setFrequency(0.0);
   outputAnalyzers_.stopCapture();
   engine_.spectrumCapture().stopCapture();
   cancelBackupExport();
-  std::shared_ptr<WebViewHost> webView;
-  {
-    std::scoped_lock editorLock(editorMutex_);
-    if (!editorTerminating_) {
-      webView = webView_;
-    }
-  }
+  closeSfzReads();
   if (webView != nullptr) {
     webView->detach(owner);
   }
@@ -3885,8 +3904,33 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
   if (!MessageRouter::decode(request, message, &error)) {
     return bridgeResult(false, error);
   }
+  if (message.action == UiAction::sfzLibrary) {
+    if (message.path != "select") {
+      std::scoped_lock lock(sfzMutex_);
+      return sfzLibrary_.request(message.path, message.content);
+    }
+    std::uint64_t generation;
+    {
+      std::scoped_lock lock(sfzMutex_);
+      generation = ++sfzGeneration_;
+    }
+    // Modal dialogs pump events. No service lock survives the chooser, and a
+    // replaced or closed page cannot persist the abandoned selection.
+#if defined(EFFETUNE_PROCESSOR_TEST_HOOKS)
+    const auto selected = sfzFolderChooserForTesting_
+        ? sfzFolderChooserForTesting_() : chooseSfzFolder();
+#else
+    const auto selected = chooseSfzFolder();
+#endif
+    std::scoped_lock lock(sfzMutex_);
+    if (!selected || generation != sfzGeneration_ ||
+        requestPageGeneration != uiPageGeneration_.load(std::memory_order_acquire)) {
+      return R"({"ok":true,"data":null})";
+    }
+    return sfzLibrary_.request("select", message.content, *selected);
+  }
   if (message.action == UiAction::frequencyPreview) {
-    frequencyPreview_.setFrequency(message.previewFrequency);
+    frequencyPreview_.setFrequency(message.previewFrequency, message.previewSound);
     return bridgeResult(true);
   }
   if (message.action == UiAction::resetPluginState) {
@@ -3965,6 +4009,7 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
       outputAnalyzers_.stopCapture();
       engine_.spectrumCapture().stopCapture();
       cancelBackupExport();
+      closeSfzReads();
       closeOpenHostGestures();
       std::scoped_lock resources(processingResourcesMutex_);
       const auto pageGeneration =
@@ -4183,13 +4228,20 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     try {
       std::scoped_lock transferLock(assetTransferMutex_);
       const auto key = assetKey(transfer.asset.logicalId, transfer.asset.slot);
+      const auto limits = engine_.assetLimits(transfer.asset.logicalId, transfer.asset.slot);
+      if (!limits.accepts(message.assetByteSize, transfer.asset.footprintBytes))
+        return bridgeResult(false, "DSP asset exceeds the plug-in capacity");
+      transfer.budget = limits.budget;
+      std::vector<std::uint64_t> replacedKeys{key};
       std::uint64_t pendingFootprint = transfer.asset.footprintBytes;
       for (const auto &[pendingKey, pending] : pendingAssetTransfers_) {
-        if (pendingKey != key) {
+        if (pendingKey != key && pending.budget == transfer.budget) {
+          replacedKeys.push_back(pendingKey);
           pendingFootprint += pending.asset.footprintBytes;
         }
       }
-      if (pendingFootprint > EngineHost::kAggregateAssetBudgetBytes) {
+      pendingFootprint += engine_.assetFootprint(transfer.budget, replacedKeys);
+      if (pendingFootprint > transfer.budget) {
         return bridgeResult(false, "DSP asset transfer budget exceeded");
       }
       transfer.asset.payload.resize(message.assetByteSize);

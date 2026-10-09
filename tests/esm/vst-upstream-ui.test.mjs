@@ -160,7 +160,10 @@ test('Visualizer startup preference opens once without changing host pipeline st
     assert.ok(match);
     return match[0];
   });
-  const App = vm.runInNewContext(`(class { ${methods.join('\n')} })`);
+  const diagnostics = [];
+  const App = vm.runInNewContext(`(class { ${methods.join('\n')} })`, {
+    console: { error: (...args) => diagnostics.push(args) }
+  });
   for (const startupView of ['effects', 'visualizer', 'library', undefined]) {
     const app = new App();
     let opened = 0;
@@ -169,6 +172,129 @@ test('Visualizer startup preference opens once without changing host pipeline st
     await Promise.all([app.applyStartupViewPreference(), app.applyStartupViewPreference()]);
     assert.equal(opened, startupView === 'visualizer' ? 1 : 0);
   }
+  const app = new App();
+  const errors = [];
+  const failure = new Error('Test navigation failure');
+  app.startupConfig = { startupView: 'visualizer' };
+  app.uiManager = { async showVisualizerView() { throw failure; },
+    setError: (...args) => errors.push(args) };
+  await app.applyStartupViewPreference();
+  assert.deepEqual(diagnostics, [['Error opening Visualizer startup view:', failure]]);
+  assert.deepEqual(errors, [['Visualizer could not be opened. Please try the Visualizer button.', true]]);
+});
+
+test('startup navigation waits for native readiness and settles before revealing the view', async () => {
+  const appSource = await assetText('js/app.js');
+  const uiSource = await assetText('js/ui-manager.js');
+  const method = (source, name) => {
+    const match = source.match(new RegExp(`    (?:async )?${name}\\([^\\n]*\\) \\{[\\s\\S]*?\\n    \\}`));
+    assert.ok(match, `Missing ${name}`);
+    return match[0];
+  };
+  const previous = { window: globalThis.window, document: globalThis.document };
+  try {
+    for (const [startupView, dspReady, disabled, initiallyReady = false] of [
+      ['visualizer', true, false], ['effects', true, false],
+      ['visualizer', false, false], ['visualizer', true, true], ['visualizer', true, false, true]
+    ]) {
+      const document = Object.assign(new Element('document'), {
+        documentElement: new Element('html'), body: new Element('body'), hidden: false
+      });
+      document.documentElement.classList.add('app-starting');
+      const pluginsLoaded = Promise.withResolvers();
+      const hostInfo = Promise.withResolvers();
+      const rebuiltInfo = Promise.withResolvers();
+      const viewReady = Promise.withResolvers();
+      let hostRequested = false;
+      let refreshRequested = false;
+      let rebuilds = 0;
+      let startupContentHandled = false;
+      const openedStatuses = [];
+      const window = { location: { search: '' }, audioPreferences: { useWasmDsp: !disabled },
+        electronAPI: {}, addEventListener() {}, removeEventListener() {},
+        __effetuneHostCall: async (type, payload) => {
+          if (type === 'pipeline/rebuild') { rebuilds++; return { ok: true }; }
+          if (type !== 'host/getInfo') return { ok: true };
+          if (payload?.startup) { hostRequested = true; return hostInfo.promise; }
+          refreshRequested = true;
+          return rebuiltInfo.promise;
+        } };
+      Object.assign(globalThis, { window, document });
+      const { AudioManager } = await assetModule('vst-audio-manager.js');
+      const { VisualizerSources } = await assetModule('js/visualizer/visualizer-sources.js');
+      const pipelineA = [{ id: 17 }], pipelineB = [{ id: 42, name: 'DC Offset', enabled: true,
+        getParameters: () => ({ of: .25 }),
+        getWorkletPluginData(parameters) { return { id: this.id, type: 'DCOffsetPlugin', enabled: true, parameters }; } }];
+      const audioManager = new AudioManager();
+      clearInterval(audioManager.telemetryTimer);
+      Object.assign(audioManager, { pipelineA, pipelineB, currentPipeline: 'B',
+        pipelineProcessor: { setPipeline() {}, setMasterBypass() {} },
+        applyNativeBypass() {}, applyHostAutomationDeltas() {}
+      });
+      const sources = new VisualizerSources(audioManager);
+      assert.equal(sources.getStatus(), disabled ? 'disabled' : 'unavailable');
+      const context = { window, document, console, MIC_DENIED_PREFIX: 'Audio Error: Microphone',
+        displayAppVersion: async () => {}, waitForStylesheets: async () => {},
+        requestAnimationFrame: callback => queueMicrotask(callback) };
+      vm.runInNewContext(`this.App = class { ${['initialize', 'applyStartupViewPreference',
+        'openConfiguredStartupView'].map(name => method(appSource, name)).join('\n')} };
+        this.Navigation = class { ${method(uiSource, 'showVisualizerView')} };`, context, {
+        filename: path.join(assets, 'js/app.js'),
+        importModuleDynamically: vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER
+      });
+      const uiManager = Object.assign(new context.Navigation(), {
+        updateLoadingProgress() {}, initPluginList() {}, initDragAndDrop() {}, initAudio() {},
+        updatePipelineUI() {}, isDoubleBlindActive: () => false, hideLibraryView() {},
+        updateViewSwitchButtons() {}, setError: message => assert.fail(message),
+        async ensureVisualizerView() {
+          openedStatuses.push(sources.getStatus());
+          await viewReady.promise;
+        },
+        visualizerView: { show() { document.body.classList.add('view-visualizer'); }, updateVisibility() {} }
+      });
+      const app = Object.assign(new context.App(), { startupConfig: { startupView }, audioManager, uiManager,
+        pluginManager: { loadPlugins: () => pluginsLoaded.promise },
+        initializeAudioWorklet: async () => true,
+        initializeAndBuildPipeline: async () => { assert.equal(await audioManager.rebuildPipeline(), ''); return true; },
+        setupEventListeners() {}, handleErrors() {}, scheduleDeferredStartupTasks() {},
+        processCommandLineArguments: async () => { startupContentHandled = true; } });
+      window.app = app;
+      const initialized = app.initialize();
+      assert.deepEqual(openedStatuses, [], 'no navigation while plugin definitions load');
+      pluginsLoaded.resolve();
+      await until(() => hostRequested);
+      assert.deepEqual(openedStatuses, [], 'no navigation before the native startup handshake');
+      hostInfo.resolve({ dspReady: initiallyReady, contextGeneration: 7, engineSampleRate: 48000, channels: 2 });
+      if (!initiallyReady) {
+        await until(() => refreshRequested);
+        assert.equal(rebuilds, 1);
+        assert.deepEqual(openedStatuses, [], 'no navigation before post-rebuild readiness settles');
+        assert.equal(document.documentElement.classList.contains('app-starting'), true);
+      }
+      rebuiltInfo.resolve({ dspReady, contextGeneration: 7 });
+      if (startupView === 'visualizer') {
+        await until(() => openedStatuses.length === 1);
+        assert.equal(startupContentHandled, true);
+        assert.deepEqual(openedStatuses, [disabled ? 'disabled' : dspReady ? 'ready' : 'unavailable']);
+        assert.equal(document.documentElement.classList.contains('app-starting'), true);
+        assert.notEqual(app.initialized, true);
+      }
+      viewReady.resolve();
+      await initialized;
+      await app.applyStartupViewPreference();
+      assert.equal(openedStatuses.length, startupView === 'visualizer' ? 1 : 0);
+      assert.equal(document.body.classList.contains('view-visualizer'), startupView === 'visualizer');
+      assert.equal(document.documentElement.classList.contains('app-starting'), false);
+      assert.equal(app.initialized, true);
+      assert.equal(audioManager.pipelineA, pipelineA);
+      assert.equal(audioManager.pipelineB, pipelineB);
+      assert.equal(audioManager.currentPipeline, 'B');
+      assert.equal(rebuilds, initiallyReady ? 0 : 1);
+      sources.dispose();
+      clearTimeout(audioManager.latencyServiceTimer);
+      audioManager.nativePort.close();
+    }
+  } finally { Object.assign(globalThis, previous); }
 });
 
 test('a native Spectrum Tap build preserves HQ configuration and reveals the quality control', async () => {
@@ -182,13 +308,18 @@ test('a native Spectrum Tap build preserves HQ configuration and reveals the qua
   assert.equal(context.document.documentElement.classList.contains('effetune-vst-native-spectrum'), true);
 });
 
-test('bundled settings persist themes, startup view and Peak Hold and restore rejected edits', async () => {
+test('bundled settings persist supported choices and restore rejected edits', async () => {
+  const bootstrapSource = await assetText('vst-bootstrap.js');
+  for (const id of ['frequency-preview-sound', 'sfz-size-limit']) {
+    assert.ok(bootstrapSource.includes(`.config-dialog .device-section:has(#${id}),`),
+      `${id} must be visible in VST settings`);
+  }
   const { showConfigDialog } = await assetModule('js/electron/configIntegration.js');
   const previous = { window: globalThis.window, document: globalThis.document };
   try {
     for (const success of [true, false]) {
       let saved = { theme: 'midnight', startupView: 'effects', spectrumOverlayPeakHold: false,
-        spectrumOverlayQuality: 'normal', future: 42 };
+        spectrumOverlayQuality: 'normal', frequencyPreviewSound: 'sine', sfzMaxSizeMiB: 256, future: 42 };
       const calls = [];
       const applied = [];
       const context = await bootstrap(async serialized => {
@@ -206,6 +337,10 @@ test('bundled settings persist themes, startup view and Peak Hold and restore re
       await showConfigDialog(true, {});
       const theme = document.getElementById('theme-select');
       assert.deepEqual(theme.children.map(option => option.value), ['graphite', 'paper', 'midnight', 'ember', 'mint']);
+      const sound = document.getElementById('frequency-preview-sound');
+      assert.deepEqual(sound.children.map(option => option.value), ['sine', 'bandpassNoise']);
+      const sfzLimit = document.getElementById('sfz-size-limit');
+      assert.deepEqual(sfzLimit.children.map(option => option.value), ['64', '128', '256', '512', '1024']);
       const originalError = console.error;
       try {
         if (!success) console.error = () => {};
@@ -216,21 +351,255 @@ test('bundled settings persist themes, startup view and Peak Hold and restore re
         display.value = 'peakHold';
         await display.dispatchEvent('change');
         assert.equal(display.value, success ? 'peakHold' : 'instant');
+        sound.value = 'bandpassNoise';
+        await sound.dispatchEvent('change');
+        assert.equal(sound.value, success ? 'bandpassNoise' : 'sine');
+        sfzLimit.value = '1024';
+        await sfzLimit.dispatchEvent('change');
+        assert.equal(sfzLimit.value, success ? '1024' : '256');
       } finally { console.error = originalError; }
       assert.equal(theme.value, success ? 'paper' : 'midnight');
       assert.equal(saved.startupView, success ? 'visualizer' : 'effects');
       assert.equal(saved.spectrumOverlayPeakHold, success);
+      assert.equal(saved.frequencyPreviewSound, success ? 'bandpassNoise' : 'sine');
+      assert.equal(saved.sfzMaxSizeMiB, success ? 1024 : 256);
       assert.equal(saved.future, 42);
-      assert.equal(calls.filter(call => call.type === 'config/save').length, 3);
+      assert.equal(calls.filter(call => call.type === 'config/save').length, 5);
       assert.deepEqual(applied, success ? [['theme', 'paper'], ['spectrum', { quality: 'normal', peakHold: true }]] : []);
       await document.getElementById('close-btn').dispatchEvent('click');
       await showConfigDialog(true, {});
       assert.equal(document.getElementById('theme-select').value, saved.theme);
       assert.equal(document.getElementById('startup-view-visualizer').checked, success);
       assert.equal(document.getElementById('spectrum-overlay-display').value, success ? 'peakHold' : 'instant');
+      assert.equal(document.getElementById('frequency-preview-sound').value, saved.frequencyPreviewSound);
+      assert.equal(document.getElementById('sfz-size-limit').value, String(saved.sfzMaxSizeMiB));
       await document.getElementById('close-btn').dispatchEvent('click');
     }
   } finally { Object.assign(globalThis, previous); }
+});
+
+test('SFZ native folder selection preserves cancellation and offers multiple instruments', async () => {
+  const source = await assetText('plugins/others/sfz_note_player.js');
+  const { NativeSfzLibraryService } = await assetModule('js/sfz/native-service.js');
+  for (const cancelled of [true, false]) {
+    const banks = ['a', 'b'].map((letter, index) => ({ id: letter.repeat(24), name: `Instrument ${index}`,
+      selectedPath: `instrument-${index}.sfz` }));
+    const calls = [];
+    const context = await bootstrap(async serialized => {
+      const call = JSON.parse(serialized);
+      calls.push(call);
+      return { ok: true, data: cancelled ? null : { banks } };
+    });
+    assert.equal(context.window.electronAPI.sfzLibraryV1.apiVersion, 1);
+    context.PluginBase = class {
+      registerProcessor() {}
+      createCheckboxControl() { return new Element('div'); }
+      createParameterControl() { return new Element('div'); }
+    };
+    vm.runInNewContext(source, context);
+    const plugin = new context.window.SFZNotePlayerPlugin();
+    const service = new NativeSfzLibraryService(context.window.electronAPI.sfzLibraryV1);
+    const loaded = [];
+    Object.assign(plugin, { id: 7, _refreshBanks: async () => {}, _renderStatus() {}, _showLoadNotice() {},
+      _noteControl: () => new Element('div'), _resetLoadNotice() {}, updateParameters() {},
+      _getLibraryService: async () => service, _loadBank: async () => { loaded.push(plugin.sf); } });
+    const ui = plugin.createUI();
+    const folderButton = flatten(ui).find(element => element.tagName === 'BUTTON' && /Folder/.test(element.textContent));
+    assert.equal(folderButton.textContent, 'Select SFZ Folder…');
+    assert.equal(plugin._importRow.children[1].textContent, 'Select');
+    plugin.sf = 'c'.repeat(24);
+    const pending = plugin._selectNativeFolder();
+    if (!cancelled) {
+      await until(() => typeof plugin._finishImportSelection === 'function');
+      assert.equal(plugin._importRow.hidden, false);
+      assert.deepEqual(plugin._importChoices.children.map(option => option.value), banks.map(bank => bank.id));
+      plugin._finishImportSelection(banks[1].id);
+    }
+    await pending;
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].type, 'sfz/select');
+    assert.equal(plugin.sf, cancelled ? 'c'.repeat(24) : banks[1].id);
+    assert.deepEqual(loaded, cancelled ? [] : [banks[1].id]);
+  }
+});
+
+const sfzReadId = 'd'.repeat(24);
+const sfzRequest = { id: 'a'.repeat(24), relativePath: 'sample.wav', maxBytes: 1024 * 1024 };
+function sfzFileHost(bytes, calls, override = () => undefined) {
+  return async serialized => {
+    const call = JSON.parse(serialized);
+    calls.push(call);
+    const custom = override(call);
+    if (custom !== undefined) return custom;
+    if (call.type === 'sfz/openRead') return { ok: true, data: { readId: sfzReadId, size: bytes.length } };
+    if (call.type === 'sfz/readChunk') {
+      const { offset, length } = call.payload;
+      return { ok: true, data: { base64: Buffer.from(bytes.subarray(offset, offset + length)).toString('base64') } };
+    }
+    return { ok: true, data: true };
+  };
+}
+
+test('SFZ reads return exact Uint8Array data across bounded native chunks and close the handle', async () => {
+  const bytes = Uint8Array.from({ length: 400000 }, (_, index) => index % 256);
+  const calls = [];
+  const context = await bootstrap(sfzFileHost(bytes, calls));
+  const result = await context.window.electronAPI.sfzLibraryV1.readRelative(sfzRequest);
+  assert.equal(result.ok, true);
+  assert.ok(result.data instanceof Uint8Array);
+  assert.deepEqual(result.data, bytes);
+  assert.deepEqual(calls.filter(call => call.type === 'sfz/readChunk').map(call => call.payload), [
+    { readId: sfzReadId, offset: 0, length: 196608 },
+    { readId: sfzReadId, offset: 196608, length: 196608 },
+    { readId: sfzReadId, offset: 393216, length: 6784 }
+  ]);
+  assert.equal(calls.at(-1).type, 'sfz/closeRead');
+});
+
+test('SFZ reads preserve missing and size-limit results and bound malformed/native failures', async () => {
+  for (const scenario of ['missing', 'too-large', 'failure', 'malformed', 'thrown', 'invalid-size']) {
+    const calls = [];
+    const context = await bootstrap(sfzFileHost(new Uint8Array(12), calls, call => {
+      if (call.type === 'sfz/openRead') {
+        if (scenario === 'missing') return { ok: true, data: null };
+        if (scenario === 'too-large') return { ok: false, code: 'too-large', error: 'Private path' };
+        if (scenario === 'invalid-size') return { ok: true, data: { readId: sfzReadId, size: -1 } };
+      }
+      if (call.type === 'sfz/readChunk') {
+        if (scenario === 'failure') return { ok: false, code: 'storage-failed', error: 'Private path' };
+        if (scenario === 'malformed') return { ok: true, data: { base64: 'AQ==' } };
+        if (scenario === 'thrown') throw new Error('Private transport error');
+      }
+    }));
+    const result = await context.window.electronAPI.sfzLibraryV1.readRelative(sfzRequest);
+    assert.deepEqual(JSON.parse(JSON.stringify(result)), scenario === 'missing' ? { ok: true, data: null } :
+      { ok: false, code: scenario === 'too-large' ? 'too-large' : 'storage-failed' });
+    assert.equal(calls.filter(call => call.type === 'sfz/closeRead').length,
+      ['missing', 'too-large'].includes(scenario) ? 0 : 1);
+  }
+});
+
+test('SFZ concurrent reads and probes close each job before opening another and recover after failure', async () => {
+  const bytes = Uint8Array.from({ length: 400000 }, (_, index) => index % 256);
+  const calls = [];
+  let active = 0;
+  let maximumActive = 0;
+  let opened = 0;
+  const context = await bootstrap(sfzFileHost(bytes, calls, call => {
+    if (call.type === 'sfz/openRead') {
+      active++;
+      maximumActive = Math.max(maximumActive, active);
+      opened++;
+      assert.ok(active <= 16, 'native read-session capacity exceeded');
+    }
+    if (call.type === 'sfz/readChunk' && opened === 9) {
+      return { ok: false, code: 'storage-failed' };
+    }
+    if (call.type === 'sfz/closeRead') active--;
+  }));
+  const bridge = context.window.electronAPI.sfzLibraryV1;
+  const results = await Promise.all(Array.from({ length: 40 }, (_, index) =>
+    index % 2 ? bridge.statRelative(sfzRequest) : bridge.readRelative(sfzRequest)));
+  assert.equal(results.filter(result => result.ok).length, 39);
+  assert.deepEqual(JSON.parse(JSON.stringify(results[8])), { ok: false, code: 'storage-failed' });
+  assert.equal(maximumActive, 1);
+  assert.equal(active, 0);
+  assert.equal(calls.filter(call => call.type === 'sfz/closeRead').length, 40);
+  assert.deepEqual(results.at(-2).data, bytes, 'a failed job must not poison subsequent reads');
+});
+
+test('more than sixteen concurrent native SFZ bank preparations share bounded read sessions', async () => {
+  const { NativeSfzLibraryService } = await assetModule('js/sfz/native-service.js');
+  const banks = Array.from({ length: 20 }, (_, index) => ({
+    id: index.toString(16).padStart(24, '0'), name: `Instrument ${index}`, selectedPath: `instrument-${index}.sfz`
+  }));
+  const definition = new TextEncoder().encode('<region> sample=tone.wav key=60');
+  const wav = Buffer.alloc(44 + 16);
+  wav.write('RIFF'); wav.writeUInt32LE(wav.length - 8, 4); wav.write('WAVEfmt ', 8);
+  wav.writeUInt32LE(16, 16); wav.writeUInt16LE(1, 20); wav.writeUInt16LE(1, 22);
+  wav.writeUInt32LE(48000, 24); wav.writeUInt32LE(96000, 28);
+  wav.writeUInt16LE(2, 32); wav.writeUInt16LE(16, 34); wav.write('data', 36); wav.writeUInt32LE(16, 40);
+  let admitted = null;
+  let maximumActive = 0;
+  let opened = 0;
+  let closed = 0;
+  const context = await bootstrap(async serialized => {
+    const { type, payload } = JSON.parse(serialized);
+    if (type === 'sfz/list') return { ok: true, data: banks };
+    if (type === 'sfz/openRead') {
+      maximumActive = Math.max(maximumActive, admitted ? 2 : 1);
+      assert.equal(admitted, null, 'another bank preparation still owns a read session');
+      admitted = payload.relativePath === 'tone.wav' ? wav : definition;
+      opened++;
+      return { ok: true, data: { readId: sfzReadId, size: admitted.length } };
+    }
+    if (type === 'sfz/readChunk') {
+      const { offset, length } = payload;
+      return { ok: true, data: { base64: Buffer.from(admitted.subarray(offset, offset + length)).toString('base64') } };
+    }
+    if (type === 'sfz/closeRead') {
+      admitted = null;
+      closed++;
+      return { ok: true, data: true };
+    }
+    throw new Error(`Unexpected fixture operation: ${type}`);
+  });
+  const service = new NativeSfzLibraryService(context.window.electronAPI.sfzLibraryV1);
+  const prepared = await Promise.all(banks.map(bank => service.prepare(bank.id, {
+    decode: async (_bytes, sampleRate) => ({ sampleRate, channels: [new Float32Array(8)] })
+  })));
+  assert.ok(prepared.every(bank => bank.regionCount === 1 && bank.descriptor.payload instanceof ArrayBuffer));
+  assert.equal(opened, 60, 'each bank reads its definition, probes its sample, then reads the sample');
+  assert.equal(closed, opened);
+  assert.equal(maximumActive, 1);
+  assert.equal(admitted, null);
+});
+
+test('SFZ stat probes upstream WAV headers past JUNK chunks without reading sample data', async () => {
+  const bytes = new Uint8Array(300000);
+  const view = new DataView(bytes.buffer);
+  const ascii = (offset, value) => bytes.set(new TextEncoder().encode(value), offset);
+  ascii(0, 'RIFF'); view.setUint32(4, bytes.length - 8, true); ascii(8, 'WAVE');
+  ascii(12, 'JUNK'); view.setUint32(16, 200000, true);
+  const fmt = 200020;
+  ascii(fmt, 'fmt '); view.setUint32(fmt + 4, 16, true); view.setUint16(fmt + 8, 1, true);
+  view.setUint16(fmt + 10, 2, true); view.setUint32(fmt + 12, 48000, true);
+  view.setUint16(fmt + 20, 4, true); view.setUint16(fmt + 22, 16, true);
+  ascii(fmt + 24, 'data'); view.setUint32(fmt + 28, 256 * 4, true);
+  const calls = [];
+  const context = await bootstrap(sfzFileHost(bytes, calls));
+  const result = await context.window.electronAPI.sfzLibraryV1.statRelative(sfzRequest);
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), {
+    ok: true, data: { size: bytes.length, channels: 2, sampleRate: 48000, frames: 256 }
+  });
+  assert.equal(calls[0].payload.maxBytes, 1024 * 1024 * 1024);
+  assert.ok(calls.filter(call => call.type === 'sfz/readChunk').every(call => call.payload.length <= 16));
+  assert.equal(calls.at(-1).type, 'sfz/closeRead');
+});
+
+test('SFZ stat uses upstream AIFF and FLAC metadata and handles short or missing files', async () => {
+  // Match the compact header fixtures used by the upstream native SFZ tests.
+  const flac = Buffer.alloc(42);
+  flac.write('fLaC'); flac[4] = 0x80; flac[7] = 34;
+  flac.writeBigUInt64BE((48000n << 44n) | (1n << 41n) | 96000n, 18);
+  const aiff = Buffer.alloc(38);
+  aiff.write('FORM'); aiff.write('AIFF', 8); aiff.write('COMM', 12);
+  aiff.writeUInt32BE(18, 16); aiff.writeUInt16BE(1, 20); aiff.writeUInt32BE(128, 22);
+  aiff.writeUInt16BE(16, 26); aiff.writeUInt16BE(16398, 28); aiff.writeUInt32BE(0xac440000, 30);
+  for (const [bytes, metadata] of [
+    [flac, { channels: 2, frames: 96000, sampleRate: 48000 }],
+    [aiff, { channels: 1, frames: 128, sampleRate: 44100 }],
+    [new Uint8Array(5), {}]
+  ]) {
+    const calls = [];
+    const context = await bootstrap(sfzFileHost(bytes, calls));
+    const result = await context.window.electronAPI.sfzLibraryV1.statRelative(sfzRequest);
+    assert.deepEqual(JSON.parse(JSON.stringify(result)), { ok: true, data: { size: bytes.length, ...metadata } });
+    assert.equal(calls.at(-1).type, 'sfz/closeRead');
+  }
+  const context = await bootstrap(async () => ({ ok: true, data: null }));
+  assert.deepEqual(JSON.parse(JSON.stringify(await context.window.electronAPI.sfzLibraryV1.statRelative(sfzRequest))),
+    { ok: true, data: null });
 });
 
 async function bundledZip() {
@@ -268,6 +637,7 @@ class Element {
   get textContent() { return this._text || ''; }
   appendChild(node) { node.parentNode = this; this.children.push(node); return node; }
   append(...nodes) { nodes.forEach(node => this.appendChild(node)); }
+  replaceChildren(...nodes) { this.children = []; this.append(...nodes); }
   remove() {
     if (this.parentNode) this.parentNode.children = this.parentNode.children.filter(node => node !== this);
   }
@@ -307,8 +677,11 @@ async function bootstrap(hostMessage) {
   });
   const window = Object.assign(new Element('window'), { vst_hostMessage: hostMessage });
   const context = { document, window, navigator: { platform: 'Win32', userAgent: 'WebView' },
-    URL, Uint8Array, Blob, DOMException, btoa, console, setTimeout, clearTimeout };
-  vm.runInNewContext(await assetText('vst-bootstrap.js'), context);
+    URL, Uint8Array, Blob, DOMException, btoa, atob, console, setTimeout, clearTimeout };
+  vm.runInNewContext(await assetText('vst-bootstrap.js'), context, {
+    filename: path.join(assets, 'vst-bootstrap.js'),
+    importModuleDynamically: vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER
+  });
   return context;
 }
 

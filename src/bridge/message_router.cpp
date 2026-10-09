@@ -102,12 +102,12 @@ void setError(std::string *destination, std::string value) {
       headBlock == 1024;
   if (formatTag <= 0 || formatTag > std::numeric_limits<std::uint32_t>::max() || channels < 1 ||
       channels > 16 || frames < 1 || frames > std::numeric_limits<std::uint32_t>::max() ||
-      topology < 1 || topology > 4 || !validHeadBlock ||
+      topology < 0 || topology > 4 || !validHeadBlock ||
       (rateDivider != 1 && rateDivider != 2 && rateDivider != 4) || pathCount < 0 ||
       pathCount > 16 || inputCount < 0 || inputCount > 16 || processingChannels < 1 ||
       processingChannels > EngineHost::kMaxChannels || byteSize < 1 ||
-      byteSize > EngineHost::kMaximumAssetPayloadBytes || footprintBytes < byteSize ||
-      footprintBytes > EngineHost::kMaximumAssetPayloadBytes) {
+      byteSize > EngineHost::kMaximumAssetTransportBytes || footprintBytes < byteSize ||
+      footprintBytes > EngineHost::kMaximumAssetTransportBytes) {
     setError(error, "DSP asset metadata is invalid or exceeds the plug-in capacity");
     return false;
   }
@@ -437,11 +437,18 @@ bool MessageRouter::decode(const std::string_view json, RoutedUiMessage &message
       }
     }
 
-    if (type == "host/getInfo") {
+    if (type == "sfz/select" || type == "sfz/list" || type == "sfz/remove" ||
+        type == "sfz/openRead" || type == "sfz/readChunk" || type == "sfz/closeRead") {
+      decoded.action = UiAction::sfzLibrary;
+      decoded.path = type.substr(4);
+      decoded.content = choc::json::toString(payload);
+    } else if (type == "host/getInfo") {
       decoded.action = UiAction::hostInfo;
       decoded.startupHandshake = payload["startup"].getWithDefault<bool>(false);
     } else if (type == "audio/frequencyPreview") {
       decoded.action = UiAction::frequencyPreview;
+      decoded.previewSound = payload["sound"].getWithDefault<std::string>("") == "bandpassNoise"
+          ? FrequencyPreview::Sound::bandpassNoise : FrequencyPreview::Sound::sine;
       decoded.previewFrequency = payload["frequency"].getWithDefault<double>(0.0);
       if (!std::isfinite(decoded.previewFrequency) || decoded.previewFrequency <= 0.0) {
         decoded.previewFrequency = 0.0;
@@ -544,7 +551,7 @@ bool MessageRouter::decode(const std::string_view json, RoutedUiMessage &message
       }
       const auto offset = payload["offset"].getWithDefault<std::int64_t>(-1);
       decoded.content = payload["data"].getWithDefault<std::string>({});
-      if (offset < 0 || offset > EngineHost::kMaximumAssetPayloadBytes ||
+      if (offset < 0 || offset > EngineHost::kMaximumAssetTransportBytes ||
           decoded.content.empty() || decoded.content.size() > kMaximumAssetChunkBase64Bytes) {
         setError(error, "DSP asset chunk is invalid");
         return false;

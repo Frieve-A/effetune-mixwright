@@ -21,6 +21,7 @@ class Engine;
 
 namespace effetune::vst {
 namespace plugin { class PluginProcessorTestAccess; }
+class EngineHostTestAccess;
 
 struct KernelInfo {
   std::uint32_t index = 0;
@@ -63,6 +64,20 @@ public:
   static constexpr std::uint32_t kMaximumAssetPayloadBytes = 32u * 1024u * 1024u;
   static constexpr std::uint32_t kAggregateAssetBudgetBytes = 128u * 1024u * 1024u;
 
+  static constexpr std::uint32_t kSfzAssetBudgetBytes = 1024u * 1024u * 1024u;
+  // Transport permits the largest supported bank; target admission uses the kernel.
+  static constexpr std::uint32_t kMaximumAssetTransportBytes = kSfzAssetBudgetBytes;
+  struct AssetLimits {
+    std::uint32_t capacity = 0;
+    std::uint32_t budget = 0;
+    [[nodiscard]] bool accepts(std::size_t bytes, std::uint32_t footprint) const noexcept {
+      return bytes != 0 && bytes <= capacity && footprint >= bytes && footprint <= capacity;
+    }
+  };
+  [[nodiscard]] AssetLimits assetLimits(std::uint32_t logicalId, std::uint32_t slot) const;
+  [[nodiscard]] std::uint64_t assetFootprint(std::uint32_t budget,
+                                            std::span<const std::uint64_t> excludedKeys) const;
+
   struct ProcessCounters {
     std::uint64_t batchAttempts = 0;
     std::uint64_t commandFailures = 0;
@@ -88,12 +103,14 @@ public:
     ProcessError error = ProcessError::none;
   };
 
+  enum class RuntimeFaultKind { tubeCircuit, adaptivePrediction };
   struct CircuitFaultSnapshot {
     std::uint32_t pluginId = 0;
     std::uint32_t instanceEpoch = 0;
     std::uint32_t generation = 0;
     bool latched = false;
     std::uint32_t cause = 0;
+    RuntimeFaultKind kind = RuntimeFaultKind::tubeCircuit;
   };
   [[nodiscard]] std::vector<CircuitFaultSnapshot> circuitFaults() const;
 
@@ -230,7 +247,10 @@ public:
 
 private:
   friend class plugin::PluginProcessorTestAccess;
+  friend class EngineHostTestAccess;
+  enum class AnalysisRole { other, display, rhythm, producer, consumer };
   struct CircuitFaultProjection {
+    RuntimeFaultKind kind = RuntimeFaultKind::tubeCircuit;
     std::uint32_t instanceEpoch = 0;
     std::atomic<std::uint64_t> state{0};
   };
@@ -242,6 +262,13 @@ private:
     // Allocated only at rebuild for kernels with a host-owned measurement gate.
     std::vector<float> measurementParameters;
     std::unique_ptr<CircuitFaultProjection> circuitFault;
+    std::uint32_t assetBudget = kAggregateAssetBudgetBytes;
+    AnalysisRole analysisRole = AnalysisRole::other;
+    float minimumMidi = 0.0f;
+    float maximumMidi = 0.0f;
+    bool metronomeClick = false;
+    et_instance analysisSource = 0;
+    et_instance pendingAnalysisSource = 0;
   };
 
   void discoverKernels();
@@ -253,6 +280,8 @@ private:
                                           bool *pipelinePlanDirty = nullptr) noexcept;
   void storeActiveDescriptorUnlocked(const std::uint8_t *descriptor,
                                      std::uint32_t byteCount) noexcept;
+  [[nodiscard]] bool refreshAnalysisSourcesUnlocked(std::uint32_t channels,
+                                                    bool masterBypass) noexcept;
   [[nodiscard]] bool updateParametersUnlocked(std::uint32_t logicalId,
                                               std::span<const float> packed,
                                               std::uint32_t paramsHash,
@@ -285,6 +314,10 @@ private:
   bool frequencyPreviewActive_ = false;
   std::array<std::uint8_t, AudioCommand::kMaxDescriptorBytes> activeDescriptor_{};
   std::uint32_t activeDescriptorByteCount_ = 0;
+  std::array<InstanceEntry *, kMaxPipelineNodes> analysisNodes_{};
+  bool analysisSourcesDirty_ = true;
+  bool analysisMasterBypass_ = false;
+  std::uint32_t analysisChannels_ = 0;
   std::unordered_map<std::string, KernelInfo> kernels_;
   // The kernel owns the preparation state as plain memory that the audio
   // thread advances, so it cannot be read from a control thread. Every path
@@ -292,6 +325,7 @@ private:
   // poll read the state without stopping the DSP for it.
   struct AssetEntry {
     RuntimeAsset asset;
+    std::uint32_t budget = kAggregateAssetBudgetBytes;
     std::atomic<std::uint32_t> state{
         static_cast<std::uint32_t>(ET_ASSET_STATE_NONE)};
   };

@@ -49,12 +49,15 @@ Use the **Visualizer** header button to view and edit analyzer layouts fed by th
 native pipeline output. The **Effect Pipeline** button returns to effect editing.
 Visualizer presets and imported images use the VST WebView's local storage.
 The music player and music library remain outside the VST interface.
+Upstream's LAN remote control is not available in this VST build.
 
 Use **Settings → Configuration → Controllers** to open controller mapping settings.
 Controller mappings can toggle master bypass, switch A/B, and step through saved
 presets. Player transport controls are omitted from the mapping choices.
 
 **Configuration → General** includes the upstream language and theme choices.
+It also selects sine or bandpass noise for frequency audition and the SFZ bank
+size limit (64, 128, 256, 512, or 1024 MiB; 256 MiB by default).
 **Startup** selects the Effect Pipeline or Visualizer view when the editor opens;
 the pipeline itself continues to come from the host's plug-in state.
 **Display** selects instantaneous or Peak Hold spectra for per-effect Spectrum
@@ -76,6 +79,21 @@ remaining tap delay. Visual synchronization is not enabled yet: mapping these
 positions to the host output clock, applying additional audio output delay and
 reporting that applied delay to the host are still required. Visualizer analyzer
 sources have their own analysis settings.
+
+SFZ Note Player reads instruments and samples directly from the selected folder.
+Choose **Select SFZ Folder…**, then select an SFZ file when the folder contains
+several instruments. Folder references persist locally; the source files must
+remain available, and moving or deleting them makes the instrument unavailable
+until you select it again. **Remove** removes the local library reference and
+leaves the source files in place. Projects store local SFZ identifiers, so choose
+the instrument again when opening a project on another machine. The configured limit applies to each bank's preparation and
+decoded sample data, with a native SFZ asset budget of 1 GiB. Impulse-response
+assets retain their separate 32 MiB per-asset and 128 MiB total budgets.
+
+When an active Notes analyzer and SFZ Note Player read the same input with matching
+note ranges, Mixwright reuses their note analysis where routing and timing allow it.
+Changing the input, note range or an intervening audio effect restores independent
+SFZ analysis.
 
 ## Room EQ Measurements
 

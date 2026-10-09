@@ -5,6 +5,7 @@
 
 #include "bridge/state_codec.h"
 #include "bridge/backup_export.h"
+#include "bridge/sfz_library.h"
 #include "bridge/config_store.h"
 #include "bridge/preset_store.h"
 #include "engine/automation_catalog.h"
@@ -194,6 +195,7 @@ private:
   void armLatencyNotification();
   void queueLatencyNotification(bool restartDebounce);
   void cancelBackupExport();
+  void closeSfzReads();
   // The UI reports the latency of the DSP image currently being rendered. This
   // may lead getLatencySamples() briefly while the non-real-time compensation
   // plan and the host PDC notification wait for a safe control window.
@@ -507,6 +509,7 @@ private:
 
   struct PendingAssetTransfer {
     RuntimeAsset asset;
+    std::uint32_t budget = 0;
     std::uint64_t operationRevision = 0;
     std::size_t receivedBytes = 0;
   };
@@ -536,6 +539,9 @@ private:
   AutomationScheduler automationScheduler_;
   PresetStore presetStore_;
   ConfigStore configStore_;
+  SfzLibrary sfzLibrary_{configStore_.path().parent_path() / "sfz-references.json"};
+  std::mutex sfzMutex_;
+  std::uint64_t sfzGeneration_ = 0;
   PluginStateDocument state_;
   UndoOpaqueStateStore undoOpaqueState_;
   std::string configJson_ = "{}";
@@ -811,6 +817,8 @@ private:
 #if defined(EFFETUNE_PROCESSOR_TEST_HOOKS)
   std::function<std::optional<std::filesystem::path>(std::string_view)>
       backupSaveChooserForTesting_;
+  std::function<std::optional<std::filesystem::path>()> sfzFolderChooserForTesting_;
+  std::optional<void *> attachedEditorOwnerForTesting_;
   std::uint32_t pipelinePlanRefreshFailuresForTesting_ = 0;
   std::atomic_bool pauseControllerCommitBeforePublishForTesting_{false};
   std::atomic_bool controllerCommitPausedForTesting_{false};

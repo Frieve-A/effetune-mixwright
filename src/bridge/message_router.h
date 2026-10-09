@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine/engine_host.h"
+#include "engine/frequency_preview.h"
 #include "engine/output_analyzers.h"
 
 #include <string>
@@ -11,6 +12,7 @@ namespace effetune::vst {
 
 enum class UiAction {
   hostInfo,
+  sfzLibrary,
   frequencyPreview,
   resetPluginState,
   openExternalUrl,
@@ -105,6 +107,7 @@ struct RoutedUiMessage {
   std::uint32_t elementIndex = 0;
   double normalizedValue = 0.0;
   double previewFrequency = 0.0;
+  FrequencyPreview::Sound previewSound = FrequencyPreview::Sound::sine;
   SpectrumMode spectrumMode = SpectrumMode::off;
   SpectrumQuality spectrumQuality = SpectrumQuality::normal;
   std::string pluginType;

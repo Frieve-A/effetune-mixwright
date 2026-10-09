@@ -349,6 +349,7 @@ struct WebViewHostState : public std::enable_shared_from_this<WebViewHostState> 
   void shutdown() noexcept;
   [[nodiscard]] bool attach(void *owner, void *parent, std::int32_t width,
                             std::int32_t height);
+  [[nodiscard]] bool isAttachedTo(void *owner) noexcept;
   void resize(void *owner, std::int32_t width, std::int32_t height) noexcept;
   void detach(void *owner) noexcept;
   void serviceInitialisation() noexcept;
@@ -787,12 +788,11 @@ struct WebViewGeneration : public std::enable_shared_from_this<WebViewGeneration
       replaceWebViewOnOwner();
     }
     if (!ensureWebViewOnOwner()) {
-      owner = newOwner;
       parent = newParent;
       if (showDiagnosticViewOnOwner()) {
+        owner = newOwner;
         return true;
       }
-      owner = nullptr;
       parent = nullptr;
       return false;
     }
@@ -1276,7 +1276,7 @@ struct WebViewGeneration : public std::enable_shared_from_this<WebViewGeneration
   std::atomic<WebViewStatus> currentStatus{WebViewStatus::initialising};
   std::atomic_bool retiring{false};
   std::atomic_bool released{false};
-  void *owner = nullptr;
+  std::atomic<void *> owner{nullptr};
   void *parent = nullptr;
   std::int32_t lastWidth = 1;
   std::int32_t lastHeight = 1;
@@ -1609,6 +1609,13 @@ void WebViewHostState::resize(void *owner, const std::int32_t width,
   }
 }
 
+bool WebViewHostState::isAttachedTo(void *owner) noexcept {
+  const std::scoped_lock lock(generationMutex);
+  return owner != nullptr && !stopping.load(std::memory_order_acquire) &&
+         generation != nullptr && !generation->retiring.load(std::memory_order_acquire) &&
+         generation->owner.load(std::memory_order_acquire) == owner;
+}
+
 void WebViewHostState::detach(void *owner) noexcept {
   try {
   if (stopping.load(std::memory_order_acquire)) {
@@ -1734,6 +1741,10 @@ void WebViewHost::shutdown() noexcept {
 bool WebViewHost::attach(void *owner, void *parent, const std::int32_t width,
                          const std::int32_t height) {
   return state_ != nullptr && state_->attach(owner, parent, width, height);
+}
+
+bool WebViewHost::isAttachedTo(void *owner) const noexcept {
+  return state_ != nullptr && state_->isAttachedTo(owner);
 }
 
 void WebViewHost::resize(void *owner, const std::int32_t width,

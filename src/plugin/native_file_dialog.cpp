@@ -50,19 +50,26 @@ private:
 template <typename Dialog>
 std::optional<std::filesystem::path> runWindowsDialog(const CLSID &classId,
                                                       const std::wstring &defaultName,
-                                                      const bool backup = false) {
+                                                      const bool backup = false,
+                                                      const bool folder = false) {
   ComScope com;
   Dialog *dialog = nullptr;
   if (FAILED(CoCreateInstance(classId, nullptr, CLSCTX_INPROC_SERVER,
                               __uuidof(Dialog), reinterpret_cast<void **>(&dialog)))) {
     return std::nullopt;
   }
-  const COMDLG_FILTERSPEC filter[] = {
-      {backup ? L"EffeTune Mixwright backup" : L"EffeTune Mixwright preset",
-       backup ? L"*.effetune_backup" : L"*.effetune_preset"}, {L"All files", L"*.*"}};
-  (void)dialog->SetFileTypes(static_cast<UINT>(std::size(filter)), filter);
-  (void)dialog->SetFileTypeIndex(1);
-  (void)dialog->SetDefaultExtension(backup ? L"effetune_backup" : L"effetune_preset");
+  if (folder) {
+    FILEOPENDIALOGOPTIONS options{};
+    (void)dialog->GetOptions(&options);
+    (void)dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+  } else {
+    const COMDLG_FILTERSPEC filter[] = {
+        {backup ? L"EffeTune Mixwright backup" : L"EffeTune Mixwright preset",
+         backup ? L"*.effetune_backup" : L"*.effetune_preset"}, {L"All files", L"*.*"}};
+    (void)dialog->SetFileTypes(static_cast<UINT>(std::size(filter)), filter);
+    (void)dialog->SetFileTypeIndex(1);
+    (void)dialog->SetDefaultExtension(backup ? L"effetune_backup" : L"effetune_preset");
+  }
   if (!defaultName.empty()) {
     (void)dialog->SetFileName(defaultName.c_str());
   }
@@ -84,7 +91,7 @@ std::optional<std::filesystem::path> runWindowsDialog(const CLSID &classId,
   CoTaskMemFree(value);
   item->Release();
   dialog->Release();
-  if (path.has_value() && !hasExchangeExtension(*path,
+  if (!folder && path.has_value() && !hasExchangeExtension(*path,
       backup ? ".effetune_backup" : ".effetune_preset")) {
     return std::nullopt;
   }
@@ -104,7 +111,8 @@ std::wstring utf8ToWide(const std::string_view value) {
 #elif defined(__APPLE__)
 std::optional<std::filesystem::path> runMacDialog(const bool save,
                                                   const std::string_view defaultName,
-                                                  const bool backup = false) {
+                                                  const bool backup = false,
+                                                  const bool folder = false) {
   using SendId = id (*)(id, SEL);
   using SendIdCString = id (*)(id, SEL, const char *);
   using SendVoidId = void (*)(id, SEL, id);
@@ -116,6 +124,12 @@ std::optional<std::filesystem::path> runMacDialog(const bool save,
   auto panel = reinterpret_cast<SendId>(objc_msgSend)(
       panelClass, sel_registerName(save ? "savePanel" : "openPanel"));
   if (panel == nullptr) return std::nullopt;
+  if (!save) {
+    using SendVoidBool = void (*)(id, SEL, bool);
+    reinterpret_cast<SendVoidBool>(objc_msgSend)(panel, sel_registerName("setCanChooseDirectories:"), folder);
+    reinterpret_cast<SendVoidBool>(objc_msgSend)(panel, sel_registerName("setCanChooseFiles:"), !folder);
+    reinterpret_cast<SendVoidBool>(objc_msgSend)(panel, sel_registerName("setAllowsMultipleSelection:"), false);
+  }
   if (save && !defaultName.empty()) {
     const auto stringClass = reinterpret_cast<id>(objc_getClass("NSString"));
     const auto name = reinterpret_cast<SendIdCString>(objc_msgSend)(
@@ -133,12 +147,22 @@ std::optional<std::filesystem::path> runMacDialog(const bool save,
       pathString, sel_registerName("UTF8String"));
   if (utf8 == nullptr) return std::nullopt;
   auto path = presetPathFromUtf8(utf8);
-  return hasExchangeExtension(path, backup ? ".effetune_backup" : ".effetune_preset")
+  return folder || hasExchangeExtension(path, backup ? ".effetune_backup" : ".effetune_preset")
       ? std::optional(path) : std::nullopt;
 }
 #endif
 
 } // namespace
+
+std::optional<std::filesystem::path> chooseSfzFolder() {
+#if defined(_WIN32)
+  return runWindowsDialog<IFileOpenDialog>(CLSID_FileOpenDialog, {}, false, true);
+#elif defined(__APPLE__)
+  return runMacDialog(false, {}, false, true);
+#else
+  return std::nullopt;
+#endif
+}
 
 std::optional<std::filesystem::path> choosePresetToOpen() {
 #if defined(_WIN32)

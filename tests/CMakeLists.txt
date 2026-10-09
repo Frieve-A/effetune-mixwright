@@ -186,7 +186,7 @@ if(WIN32 AND TARGET effetune_ui_assets)
     webview/webview_smoke.cpp
     ${PROJECT_SOURCE_DIR}/src/bridge/webview_host.cpp
     ${PROJECT_SOURCE_DIR}/src/bridge/webview_host.h)
-  target_link_libraries(effetune_webview_smoke PRIVATE effetune_choc user32 ole32 shell32 shlwapi)
+  target_link_libraries(effetune_webview_smoke PRIVATE effetune_engine effetune_choc user32 ole32 shell32 shlwapi)
   target_include_directories(effetune_webview_smoke PRIVATE ${PROJECT_SOURCE_DIR}/src)
   target_compile_features(effetune_webview_smoke PRIVATE cxx_std_20)
   target_compile_definitions(effetune_webview_smoke PRIVATE
@@ -243,3 +243,14 @@ elseif(APPLE AND TARGET validator AND TARGET effetune_plugin)
     COMMAND $<TARGET_FILE:validator> $<TARGET_BUNDLE_DIR:effetune_plugin>)
   set_tests_properties(effetune_vst3_validator PROPERTIES TIMEOUT 120)
 endif()
+
+add_executable(effetune_sfz_library_tests unit/sfz_library_tests.cpp)
+target_link_libraries(effetune_sfz_library_tests PRIVATE effetune_engine)
+target_compile_features(effetune_sfz_library_tests PRIVATE cxx_std_20)
+if(MSVC)
+  target_compile_options(effetune_sfz_library_tests PRIVATE /W4 /WX /utf-8)
+else()
+  target_compile_options(effetune_sfz_library_tests PRIVATE -Wall -Wextra -Wpedantic -Werror)
+endif()
+add_test(NAME effetune_sfz_library_tests COMMAND effetune_sfz_library_tests)
+set_tests_properties(effetune_sfz_library_tests PROPERTIES TIMEOUT 1200)

@@ -57,6 +57,9 @@ public:
 
   [[nodiscard]] bool attach(void *owner, void *parent, std::int32_t width,
                             std::int32_t height);
+  // Snapshot of the current generation's accepted editor owner. This does not
+  // dispatch onto the platform thread or transfer teardown work to it.
+  [[nodiscard]] bool isAttachedTo(void *owner) const noexcept;
   void resize(void *owner, std::int32_t width, std::int32_t height) noexcept;
   void detach(void *owner) noexcept;
   [[nodiscard]] bool loaded() const noexcept;

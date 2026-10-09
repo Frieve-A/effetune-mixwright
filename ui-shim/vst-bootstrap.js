@@ -32,6 +32,8 @@
     .config-dialog .device-section { display: none !important; }
     .config-dialog .device-section:has(#language-select) { display: block !important; }
     .config-dialog .device-section:has(#theme-select),
+    .config-dialog .device-section:has(#frequency-preview-sound),
+    .config-dialog .device-section:has(#sfz-size-limit),
     .config-dialog .device-section:has(#startup-view-effects),
     .config-dialog .device-section:has(#spectrum-overlay-display) { display: block !important; }
     .config-dialog .radio-container:has(#startup-view-library),
@@ -189,6 +191,84 @@
     return result;
   };
 
+  const sfzChunkBytes = 192 * 1024;
+  const sfzMaximumBytes = 1024 * 1024 * 1024;
+  // Keep the upstream SFZ response contract, including its size-limit code,
+  // separate from host calls that throw native error messages.
+  const sfzCall = async (operation, payload = {}) => {
+    const response = await window.vst_hostMessage(JSON.stringify({ type: `sfz/${operation}`, payload }));
+    if (response?.ok !== true) {
+      throw { code: response?.code === 'too-large' ? 'too-large' : 'storage-failed' };
+    }
+    return response.data;
+  };
+  const sfzResponse = async action => {
+    try {
+      return { ok: true, data: await action() };
+    } catch (error) {
+      return { ok: false, code: error?.code === 'too-large' ? 'too-large' : 'storage-failed' };
+    }
+  };
+  const readSfzFile = async (request, action) => {
+    const maxBytes = request?.maxBytes;
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > sfzMaximumBytes) {
+      throw { code: 'storage-failed' };
+    }
+    const opened = await sfzCall('openRead', request);
+    if (opened === null) return null;
+    const readId = opened?.readId;
+    if (typeof readId !== 'string' || !/^[a-f0-9]{24}$/.test(readId)) {
+      throw { code: 'storage-failed' };
+    }
+    try {
+      const size = opened.size;
+      if (!Number.isSafeInteger(size) || size < 0) throw { code: 'storage-failed' };
+      if (size > maxBytes) throw { code: 'too-large' };
+      const readRange = async (offset, length) => {
+        if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(length) || offset < 0 ||
+            length < 1 || length > sfzChunkBytes || offset + length > size) {
+          throw { code: 'storage-failed' };
+        }
+        const chunk = await sfzCall('readChunk', { readId, offset, length });
+        if (typeof chunk?.base64 !== 'string' || chunk.base64.length > 4 * Math.ceil(length / 3)) {
+          throw { code: 'storage-failed' };
+        }
+        const binary = atob(chunk.base64);
+        if (binary.length !== length) throw { code: 'storage-failed' };
+        return Uint8Array.from(binary, character => character.charCodeAt(0));
+      };
+      return await action(size, readRange);
+    } finally {
+      await sfzCall('closeRead', { readId });
+    }
+  };
+  let sfzReads = Promise.resolve();
+  const withSfzRead = (request, action) => {
+    // A preparation can overlap with other banks and plug-in instances. Keep
+    // each complete read/probe within the native bridge's bounded session limit.
+    const pending = sfzReads.then(() => readSfzFile(request, action));
+    sfzReads = pending.catch(() => {});
+    return pending;
+  };
+  const sfzLibraryV1 = Object.freeze({
+    apiVersion: 1,
+    select: () => sfzResponse(() => sfzCall('select')),
+    list: () => sfzResponse(() => sfzCall('list')),
+    remove: request => sfzResponse(() => sfzCall('remove', request)),
+    readRelative: request => sfzResponse(() => withSfzRead(request, async (size, readRange) => {
+      const bytes = new Uint8Array(size);
+      for (let offset = 0; offset < size; offset += sfzChunkBytes) {
+        bytes.set(await readRange(offset, Math.min(sfzChunkBytes, size - offset)), offset);
+      }
+      return bytes;
+    })),
+    statRelative: request => sfzResponse(() => withSfzRead({ ...request, maxBytes: sfzMaximumBytes },
+      async (size, readRange) => {
+        const { readSfzAudioHeader } = await import('./js/sfz/bank.js');
+        return { size, ...await readSfzAudioHeader(readRange, size) };
+      }))
+  });
+
   const noop = () => {};
   const asyncNoop = async () => ({ success: true });
   const eventNoop = () => noop;
@@ -317,6 +397,7 @@
     buttons.insertBefore(noticesButton, closeButton);
   };
   window.electronAPI = {
+    sfzLibraryV1,
     platform: navigator.platform.toLowerCase().includes('mac') ? 'darwin' : 'win32',
     getPath: async () => 'vst-user-data',
     joinPaths: async (...parts) => parts.filter(Boolean).join('/'),

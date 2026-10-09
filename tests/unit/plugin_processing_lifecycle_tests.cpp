@@ -2,6 +2,9 @@
 #include "plugin/plugin_ids.h"
 #include "../../external/effetune/dsp/generated/cpp/OscilloscopePluginParams.h"
 #include "../../external/effetune/dsp/generated/cpp/TubeSimulatorPluginParams.h"
+#include "../../external/effetune/dsp/generated/cpp/AdaptivePredictionEffectPluginParams.h"
+#include "../../external/effetune/dsp/generated/cpp/SFZNotePlayerPluginParams.h"
+#include "../../external/effetune/dsp/generated/cpp/IRReverbPluginParams.h"
 
 #include "pluginterfaces/base/ustring.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
@@ -60,6 +63,27 @@ public:
       for (std::uint32_t frame = 0; frame < frames; ++frame)
         peak = std::max(peak, std::abs(processor.engineOutputPointers_[channel][frame]));
     return peak;
+  }
+
+  // Headless lifecycle fixtures explicitly model an accepted native owner.
+  // Production uses WebViewHost's generation owner, covered by the smoke test.
+  static void setEditorOwner(EffeTuneProcessor &processor, void *owner) {
+    processor.attachedEditorOwnerForTesting_ = owner;
+  }
+
+  static void detachCurrentEditor(EffeTuneProcessor &processor) {
+    setEditorOwner(processor, &processor);
+    processor.detachEditor(&processor);
+  }
+
+  [[nodiscard]] static std::pair<std::uint64_t, std::uint64_t>
+  editorResourceGenerations(const EffeTuneProcessor &processor) {
+    return {processor.sfzGeneration_, processor.backupExportGeneration_};
+  }
+
+  static void setSfzFolderChooser(EffeTuneProcessor &processor,
+      std::function<std::optional<std::filesystem::path>()> chooser) {
+    processor.sfzFolderChooserForTesting_ = std::move(chooser);
   }
 
   static void setBackupSaveChooser(EffeTuneProcessor &processor,
@@ -1331,12 +1355,36 @@ void testFrequencyPreviewReachesPipelineAndStopsWithEditor() {
                       [](float sample) { return sample == 0.0f; }),
            "preview release reaches silence");
   };
+  const auto sine = outputLeft;
+  const auto noiseReply = choc::json::parse(processor->handleUiMessage(
+      R"({"type":"audio/frequencyPreview","payload":{"frequency":2000,"sound":"bandpassNoise"}})"));
+  expect(noiseReply["ok"].getBool(), "route bandpass noise selection");
+  process();
+  expect(outputLeft != sine && outputLeft == outputRight &&
+         std::all_of(outputLeft.begin(), outputLeft.end(), [](float sample) { return std::isfinite(sample); }),
+         "sound change reaches the audio-owned generator through the processor");
+  expect(PluginProcessorTestAccess::previewMeasurementPaused(*processor),
+         "bandpass noise closes the same measurement gate as sine");
   send("null");
   expectStopped();
   send("1000");
   process();
+  int oldEditorOwner = 0;
+  int currentEditorOwner = 0;
+  PluginProcessorTestAccess::setEditorOwner(*processor, &currentEditorOwner);
+  const auto liveResources = PluginProcessorTestAccess::editorResourceGenerations(*processor);
+  processor->detachEditor(&oldEditorOwner);
   processor->detachEditor(nullptr);
+  process();
+  expect(PluginProcessorTestAccess::previewMeasurementPaused(*processor) &&
+             PluginProcessorTestAccess::editorResourceGenerations(*processor) == liveResources,
+         "stale or null editor removal preserves the live preview and SFZ/backup operations");
+  processor->detachEditor(&currentEditorOwner);
   expectStopped();
+  const auto closedResources = PluginProcessorTestAccess::editorResourceGenerations(*processor);
+  expect(closedResources.first == liveResources.first + 1 &&
+             closedResources.second == liveResources.second + 1,
+         "the accepted editor removal cancels its SFZ reads and backup operation");
   send("1000");
   process();
   (void)processor->handleUiMessage(R"({"type":"host/getInfo","payload":{"startup":true}})");
@@ -1360,6 +1408,7 @@ void testPreviewMeasurementGateCoversInterpolationTail() {
       OversamplingSettings{2, OversamplingPhase::linear, FilterQuality::ultra},
       OversamplingSettings{4, OversamplingPhase::minimum, FilterQuality::ultra}};
   bool sawDelayedAudition = false;
+  for (const auto sound : {FrequencyPreview::Sound::sine, FrequencyPreview::Sound::bandpassNoise})
   for (const auto &setting : settings) {
     auto processor = std::make_unique<EffeTuneProcessor>();
     expect(processor->initialize(nullptr) == kResultOk, "initialize interpolated preview");
@@ -1388,9 +1437,11 @@ void testPreviewMeasurementGateCoversInterpolationTail() {
     FrequencyPreview reference;
     float *referenceChannels[]{referenceAudio.data()};
     const auto request = [&](bool active) {
-      reference.setFrequency(active ? 1000 : 0);
+      reference.setFrequency(active ? 1000 : 0, sound);
       const auto response = choc::json::parse(processor->handleUiMessage(
-          active ? R"({"type":"audio/frequencyPreview","payload":{"frequency":1000}})"
+          active ? (sound == FrequencyPreview::Sound::bandpassNoise
+              ? R"({"type":"audio/frequencyPreview","payload":{"frequency":1000,"sound":"bandpassNoise"}})"
+              : R"({"type":"audio/frequencyPreview","payload":{"frequency":1000}})")
                  : R"({"type":"audio/frequencyPreview","payload":{"frequency":null}})"));
       expect(response["ok"].getWithDefault<bool>(false), "control interpolated preview");
     };
@@ -6889,7 +6940,7 @@ void testBackupChooserReentrantCancellation() {
                 R"({"type":"backup/exportCancel","payload":{}})"));
             expect(result["ok"].getWithDefault<bool>(false), "cancel reenters modal chooser");
           } else if (action == 1) {
-            processor->detachEditor(nullptr);
+            PluginProcessorTestAccess::detachCurrentEditor(*processor);
           } else if (action == 2) {
             (void)processor->handleUiMessage(R"({"type":"host/getInfo","payload":{"startup":true}})");
           } else {
@@ -7093,7 +7144,7 @@ void testSpectrumOverlayBridgeLifecycle() {
   }
 #endif
   render();
-  processor->detachEditor(nullptr);
+  PluginProcessorTestAccess::detachCurrentEditor(*processor);
   expect(request(R"({"type":"telemetry/read"})")["spectrumOverlays"].size() == 0,
          "native editor close invalidates queued spectra");
   render();
@@ -7145,12 +7196,189 @@ void testTubeCircuitFaultBridgeLifecycle() {
          "bridge forwards actual fault with upstream validation fields");
   const auto epoch = fault["instanceEpoch"].getInt64();
   const auto generation = fault["generation"].getInt64();
-  processor->detachEditor(nullptr);
+  PluginProcessorTestAccess::detachCurrentEditor(*processor);
   const auto reopened = request(R"({"type":"host/getInfo","payload":{"startup":true}})");
   expect(reopened["runtimeEvents"].size() == 1 && reopened["runtimeEvents"][0]["latched"].getBool() &&
          reopened["runtimeEvents"][0]["instanceEpoch"].getInt64() == epoch &&
          reopened["runtimeEvents"][0]["generation"].getInt64() == generation,
          "editor startup republishes the cached latch even without another audio block");
+  installGainPipeline(*processor);
+  expect(request(R"({"type":"telemetry/read"})")["runtimeEvents"].size() == 0,
+         "replacing the active pipeline removes old fault identities");
+  install();
+  const auto recreated = request(R"({"type":"host/getInfo"})");
+  expect(recreated["runtimeEvents"].size() == 1 && !recreated["runtimeEvents"][0]["latched"].getBool() &&
+         recreated["runtimeEvents"][0]["generation"].getInt64() == 0 &&
+         recreated["runtimeEvents"][0]["instanceEpoch"].getInt64() > epoch,
+         "new circuit incarnation clears the old HUD latch with a newer epoch");
+  expect(processor->setActive(false) == kResultOk, "deactivate circuit-fault bridge");
+  expect(processor->terminate() == kResultOk, "terminate circuit-fault bridge");
+}
+
+
+void testSfzChooserReentrantCancellation() {
+  for (int action = 0; action < 3; ++action) {
+    auto processor = std::make_unique<EffeTuneProcessor>();
+    expect(processor->initialize(nullptr) == kResultOk, "initialize modal SFZ test");
+    PluginProcessorTestAccess::setSfzFolderChooser(*processor,
+        [&]() -> std::optional<std::filesystem::path> {
+          if (action == 0) PluginProcessorTestAccess::detachCurrentEditor(*processor);
+          else if (action == 1)
+            (void)processor->handleUiMessage(R"({"type":"host/getInfo","payload":{"startup":true}})");
+          else expect(processor->terminate() == kResultOk, "termination reenters SFZ chooser");
+          // An invalid selected path proves stale selection is cancelled before
+          // any registry access or traversal can take place.
+          return std::filesystem::path("abandoned-sfz-selection");
+        });
+    const auto reply = choc::json::parse(processor->handleUiMessage(R"({"type":"sfz/select","payload":{}})"));
+    expect(reply["ok"].getBool() && reply["data"].isVoid(), "closed page cannot persist a modal SFZ selection");
+    if (action != 2) expect(processor->terminate() == kResultOk, "terminate modal SFZ test");
+  }
+  auto processor = std::make_unique<EffeTuneProcessor>();
+  expect(processor->initialize(nullptr) == kResultOk, "initialize SFZ control boundary");
+  {
+    const auto lock = PluginProcessorTestAccess::lockProcessingResources(*processor);
+    const auto reply = choc::json::parse(processor->handleUiMessage(
+        R"({"type":"sfz/closeRead","payload":{"readId":"0123456789abcdef01234567"}})"));
+    expect(reply["ok"].getBool(), "SFZ operations do not acquire the audio resources lock or drain automation");
+  }
+  expect(processor->terminate() == kResultOk, "terminate SFZ control boundary");
+}
+
+void testSfzReferencesSurviveAbAndState() {
+  auto processor = std::make_unique<EffeTuneProcessor>();
+  expect(processor->initialize(nullptr) == kResultOk, "initialize SFZ state reference test");
+  auto processSetup = setup(48000, 64);
+  expect(processor->setupProcessing(processSetup) == kResultOk, "prepare SFZ state reference test");
+  const std::string referenceA = "0123456789abcdef01234567";
+  const std::string referenceB = "abcdef0123456789abcdef01";
+  const auto plugin = [&](int id, const std::string &reference) {
+    return std::string(R"({"id":)") + std::to_string(id) +
+        R"(,"type":"SFZNotePlayerPlugin","name":"SFZ Note Player","enabled":true,"parameters":{"sf":")" + reference +
+        R"("},"wasmParams":[0.5,-30,3,28,91,32,0,100,0,0,1,1,1,0,18,0],"wasmParamsHash":)" +
+        std::to_string(effetune::generated::SFZNotePlayerPluginParams::kHash) + "}";
+  };
+  for (const auto pipeline : {"A", "B", "A"}) {
+    const auto request = std::string(R"({"type":"pipeline/restoreHistory","payload":{"pipelineA":[)") +
+        plugin(55, referenceA) + R"(],"pipelineB":[)" + plugin(56, referenceB) +
+        R"(],"pipelineBInitialized":true,"currentPipeline":")" + pipeline + R"("}})";
+    expect(choc::json::parse(processor->handleUiMessage(request))["ok"].getBool(), "switch SFZ A/B image");
+  }
+  ResizableMemoryIBStream saved;
+  expect(processor->getState(&saved) == kResultOk, "save SFZ reference state");
+  auto restored = std::make_unique<EffeTuneProcessor>();
+  expect(restored->initialize(nullptr) == kResultOk, "initialize SFZ state restore");
+  saved.rewind();
+  expect(restored->setState(&saved) == kResultOk, "restore SFZ references before sample preparation");
+  ResizableMemoryIBStream savedAgain;
+  expect(restored->getState(&savedAgain) == kResultOk, "save restored SFZ state");
+  effetune::vst::PluginStateDocument document;
+  std::string error;
+  expect(effetune::vst::StateCodec::decode(
+      std::string(static_cast<const char *>(savedAgain.getData()), savedAgain.getCursor()), document, &error),
+      "decode restored SFZ state");
+  expect(document.pipelineBInitialized && document.currentPipeline == 'A' &&
+         document.pipelineA.plugins.size() == 1 && document.pipelineB.plugins.size() == 1 &&
+         choc::json::parse(document.pipelineA.plugins[0].parametersJson)["sf"].getString() == referenceA &&
+         choc::json::parse(document.pipelineB.plugins[0].parametersJson)["sf"].getString() == referenceB,
+         "A/B keeps stable SFZ references across project save and restore");
+  expect(restored->terminate() == kResultOk && processor->terminate() == kResultOk,
+         "terminate SFZ state reference processors");
+}
+
+void testSfzAndIrTransferAdmissionBudgets() {
+  auto processor = std::make_unique<EffeTuneProcessor>();
+  expect(processor->initialize(nullptr) == kResultOk, "initialize SFZ admission");
+  auto processSetup = setup(48000, 64);
+  expect(processor->setupProcessing(processSetup) == kResultOk, "prepare SFZ admission");
+  const auto request = [&](const std::string &json) {
+    return choc::json::parse(processor->handleUiMessage(json));
+  };
+  const auto sfz = [&](int id) {
+    return std::string(R"({"id":)") + std::to_string(id) +
+        R"(,"type":"SFZNotePlayerPlugin","name":"SFZ","enabled":true,"parameters":{},"wasmParams":[0.5,-30,3,28,91,32,0,100,0,0,1,1,1,0,18,0],"wasmParamsHash":)" +
+        std::to_string(effetune::generated::SFZNotePlayerPluginParams::kHash) + "}";
+  };
+  const auto ir = [&](int id) {
+    return std::string(R"({"id":)") + std::to_string(id) +
+        R"(,"type":"IRReverbPlugin","name":"IR","enabled":true,"parameters":{},"wasmParams":[0,1,1,0,1,-96,0],"wasmParamsHash":)" +
+        std::to_string(effetune::generated::IRReverbPluginParams::kHash) + "}";
+  };
+  expect(request(std::string(R"({"type":"pipeline/rebuild","payload":{"pipeline":"A","plugins":[)") +
+      sfz(55) + "," + sfz(56) + "," + ir(57) + "," + ir(58) + "," + ir(59) + "," + ir(60) + "," + ir(61) + "]}}")["ok"].getBool(),
+      "install actual native asset consumers");
+  const auto begin = [&](int id, std::uint32_t footprint) {
+    // Tiny transfer buffers exercise large reservations without allocating banks.
+    return request(std::string(R"({"type":"pipeline/assetBegin","payload":{"pluginId":)") + std::to_string(id) +
+        R"(,"slot":0,"formatTag":1,"channels":1,"frames":1,"topology":0,"headBlock":128,"rateDivider":1,"pathCount":0,"inputCount":0,"processingChannels":1,"byteSize":36,"footprintBytes":)" +
+        std::to_string(footprint) + R"(,"operationRevision":1}})")["ok"].getBool();
+  };
+  constexpr std::uint32_t mib = 1024u * 1024u;
+  for (const auto size : {64u, 128u, 256u, 512u, 1024u})
+    expect(begin(55, size * mib), "replace SFZ reservation through supported limits");
+  expect(!begin(56, 36), "SFZ pending reservations obey 1 GiB aggregate");
+  expect(!begin(57, 32u * mib + 1u), "topology-zero metadata cannot spoof larger IR capacity");
+  for (const auto id : {57, 58, 59, 60})
+    expect(begin(id, 32u * mib), "IR pending reservations remain independent of a full SFZ budget");
+  expect(!begin(61, 36), "IR pending reservations obey unchanged 128 MiB aggregate");
+  expect(request(R"({"type":"pipeline/assetClear","payload":{"pluginId":55,"slot":0}})")["ok"].getBool() &&
+         begin(56, 1024u * mib), "clearing a pending bank frees its SFZ allowance");
+  expect(processor->terminate() == kResultOk, "terminate SFZ admission");
+}
+
+void testAdaptivePredictionFaultBridgeLifecycle() {
+  auto processor = std::make_unique<EffeTuneProcessor>();
+  expect(processor->initialize(nullptr) == kResultOk, "initialize circuit-fault bridge");
+  auto processSetup = setup(48000, 64);
+  expect(processor->setupProcessing(processSetup) == kResultOk, "prepare circuit-fault bridge");
+  const auto request = [&](std::string_view json) { return choc::json::parse(processor->handleUiMessage(json)); };
+  const auto install = [&] {
+    const auto reply = request(std::string{
+        R"({"type":"pipeline/rebuild","payload":{"pipeline":"A","plugins":[{"id":17,"type":"AdaptivePredictionEffectPlugin","name":"Adaptive Prediction Effect","enabled":true,"parameters":{},"wasmParams":[1,0.02,0,0,0,1,0,0,0,0],"wasmParamsHash":)"} +
+        std::to_string(effetune::generated::AdaptivePredictionEffectPluginParams::kHash) + R"(}]}})");
+    expect(reply["ok"].getBool(), "install actual Adaptive Prediction effect");
+  };
+  install();
+  expect(processor->setActive(true) == kResultOk, "activate circuit-fault bridge");
+  gate_ordering::AudioRig rig(0);
+  const auto render = [&] {
+    tresult result;
+    { effetune::allocation_guard::Scope guard; result = processor->process(rig.data); }
+    expect(result == kResultOk, "publish circuit fault without audio allocation");
+  };
+  render();
+  rig.inputLeft.fill(std::numeric_limits<float>::max());
+  rig.inputRight.fill(std::numeric_limits<float>::max());
+  render();
+  rig.inputLeft.fill(0);
+  rig.inputRight.fill(0);
+  rig.inputLeft[0] = std::numeric_limits<float>::quiet_NaN();
+  render();
+  const auto reply = request(R"({"type":"telemetry/read"})");
+  expect(reply["runtimeEvents"].size() == 1, "telemetry includes circuit runtime state");
+  const auto fault = reply["runtimeEvents"][0];
+  expect(fault["type"].getString() == "adaptivePredictionFault" &&
+         fault["pluginType"].getString() == "AdaptivePredictionEffectPlugin" && fault["pluginId"].getInt64() == 17 &&
+         fault["latched"].getBool() && fault["cause"].getString() == "numericalFailure",
+         "bridge forwards actual fault with upstream validation fields");
+  const auto epoch = fault["instanceEpoch"].getInt64();
+  const auto generation = fault["generation"].getInt64();
+  PluginProcessorTestAccess::detachCurrentEditor(*processor);
+  const auto reopened = request(R"({"type":"host/getInfo","payload":{"startup":true}})");
+  expect(reopened["runtimeEvents"].size() == 1 && reopened["runtimeEvents"][0]["latched"].getBool() &&
+         reopened["runtimeEvents"][0]["instanceEpoch"].getInt64() == epoch &&
+         reopened["runtimeEvents"][0]["generation"].getInt64() == generation,
+         "editor startup republishes the cached latch even without another audio block");
+  expect(request(R"({"type":"pipeline/resetPluginState","payload":{"pluginId":17}})")["ok"].getBool(),
+         "queue adaptive model reset");
+  rig.inputLeft.fill(0);
+  rig.inputRight.fill(0);
+  render();
+  const auto resetReply = request(R"({"type":"telemetry/read"})");
+  const auto reset = resetReply["runtimeEvents"][0];
+  expect(!reset["latched"].getBool() && reset["cause"].getString() == "none" &&
+         reset["generation"].getInt64() > generation && reset["instanceEpoch"].getInt64() == epoch,
+         "adaptive reset publishes a newer clear generation on the same incarnation");
   installGainPipeline(*processor);
   expect(request(R"({"type":"telemetry/read"})")["runtimeEvents"].size() == 0,
          "replacing the active pipeline removes old fault identities");
@@ -9086,7 +9314,14 @@ void testNoLeakedTouch() {
   }
   {
     auto fixture = openTouchFixture("the editor close leak test");
-    fixture.processor->detachEditor(nullptr);
+    int oldEditorOwner = 0;
+    int currentEditorOwner = 0;
+    PluginProcessorTestAccess::setEditorOwner(*fixture.processor, &currentEditorOwner);
+    fixture.processor->detachEditor(&oldEditorOwner);
+    expect(fixture.handler->stepCount(TestComponentHandler::EditStep::end) == 0 &&
+               PluginProcessorTestAccess::hostGestureOpen(*fixture.processor, fixture.parameterId),
+           "a delayed old editor removal leaves the current editor's touch open");
+    fixture.processor->detachEditor(&currentEditorOwner);
     expect(fixture.handler->stepCount(TestComponentHandler::EditStep::end) == 1 &&
                !PluginProcessorTestAccess::hostGestureOpen(*fixture.processor,
                                                             fixture.parameterId),
@@ -9321,7 +9556,7 @@ void testRepeatedBeginKeepsOneTouchAndReopensAfterANativeClose() {
 
   // A close the editor cannot see, and cannot be told about: the pointer is
   // still down and the values keep arriving.
-  processor.detachEditor(nullptr);
+  PluginProcessorTestAccess::detachCurrentEditor(processor);
   expect(handler.stepCount(TestComponentHandler::EditStep::end) == 1 &&
              !PluginProcessorTestAccess::hostGestureOpen(processor,
                                                           fixture.parameterId),
@@ -11439,6 +11674,10 @@ int main() {
     testVisualizerCapturesFinalHostOutput();
     testSpectrumOverlayBridgeLifecycle();
     testTubeCircuitFaultBridgeLifecycle();
+    testAdaptivePredictionFaultBridgeLifecycle();
+    testSfzAndIrTransferAdmissionBudgets();
+    testSfzChooserReentrantCancellation();
+    testSfzReferencesSurviveAbAndState();
     testOscilloscopeSweepsSurviveProcessorReactivation();
     testDeferredBassManagementHostAndBypassLatency();
     testLiveLatencyCommitAlignsWetBypassAndHost();

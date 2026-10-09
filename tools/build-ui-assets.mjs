@@ -83,14 +83,6 @@ await cp(path.join(projectRoot, 'THIRD-PARTY-NOTICES.txt'),
          path.join(output, 'THIRD-PARTY-NOTICES.txt'));
 
 let html = await readText(path.join(source, 'effetune.html'));
-// The upstream currently loads JSZip lazily; retain compatibility with a classic-script entry.
-const legacyZipScript = 'src="js/vendor/jszip-3.10.1.min.js"';
-if (html.includes(legacyZipScript)) {
-  if (html.split(legacyZipScript).length - 1 !== 1) {
-    throw new Error('Expected one upstream JSZip script entry');
-  }
-  html = html.replace(legacyZipScript, 'src="js/vendor/jszip-3.10.2.min.js"');
-}
 const upstreamDocumentTitle = '<title>EffeTune</title>';
 const upstreamHeaderTitle = '<h1>Frieve EffeTune<img';
 const upstreamFooterTitle = 'EffeTune version <span id="app-version"></span>';
@@ -123,14 +115,11 @@ backupDialog = backupDialog.replace(backupDownload,
   '        await window.__effetuneExportBackup(output.blob, output.fileName, controller.signal);');
 await writeFile(backupDialogPath, backupDialog, 'utf8');
 const backupArchivePath = path.join(output, 'js', 'user-data-backup', 'archive.js');
-let backupArchive = await readText(backupArchivePath);
-const legacyZipLoader = "new URL('../vendor/jszip-3.10.1.min.js', import.meta.url)";
-if (backupArchive.split(legacyZipLoader).length - 1 !== 1) {
+const backupArchive = await readText(backupArchivePath);
+const zipLoader = "new URL('../vendor/jszip-3.10.2.min.js', import.meta.url)";
+if (backupArchive.split(zipLoader).length - 1 !== 1) {
   throw new Error('Unable to locate the upstream JSZip backup loader');
 }
-backupArchive = backupArchive.replace(legacyZipLoader,
-  "new URL('../vendor/jszip-3.10.2.min.js', import.meta.url)");
-await writeFile(backupArchivePath, backupArchive, 'utf8');
 for (const entry of await readdir(path.join(output, 'js', 'vendor'))) {
   await rm(path.join(output, 'js', 'vendor', entry), { recursive: true, force: true });
 }
@@ -151,6 +140,16 @@ if (!app.includes(libraryConstantsImport)) {
 }
 app = app.replace(libraryConstantsImport,
   `const normalizeMusicLibraryStartupView = () => 'tracks';`);
+const earlyStartupView = `            // Open the configured startup view before the effect pipeline can paint.
+            // The same promise is awaited once startup content has been handled.
+            void this.applyStartupViewPreference();
+`;
+if (app.split(earlyStartupView).length - 1 !== 1) {
+  throw new Error('Unable to locate the early startup-view navigation in js/app.js');
+}
+// Native DSP readiness arrives during initAudio. Keep the final awaited
+// navigation, while app-starting still hides the effect pipeline.
+app = app.replace(earlyStartupView, '');
 const startupViewPreference = /    applyStartupViewPreference\(\) \{[\s\S]*?\n    \}\n\n    async openConfiguredStartupView\(\) \{[\s\S]*?\n    \}\n\n    \/\*\*\n     \* Initialize and build pipeline/;
 if (!startupViewPreference.test(app)) {
   throw new Error('Unable to locate the music-library startup preference');

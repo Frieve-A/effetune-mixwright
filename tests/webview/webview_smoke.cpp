@@ -1,4 +1,5 @@
 #include "bridge/webview_host.h"
+#include "bridge/sfz_library.h"
 #include "plugin/editor_size.h"
 #include "choc/memory/choc_Base64.h"
 #include "choc/text/choc_JSON.h"
@@ -14,6 +15,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -357,7 +359,41 @@ LRESULT CALLBACK parentWindowProcedure(HWND window, const UINT message,
   return exited;
 }
 
+[[nodiscard]] bool writeSfzSmokeSample(const std::filesystem::path &path,
+                                     const float gain) {
+  constexpr std::uint32_t frames = 256;
+  constexpr std::uint32_t sampleRate = 48000;
+  std::array<unsigned char, 44 + frames * 2> wav{};
+  const auto ascii = [&wav](const std::size_t offset, const std::string_view text) {
+    for (std::size_t index = 0; index < text.size(); ++index)
+      wav[offset + index] = static_cast<unsigned char>(text[index]);
+  };
+  const auto littleEndian = [&wav](const std::size_t offset, const std::uint32_t value,
+                                  const std::size_t length) {
+    for (std::size_t index = 0; index < length; ++index)
+      wav[offset + index] = static_cast<unsigned char>(value >> (index * 8));
+  };
+  ascii(0, "RIFF"); littleEndian(4, static_cast<std::uint32_t>(wav.size() - 8), 4);
+  ascii(8, "WAVEfmt "); littleEndian(16, 16, 4); littleEndian(20, 1, 2);
+  littleEndian(22, 1, 2); littleEndian(24, sampleRate, 4);
+  littleEndian(28, sampleRate * 2, 4); littleEndian(32, 2, 2); littleEndian(34, 16, 2);
+  ascii(36, "data"); littleEndian(40, frames * 2, 4);
+  for (std::size_t index = 0; index < frames; ++index) {
+    const auto value = static_cast<std::int16_t>(std::round(
+        std::sin(static_cast<double>(index) * 6.283185307179586 * 440 / sampleRate) *
+        32767 * gain));
+    littleEndian(44 + index * 2, static_cast<std::uint16_t>(value), 2);
+  }
+  std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+  stream.write(reinterpret_cast<const char *>(wav.data()),
+               static_cast<std::streamsize>(wav.size()));
+  return stream.good();
+}
+
 struct SmokeState {
+  std::filesystem::path sfzFolder;
+  std::filesystem::path sfzRegistry;
+  std::unique_ptr<effetune::vst::SfzLibrary> sfzLibrary;
   std::atomic_uint32_t hostInfoCalls{0};
   std::atomic_uint32_t telemetryCalls{0};
   std::atomic_uint32_t telemetryDiscardCalls{0};
@@ -381,6 +417,27 @@ struct SmokeState {
 };
 
 [[nodiscard]] std::string responseFor(const std::string_view request, SmokeState &state) {
+  if (request.find("sfz/") != std::string_view::npos) {
+    const auto message = choc::json::parse(request);
+    const auto type = message["type"].getWithDefault<std::string>({});
+    if (type == "sfz/testReopen") {
+      state.sfzLibrary = std::make_unique<effetune::vst::SfzLibrary>(state.sfzRegistry);
+      return R"({"ok":true,"data":true})";
+    }
+    if (type == "sfz/testUpdateSample") {
+      return writeSfzSmokeSample(state.sfzFolder / "note.wav", .5f)
+          ? R"({"ok":true,"data":true})" : R"({"ok":false,"code":"storage-failed"})";
+    }
+    if (type == "sfz/testSourceExists") {
+      return std::filesystem::is_regular_file(state.sfzFolder / "note.wav") &&
+             std::filesystem::is_regular_file(state.sfzFolder / "instrument.sfz")
+          ? R"({"ok":true,"data":true})" : R"({"ok":false,"code":"storage-failed"})";
+    }
+    if (type.starts_with("sfz/") && state.sfzLibrary != nullptr)
+      return state.sfzLibrary->request(type.substr(4), choc::json::toString(message["payload"]),
+                                      state.sfzFolder);
+    return R"({"ok":false,"code":"storage-failed"})";
+  }
   if (request.find("spectrum/setTap") != std::string_view::npos) {
     const auto message = choc::json::parse(request);
     const auto payload = message["payload"];
@@ -503,6 +560,199 @@ struct SmokeState {
   return R"({"ok":true,"success":true})";
 }
 
+[[nodiscard]] bool runVisualizerStartupProbe(
+    HWND parent, const std::filesystem::path &assets,
+    const std::filesystem::path &profileRoot) {
+  const auto fixture = profileRoot / "visualizer-startup-assets";
+  std::error_code error;
+  std::filesystem::copy(assets, fixture, std::filesystem::copy_options::recursive, error);
+  if (error) {
+    std::cerr << "Cannot copy Visualizer startup assets: " << error.message() << '\n';
+    return false;
+  }
+  std::ifstream source(fixture / "effetune.html", std::ios::binary);
+  std::string html((std::istreambuf_iterator<char>(source)), {});
+  source.close();
+  constexpr std::string_view bootstrap = "<script src=\"vst-bootstrap.js\"></script>";
+  const auto insertion = html.find(bootstrap);
+  if (insertion == std::string::npos) {
+    std::cerr << "Visualizer fixture is missing the production bootstrap\n";
+    return false;
+  }
+  // Keep the production document and module startup. Offscreen WebView2 does
+  // not deliver RAF reliably, so explicitly pump cancelable callbacks. Hold
+  // the existing latency poll until first presentation to expose stale readiness.
+  html.insert(insertion + bootstrap.size(), R"HTML(
+<script>
+(() => {
+  Object.defineProperty(document, 'hidden', { get: () => false });
+  if (__VST_DISABLE_DSP__) {
+    window.electronAPI.loadAudioPreferences = async () => ({ success: true, preferences: { useWasmDsp: false } });
+    window.audioPreferences = { useWasmDsp: false };
+  }
+  const callbacks = new Map(), delayed = new Map();
+  let nextFrame = 1, nextDelayed = -1;
+  window.requestAnimationFrame = callback => { const id = nextFrame++; callbacks.set(id, callback); return id; };
+  window.cancelAnimationFrame = id => callbacks.delete(id);
+  const timeout = window.setTimeout, clear = window.clearTimeout;
+  window.setTimeout = (callback, delay, ...args) => {
+    if (delay !== 250) return timeout(callback, delay, ...args);
+    const id = nextDelayed--; delayed.set(id, () => callback(...args)); return id;
+  };
+  window.clearTimeout = id => delayed.delete(id) || clear(id);
+  const probe = window.__visualizerStartupProbe = { frames: 0, draws: 0, history: [], errors: [] };
+  window.addEventListener('error', event => probe.errors.push(event.message));
+  const drawImage = CanvasRenderingContext2D.prototype.drawImage;
+  CanvasRenderingContext2D.prototype.drawImage = function(...args) {
+    if (this.canvas.closest('#visualizerView')) probe.draws++;
+    return drawImage.apply(this, args);
+  };
+  const record = () => {
+    if (document.documentElement.classList.contains('app-starting')) return;
+    const view = window.uiManager?.visualizerView;
+    if (!view) return;
+    const visualizer = document.body.classList.contains('view-visualizer');
+    probe.history.push({ view: visualizer ? 'visualizer' : 'effects',
+      state: view.sources.getStatus(), notice: !view.status.hidden ? view.status.textContent : '',
+      statusVisible: !view.status.hidden && getComputedStyle(view.status).visibility !== 'hidden' });
+  };
+  new MutationObserver(record).observe(document, { subtree: true, childList: true,
+    characterData: true, attributes: true, attributeFilter: ['class', 'hidden', 'style'] });
+  probe.pump = () => {
+    const queued = [...callbacks];
+    const visualizerFrame = window.uiManager?.visualizerView?.frameRequest;
+    for (const [id, callback] of queued) {
+      if (!callbacks.delete(id)) continue;
+      callback(performance.now());
+      if (id === visualizerFrame) probe.frames++;
+      record();
+    }
+  };
+  probe.snapshot = () => ({ initialized: window.app?.initialized === true,
+    frames: probe.frames, draws: probe.draws, history: probe.history, errors: probe.errors,
+    pipeline: window.audioManager?.currentPipeline,
+    pipelineA: window.audioManager?.pipelineA?.map(plugin => plugin.id),
+    pipelineB: window.audioManager?.pipelineB?.map(plugin => plugin.id),
+    generation: window.audioManager?.nativeContextGeneration,
+    error: document.getElementById('errorDisplay')?.textContent || '' });
+})();
+</script>
+<script type="module">import './js/visualizer/visualizer-view.js';</script>
+)HTML");
+  bool allPassed = true;
+  for (const std::string_view scenario : {"ready", "new-generation", "unavailable",
+                                         "rebuild-failed", "refresh-failed", "disabled"}) {
+    auto scenarioHtml = html;
+    constexpr std::string_view disabledMarker = "__VST_DISABLE_DSP__";
+    scenarioHtml.replace(scenarioHtml.find(disabledMarker), disabledMarker.size(),
+                         scenario == "disabled" ? "true" : "false");
+    {
+      std::ofstream output(fixture / "effetune.html", std::ios::binary | std::ios::trunc);
+      output << scenarioHtml;
+      if (!output.good()) return false;
+    }
+    SmokeState state;
+    bool initialFalse = false;
+    const bool working = scenario == "ready" || scenario == "new-generation";
+    int owner = 0;
+    effetune::vst::WebViewHost webView(
+        [&](const std::string_view request) {
+          const auto message = choc::json::parse(request);
+          const auto type = message["type"].getWithDefault<std::string>({});
+          if (type == "config/load")
+            return std::string(R"({"ok":true,"config":{"startupView":"visualizer","columns":2}})");
+          if (type == "storage/readFile" && request.find("pipeline-state.json") != std::string_view::npos) {
+            state.pipelineStateRead.store(true);
+            return std::string(R"({"ok":true,"success":true,"content":"{\"pipelineA\":[{\"id\":17,\"name\":\"DC Offset\",\"enabled\":true,\"parameters\":{\"of\":0}}],\"pipelineB\":[{\"id\":42,\"name\":\"DC Offset\",\"enabled\":true,\"parameters\":{\"of\":0.25}}],\"currentPipeline\":\"B\"}"})");
+          }
+          if (type == "pipeline/rebuild") {
+            if (scenario == "new-generation") state.contextGeneration.store(2);
+            const auto response = responseFor(request, state);
+            return scenario == "rebuild-failed"
+                ? std::string(R"({"ok":false,"error":"Test rebuild rejected"})") : response;
+          }
+          if (type == "host/getInfo") {
+            const bool rebuilt = state.pipelineRebuildCalls.load() > 0;
+            if (message["payload"]["startup"].getWithDefault<bool>(false)) initialFalse = !rebuilt;
+            if (rebuilt && scenario == "refresh-failed")
+              return std::string(R"({"ok":false,"error":"Test readiness snapshot rejected"})");
+            auto response = choc::json::parse(responseFor(request, state));
+            response.setMember("dspReady", rebuilt && working);
+            return choc::json::toString(response);
+          }
+          // telemetry/read deliberately has the production shape: no readiness.
+          return responseFor(request, state);
+        }, fixture, false);
+    bool attached = webView.attach(&owner, parent,
+        effetune::vst::plugin::kDefaultEditorWidth, effetune::vst::plugin::kDefaultEditorHeight);
+    ShowWindow(parent, SW_SHOWNOACTIVATE);
+    const auto pumpMessages = [] {
+      MSG message{};
+      while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE) != 0) {
+        TranslateMessage(&message); DispatchMessageW(&message);
+      }
+    };
+    const auto evaluate = [&](const std::string &script, std::string &result) {
+      std::atomic_bool complete{false};
+      std::string evaluationError;
+      if (!webView.evaluate(script, [&](std::string failure, std::string value) {
+            evaluationError = std::move(failure); result = std::move(value); complete.store(true);
+          })) return false;
+      const auto deadline = std::chrono::steady_clock::now() + kCompletionTimeout;
+      while (!complete.load() && std::chrono::steady_clock::now() < deadline) {
+        pumpMessages(); std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      }
+      return complete.load() && evaluationError.empty();
+    };
+    std::string result;
+    choc::value::Value snapshot;
+    const auto deadline = std::chrono::steady_clock::now() + kCompletionTimeout;
+    while (attached && std::chrono::steady_clock::now() < deadline) {
+      pumpMessages();
+      if (evaluate(
+          "(() => { const probe = window.__visualizerStartupProbe; if (!probe) return null; "
+          "probe.pump(); return probe.snapshot(); })()", result)) {
+        // A ready WebView can still be on the blank document before the probe
+        // is installed. Its intentional null result is a bare JSON value.
+        snapshot = choc::json::parseValue(result);
+        if (snapshot.isObject() && snapshot["initialized"].getWithDefault<bool>(false) &&
+            snapshot["frames"].getWithDefault<int>(0) >= 3) break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (!snapshot.isObject()) {
+      std::cerr << "Visualizer startup " << scenario << " did not produce a snapshot: " << result << '\n';
+      allPassed = false;
+      webView.detach(&owner);
+      continue;
+    }
+    const auto history = snapshot["history"];
+    bool hasUnavailable = false, hasDisabled = false, effectsPresented = false;
+    for (const auto &entry : history) {
+      effectsPresented |= entry["view"].getWithDefault<std::string>({}) != "visualizer";
+      if (entry["statusVisible"].getWithDefault<bool>(false)) {
+        hasUnavailable |= entry["state"].getWithDefault<std::string>({}) == "unavailable";
+        hasDisabled |= entry["state"].getWithDefault<std::string>({}) == "disabled";
+      }
+    }
+    const bool statePreserved = snapshot["pipeline"].getWithDefault<std::string>({}) == "B" &&
+        snapshot["pipelineA"].size() == 1 && snapshot["pipelineA"][0].getWithDefault<int>(0) == 17 &&
+        snapshot["pipelineB"].size() == 1 && snapshot["pipelineB"][0].getWithDefault<int>(0) == 42;
+    const bool passed = attached && initialFalse && statePreserved && !effectsPresented &&
+        history.size() > 0 && snapshot["frames"].getWithDefault<int>(0) >= 3 &&
+        snapshot["errors"].size() == 0 &&
+        (working ? !hasUnavailable && !hasDisabled && snapshot["draws"].getWithDefault<int>(0) > 0 &&
+                   snapshot["generation"].getWithDefault<int>(0) == (scenario == "new-generation" ? 2 : 1)
+                 : scenario == "disabled" ? hasDisabled && !hasUnavailable
+                                           : hasUnavailable);
+    std::cout << "Visualizer startup " << scenario << ": " << (passed ? "PASS " : "FAIL ")
+              << result << std::endl;
+    allPassed &= passed;
+    webView.detach(&owner);
+  }
+  return allPassed;
+}
+
 } // namespace
 
 int main(const int argc, char **argv) {
@@ -513,7 +763,13 @@ int main(const int argc, char **argv) {
                        "--non-pumping-owner-child") {
     return runNonPumpingOwnerChild();
   }
-  if (!runNonPumpingOwnerWatchdog()) {
+  const bool startupOnly = argc == 4 && std::string_view(argv[1]) == "--visualizer-startup-only" &&
+      std::string_view(argv[2]) == "--assets";
+  if (argc != 1 && !startupOnly) {
+    std::cerr << "Usage: effetune_webview_smoke [--visualizer-startup-only --assets <directory>]\n";
+    return 1;
+  }
+  if (!startupOnly && !runNonPumpingOwnerWatchdog()) {
     std::cerr << "WebView teardown blocked on a non-pumping owner STA\n";
     return 1;
   }
@@ -537,6 +793,18 @@ int main(const int argc, char **argv) {
                            WS_OVERLAPPEDWINDOW, -30000, -30000, 900, 650,
                            nullptr, nullptr, instance, nullptr);
   };
+  const auto startupParent = createParent();
+  const bool startupPassed = startupParent != nullptr && runVisualizerStartupProbe(
+      startupParent, std::filesystem::absolute(startupOnly ? argv[3] : EFFETUNE_WEBVIEW_ASSET_DIR),
+      webViewProfile.path());
+  if (startupParent != nullptr) DestroyWindow(startupParent);
+  webViewProfile.captureChildProcesses();
+  if (startupOnly || !startupPassed) {
+    UnregisterClassW(className, instance);
+    const bool cleaned = webViewProfile.cleanup();
+    if (!cleaned) std::cerr << "Visualizer startup profile cleanup failed\n";
+    return startupPassed && cleaned ? 0 : 1;
+  }
 
   // A processor may already have handed an editor a shared lease when
   // terminate retires its owning reference. Explicit shutdown must stop that
@@ -740,6 +1008,23 @@ int main(const int argc, char **argv) {
   }
 
   SmokeState smokeState;
+  smokeState.sfzFolder = webViewProfile.path() / "sfz-source";
+  smokeState.sfzRegistry = webViewProfile.path() / "sfz-registry.json";
+  std::error_code sfzError;
+  std::filesystem::create_directory(smokeState.sfzFolder, sfzError);
+  {
+    std::ofstream first(smokeState.sfzFolder / "instrument.sfz");
+    std::ofstream second(smokeState.sfzFolder / "second.sfz");
+    first << "<region> sample=note.wav key=60";
+    second << "<region> sample=note.wav key=61";
+    if (sfzError || !first.good() || !second.good() ||
+        !writeSfzSmokeSample(smokeState.sfzFolder / "note.wav", .25f)) {
+      DestroyWindow(parent);
+      std::cerr << "Unable to create the native SFZ source fixture\n";
+      return 1;
+    }
+  }
+  smokeState.sfzLibrary = std::make_unique<effetune::vst::SfzLibrary>(smokeState.sfzRegistry);
   std::atomic_bool evaluationComplete{false};
   std::atomic_bool evaluationPending{false};
   std::atomic_bool uiReady{false};
@@ -770,6 +1055,8 @@ int main(const int argc, char **argv) {
   bool languageChangedImmediately = false;
   bool measurementImportAvailable = false;
   std::string measurementImportDiagnostics;
+  bool upstream213IntegrationValid = false;
+  std::string upstream213IntegrationDiagnostics;
   bool aboutNoticesReachable = false;
   bool externalLinksRouted = false;
   bool isolatedWebOrigin = false;
@@ -778,6 +1065,7 @@ int main(const int argc, char **argv) {
   bool masterToggleReachedNative = false;
   bool defaultViewportFits = false;
   bool reattachedWithFreshWebView = false;
+  bool editorOwnershipRespected = true;
   bool recoveredAfterParentDestruction = false;
   bool reopenedReadyEditorWasRebuilt = false;
   bool missingResourceGuidanceShown = false;
@@ -800,10 +1088,18 @@ int main(const int argc, char **argv) {
           return responseFor(request, smokeState);
         },
         extendedAssetRoot, false);
+    editorOwnershipRespected = !webView.isAttachedTo(activeEditorOwner) &&
+        !webView.isAttachedTo(nullptr) &&
+        !webView.attach(&secondEditorOwner, nullptr, 900, 650) &&
+        !webView.isAttachedTo(&secondEditorOwner);
     attached = webView.attach(activeEditorOwner, parent,
                               effetune::vst::plugin::kDefaultEditorWidth,
                               effetune::vst::plugin::kDefaultEditorHeight);
     if (attached) {
+      editorOwnershipRespected = webView.isAttachedTo(activeEditorOwner) &&
+          !webView.attach(&secondEditorOwner, nullptr, 900, 650) &&
+          webView.isAttachedTo(activeEditorOwner) &&
+          !webView.isAttachedTo(&secondEditorOwner) && editorOwnershipRespected;
       ShowWindow(parent, SW_SHOWNOACTIVATE);
       const auto deadline = std::chrono::steady_clock::now() + kCompletionTimeout;
       auto nextEvaluation = std::chrono::steady_clock::now() + std::chrono::seconds(1);
@@ -1431,6 +1727,102 @@ int main(const int argc, char **argv) {
                    "details: window.__vstMeasurementImportDiagnostics })",
                    measurementImportDiagnostics);
         }
+        const auto upstream213FixtureStarted = languageFixtureReady && evaluate(R"JS(
+          (() => {
+            window.__vstUpstream213Ready = false;
+            window.__vstUpstream213Error = '';
+            void (async () => {
+              let stage = 'SFZ native folder routing';
+              let service, bankId, plugin, sources, renderer;
+              let registeredIds = [];
+              try {
+                const bridge = window.electronAPI?.sfzLibraryV1;
+                if (bridge?.apiVersion !== 1) throw new Error('Native SFZ capability unavailable');
+                plugin = window.pluginManager.createPlugin('SFZ Note Player');
+                const ui = plugin.createUI();
+                const buttons = [...ui.querySelectorAll('button')].map(button => button.textContent);
+                if (!buttons.includes('Select SFZ Folder…') || buttons.includes('Import Folder…'))
+                  throw new Error('Native selection controls unavailable');
+                stage = 'SFZ native folder selection';
+                service = await plugin._getLibraryService();
+                const { NativeSfzLibraryService } = await import('./js/sfz/native-service.js');
+                if (!(service instanceof NativeSfzLibraryService) || service.backend)
+                  throw new Error('Shared native SFZ library not selected');
+                const selected = await service.selectFolder();
+                registeredIds = selected.map(entry => entry.id);
+                if (selected.length !== 2) throw new Error('Folder instruments unavailable');
+                bankId = selected.find(entry => entry.name === 'instrument.sfz')?.id;
+                if (!bankId || !(await service.list()).some(item => item.id === bankId))
+                  throw new Error('Selected instrument absent from library');
+                const decode = (bytes, rate) => plugin._decodeAudioData(bytes, rate);
+                stage = 'SFZ persisted reference and direct file read';
+                await window.__effetuneHostCall('sfz/testReopen');
+                const reopened = new NativeSfzLibraryService(bridge);
+                if (!(await reopened.list()).some(item => item.id === bankId))
+                  throw new Error('SFZ reference did not persist');
+                const request = { id: bankId, relativePath: 'note.wav', maxBytes: 1024 * 1024 };
+                const before = await bridge.readRelative(request);
+                await window.__effetuneHostCall('sfz/testUpdateSample');
+                const after = await bridge.readRelative(request);
+                if (!before.ok || !after.ok || !(after.data instanceof Uint8Array) ||
+                    !after.data.some((value, index) => value !== before.data[index]))
+                  throw new Error('Edited source sample was not read directly');
+                const stats = await bridge.statRelative(request);
+                if (!stats.ok || stats.data.channels !== 1 || stats.data.frames !== 256 ||
+                    stats.data.sampleRate !== 48000) throw new Error('Native sample header unavailable');
+                stage = 'SFZ native asset preparation';
+                const prepared = await reopened.prepare(bankId, { decode });
+                if (prepared?.regionCount !== 1 || prepared.descriptor.layout !== 0 ||
+                    !(prepared.descriptor.payload instanceof ArrayBuffer) || prepared.descriptor.payload.byteLength < 64)
+                  throw new Error('Native SFZ source did not prepare an audio asset');
+                stage = 'SFZ reference deletion';
+                const removedId = bankId;
+                for (const id of registeredIds) await service.remove(id);
+                registeredIds = [];
+                bankId = null;
+                await window.__effetuneHostCall('sfz/testReopen');
+                const deleted = new NativeSfzLibraryService(bridge);
+                if ((await deleted.list()).length !== 0 || await deleted.prepare(removedId, { decode }) !== null)
+                  throw new Error('Deleted SFZ reference remains available');
+                await window.__effetuneHostCall('sfz/testSourceExists');
+                stage = 'Guitar Visualizer source and renderer';
+                const { createDefaultLayout, createItem } = await import('./js/visualizer/visualizer-model.js');
+                const { VisualizerSources } = await import('./js/visualizer/visualizer-sources.js');
+                const { VisualizerRenderer } = await import('./js/visualizer/visualizer-renderer.js');
+                const layout = createDefaultLayout();
+                const item = createItem('guitar', 'smoke-guitar');
+                layout.items = [item];
+                sources = new VisualizerSources(window.audioManager);
+                sources.setLayout(layout);
+                if ([...sources.sources.values()][0]?.definition.type !== 'NoteSpectrogramPlugin')
+                  throw new Error('Guitar analyzer source unavailable');
+                const canvas = document.createElement('canvas');
+                canvas.width = 320; canvas.height = 180;
+                renderer = new VisualizerRenderer(canvas);
+                renderer.draw(layout, sources, null, performance.now() / 1000);
+                if (renderer.layers.get(item.id)?.display?.type !== 'guitar')
+                  throw new Error('Guitar renderer unavailable');
+                window.__vstUpstream213Ready = true;
+              } catch (error) {
+                window.__vstUpstream213Error = `${stage}: ${error.message}`;
+              } finally {
+                renderer?.dispose();
+                sources?.dispose();
+                for (const id of registeredIds) await service?.remove(id);
+                plugin?.cleanup();
+              }
+            })().catch(error => { window.__vstUpstream213Error = `Fixture cleanup: ${error.message}`; });
+            return true;
+          })()
+        )JS", ignored) && ignored == "true";
+        upstream213IntegrationValid = upstream213FixtureStarted && waitForJavascript(
+            "window.__vstUpstream213Ready === true || !!window.__vstUpstream213Error",
+            kCompletionTimeout) && evaluate("window.__vstUpstream213Ready === true && !window.__vstUpstream213Error", ignored) &&
+            ignored == "true";
+        if (!upstream213IntegrationValid) {
+          evaluate("String(window.__vstUpstream213Error || 'SFZ/Guitar integration check did not complete')",
+                   upstream213IntegrationDiagnostics);
+        }
         const auto configDialogOpened = languageFixtureReady && evaluate(
             "(() => { document.getElementById('configSettingsButton')?.click(); return true; })()",
             ignored) && ignored == "true" && waitForJavascript(
@@ -1446,8 +1838,10 @@ int main(const int argc, char **argv) {
                   'config-category-general,config-category-startup,config-category-display,config-category-controllers') throw new Error('Settings categories');
               const sections = [...document.querySelectorAll('.config-dialog .device-section')];
               const generalVisible = sections.filter(visible);
-              if (generalVisible.length !== 2 || !visible(document.getElementById('language-select')) ||
-                  !visible(document.getElementById('theme-select'))) throw new Error('General visibility');
+              if (generalVisible.length !== 4 || !visible(document.getElementById('language-select')) ||
+                  !visible(document.getElementById('theme-select')) ||
+                  !visible(document.getElementById('frequency-preview-sound')) ||
+                  !visible(document.getElementById('sfz-size-limit'))) throw new Error('General visibility including audition/SFZ');
               const unsupported = [...document.querySelectorAll('.config-category-panel')].filter(
                 panel => !['general', 'startup', 'display', 'controllers'].some(category => panel.id === `config-panel-${category}`));
               if (unsupported.some(visible)) throw new Error('Unsupported panel visible');
@@ -1459,6 +1853,22 @@ int main(const int argc, char **argv) {
                 }
               };
               const theme = document.getElementById('theme-select');
+              const sound = document.getElementById('frequency-preview-sound');
+              if ([...sound.options].map(option => option.value).join(',') !== 'sine,bandpassNoise')
+                throw new Error('Audition sound choices');
+              for (const value of ['bandpassNoise', 'sine']) {
+                sound.value = value;
+                sound.dispatchEvent(new Event('change', { bubbles: true }));
+                await waitFor(() => window.appConfig.frequencyPreviewSound === value);
+              }
+              const sfzLimit = document.getElementById('sfz-size-limit');
+              if ([...sfzLimit.options].map(option => option.value).join(',') !== '64,128,256,512,1024')
+                throw new Error('SFZ bank size choices');
+              for (const value of ['1024', '256']) {
+                sfzLimit.value = value;
+                sfzLimit.dispatchEvent(new Event('change', { bubbles: true }));
+                await waitFor(() => window.appConfig.sfzMaxSizeMiB === Number(value));
+              }
               if ([...theme.options].map(option => option.value).join(',') !==
                   'graphite,paper,midnight,ember,mint') throw new Error('Theme choices');
               for (const value of ['paper', 'midnight', 'ember', 'mint', 'graphite']) {
@@ -1740,6 +2150,8 @@ int main(const int argc, char **argv) {
             replacementParent != nullptr && replacementParent != parent;
         smokeState.pipelineStateRead.store(false, std::memory_order_release);
         webView.detach(&firstEditorOwner);
+        editorOwnershipRespected = !webView.isAttachedTo(&firstEditorOwner) &&
+            editorOwnershipRespected;
         DestroyWindow(parent);
         parent = replacementParent;
         activeEditorOwner = &secondEditorOwner;
@@ -1751,6 +2163,8 @@ int main(const int argc, char **argv) {
           const auto child = GetWindow(parent, GW_CHILD);
           // A delayed removed() from the old IPlugView must not detach the new one.
           webView.detach(&firstEditorOwner);
+          editorOwnershipRespected = !webView.isAttachedTo(&firstEditorOwner) &&
+              webView.isAttachedTo(activeEditorOwner) && editorOwnershipRespected;
           reattachedWithFreshWebView = child != nullptr && GetParent(child) == parent &&
               markerInstalled && waitForJavascript(
                   "window.__vstReattachMarker === undefined && "
@@ -1782,6 +2196,8 @@ int main(const int argc, char **argv) {
             ShowWindow(parent, SW_SHOWNOACTIVATE);
             const auto child = GetWindow(parent, GW_CHILD);
             webView.detach(&secondEditorOwner);
+            editorOwnershipRespected = !webView.isAttachedTo(&secondEditorOwner) &&
+                webView.isAttachedTo(activeEditorOwner) && editorOwnershipRespected;
             recoveredAfterParentDestruction = child != nullptr && GetParent(child) == parent &&
                 waitForJavascript(
                     "window.app?.initialized === true && "
@@ -1838,6 +2254,8 @@ int main(const int argc, char **argv) {
       }
     }
     webView.detach(activeEditorOwner);
+    editorOwnershipRespected = !webView.isAttachedTo(activeEditorOwner) &&
+        editorOwnershipRespected;
     webViewProfile.captureChildProcesses();
   }
   if (parent != nullptr && IsWindow(parent) != FALSE) {
@@ -2098,8 +2516,13 @@ int main(const int argc, char **argv) {
           text.resize(static_cast<std::size_t>(length));
           multiThreadedApartmentDiagnosed =
               text.find(L"EFFETUNE-UI-MTA") != std::wstring::npos &&
-              text.find(L"multi-threaded apartment") != std::wstring::npos;
+              text.find(L"multi-threaded apartment") != std::wstring::npos &&
+              probe.isAttachedTo(&probeOwner);
         }
+        probe.shutdown();
+        multiThreadedApartmentDiagnosed = !probe.isAttachedTo(&probeOwner) &&
+            !probe.attach(&probeOwner, probeParent, 900, 650) &&
+            !probe.isAttachedTo(&probeOwner) && multiThreadedApartmentDiagnosed;
         probe.detach(&probeOwner);
       }
       DestroyWindow(probeParent);
@@ -2321,6 +2744,11 @@ int main(const int argc, char **argv) {
               << measurementImportDiagnostics << '\n';
     return 1;
   }
+  if (!upstream213IntegrationValid) {
+    std::cerr << "SFZ browser bank import/preparation/deletion or Guitar Visualizer integration failed: "
+              << upstream213IntegrationDiagnostics << '\n';
+    return 1;
+  }
   if (!aboutNoticesReachable) {
     std::cerr << "The About dialog did not show the Mixwright version and complete third-party "
                  "notices\n";
@@ -2345,6 +2773,10 @@ int main(const int argc, char **argv) {
   }
   if (!defaultViewportFits) {
     std::cerr << "The default one-column editor viewport has horizontal overflow\n";
+    return 1;
+  }
+  if (!editorOwnershipRespected) {
+    std::cerr << "WebView ownership changed after a failed attach or stale editor removal\n";
     return 1;
   }
   if (!reattachedWithFreshWebView) {
