@@ -75,6 +75,9 @@ const requiredFiles = [
   'js/vendor/jszip-3.10.2.min.js',
   'js/midi/playback-speed.js',
   'js/ui/visualizer-shared.js',
+  'js/library/metadata/lyrics.js',
+  'js/library/metadata/text-encoding.js',
+  'js/ui/onboarding-tour.js',
   'js/startup.js',
   'THIRD-PARTY-NOTICES.txt',
   'plugins/plugins.txt',
@@ -809,7 +812,7 @@ for (const excluded of [
   'js/vendor/music-metadata-browser.mjs',
   'js/ui/double-blind-test',
   'js/pipeline-analyzer',
-  'js/library',
+  'js/library/library-manager-v2.js',
   'js/ui/library',
   'js/ui/audio-player',
   'js/ui/audio-player.js',
@@ -822,6 +825,12 @@ for (const excluded of [
   } catch (error) {
     if (error?.code !== 'ENOENT') throw error;
   }
+}
+
+const sharedMetadata = await readdir(path.join(assets, 'js', 'library', 'metadata'));
+if (sharedMetadata.sort().join(',') !== 'lyrics.js,text-encoding.js' ||
+    (await readdir(path.join(assets, 'js', 'library'))).join(',') !== 'metadata') {
+  throw new Error('Only the pure Visualizer lyrics helpers may remain from the music library');
 }
 
 const visitedModules = new Set();

@@ -8,6 +8,7 @@ import { installThemePaletteStub } from '../../external/effetune/tests/helpers/t
 import { fileURLToPath } from 'node:url';
 
 import * as irContract from '../../external/effetune/js/ir-library/ir-plugin-contract.js';
+import { TelemetryHub } from '../../external/effetune/js/audio/telemetry-hub.js';
 import {
   getPluginExecutionCapabilities
 } from '../../external/effetune/js/audio/plugin-execution-capabilities.js';
@@ -180,6 +181,93 @@ function installSpectrumPolling({ context, port }) {
     telemetryHub: { handleMessage() { assert.fail('empty DSP packets must not enter TelemetryHub'); } } });
   return () => context.poll.call(port.owner);
 }
+
+test('native telemetry preserves Note history within a source and accepts restarted instances', async () => {
+  const fixture = createNativePort();
+  const { context, port } = fixture;
+  installSpectrumPolling(fixture);
+  const start = source.indexOf('  pollNativeTelemetry()');
+  const end = source.indexOf('\n  async initAudio()', start);
+  vm.runInNewContext(`this.PollManager = class { ${source.slice(start, end)} };`, context);
+  Object.assign(port.owner, {
+    pollNativeTelemetry: context.PollManager.prototype.pollNativeTelemetry,
+    pollNativeTelemetryOnce: context.PollManager.prototype.pollNativeTelemetryOnce
+  });
+  const hub = new TelemetryHub({ now: () => 0, schedule: () => 1, cancel() {} });
+  port.owner.telemetryHub = hub;
+  context.window.dspTelemetryHub = hub;
+  context.PluginBase = class {
+    constructor() { this.enabled = true; this._sectionEnabled = true; }
+    registerProcessor() {}
+  };
+  const noteSource = await readFile(path.join(projectRoot,
+    'external/effetune/plugins/analyzer/note_spectrogram.js'), 'utf8');
+  vm.runInNewContext(noteSource, context);
+  const note = new context.window.NoteSpectrogramPlugin();
+  note.id = 7;
+  assert.equal(note.ensureDspTelemetrySubscription(), true);
+  const outputTap = 0xf0000000;
+  const sources = instanceId => ({ 7: { instanceId }, [outputTap]: { instanceId: 'output:1' } });
+  const packet = (frameIndex, generation, tap = 7) => {
+    // Current native Note v6 payload, including its empty revision planes.
+    const bytes = new ArrayBuffer(16 + 9192);
+    const view = new DataView(bytes);
+    view.setUint16(0, 24, true);
+    view.setUint16(2, 6, true);
+    view.setUint32(4, tap, true);
+    view.setUint16(12, 9192, true);
+    view.setFloat32(16, 48000, true);
+    view.setFloat32(20, 10 + frameIndex * .02, true);
+    view.setUint16(24, 440, true);
+    view.setUint16(26, 21, true);
+    view.setFloat32(28, .02, true);
+    view.setUint32(32, frameIndex, true);
+    view.setUint32(36, 5, true);
+    view.setUint32(40, generation, true);
+    view.setFloat32(48, 1, true);
+    return { bytes: bytes.byteLength, packet: Buffer.from(bytes).toString('base64') };
+  };
+  let reply;
+  context.window.__effetuneHostCall = async () => reply;
+  const poll = async (instance, frame, generation) => {
+    reply = { telemetrySources: sources(instance), ...packet(frame, generation) };
+    await port.owner.pollNativeTelemetry();
+    assert.equal(hub.stats.subscriberErrors, 0);
+  };
+  await poll('pipeline:1', 100, 2);
+  assert.equal(note.lastFrameIndex, 100);
+  assert.equal(note.history[0], 1, 'the actual Note UI writes the received column');
+  const originalSource = note.telemetrySource;
+  const outputSource = hub.sources.get(outputTap);
+  await poll('pipeline:1', 0, 2);
+  assert.equal(note.lastFrameIndex, 100, 'same-source backwards frame guards remain intact');
+  await poll('pipeline:2', 0, 2);
+  assert.equal(note.lastFrameIndex, 0, 'recreated instance accepts its initial frame without an OFF/ON gesture');
+  assert.notEqual(note.telemetrySource, originalSource);
+  assert.equal(hub.sources.get(outputTap), outputSource, 'pipeline replacement retains output history identity');
+  await poll('pipeline:2', 100, 4);
+  hub.setVisualSyncResolver(() => 1000);
+  await poll('pipeline:2', 101, 4);
+  reply = { telemetrySources: sources('pipeline:2'), ...packet(1, 2, outputTap) };
+  await port.owner.pollNativeTelemetry();
+  assert.equal(hub.visualSyncQueue.length, 2);
+  let resolvePoll;
+  context.window.__effetuneHostCall = () => new Promise(resolve => { resolvePoll = resolve; });
+  const pending = port.owner.pollNativeTelemetry();
+  assert.equal(port.owner.pollNativeTelemetry(), pending, 'source snapshots cannot overtake one another');
+  resolvePoll({ telemetrySources: sources('pipeline:3'), bytes: 0, packet: '' });
+  await pending;
+  assert.equal(hub.visualSyncQueue.length, 1, 'empty replacement poll discards only obsolete pipeline frames');
+  assert.equal(hub.visualSyncQueue[0].frame.tapId, outputTap);
+  hub.setVisualSyncResolver(null);
+  context.window.__effetuneHostCall = async () => reply;
+  await poll('pipeline:3', 0, 2);
+  assert.equal(note.activeGeneration, 2, 'a new instance may also restart at an older generation');
+  assert.equal(note.lastFrameIndex, 0);
+  await poll('pipeline:3', 1, 2);
+  assert.equal(note.lastFrameIndex, 1, 'replacement continues advancing');
+  note.disposeDspTelemetrySubscription();
+});
 
 test('host track metadata replaces and clears without DSP packets and reuses unchanged artwork', async () => {
   const fixture = createNativePort();

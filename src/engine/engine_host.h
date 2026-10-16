@@ -8,8 +8,9 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
-#include <mutex>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -196,6 +197,27 @@ public:
                                       std::uint32_t paramsHash,
                                       std::span<const std::uint8_t> parameterBytes = {});
   [[nodiscard]] bool setAsset(RuntimeAsset asset, std::string *error = nullptr);
+  class PreparedAssetUpdate {
+  public:
+    PreparedAssetUpdate();
+    ~PreparedAssetUpdate();
+    PreparedAssetUpdate(const PreparedAssetUpdate &) = delete;
+    PreparedAssetUpdate &operator=(const PreparedAssetUpdate &) = delete;
+  private:
+    friend class EngineHost;
+    struct Storage;
+    std::unique_ptr<Storage> storage_;
+  };
+  [[nodiscard]] bool supportsPreparedAsset(std::uint32_t logicalId, std::uint32_t slot) const;
+  [[nodiscard]] std::uint64_t supersedeAssetRequest(std::uint32_t logicalId, std::uint32_t slot);
+  // Allocate/create, prepare and finish on control; capture/apply on the engine
+  // owner between blocks. The caller transfers exclusive ownership at each step.
+  [[nodiscard]] std::unique_ptr<PreparedAssetUpdate> createAssetUpdate(
+      RuntimeAsset asset, bool clear, std::string *error = nullptr, std::uint64_t requestRevision = 0);
+  [[nodiscard]] bool captureAssetUpdate(PreparedAssetUpdate &update) noexcept;
+  [[nodiscard]] static bool prepareAssetUpdate(PreparedAssetUpdate &update) noexcept;
+  [[nodiscard]] bool applyAssetUpdate(PreparedAssetUpdate &update) noexcept;
+  void finishAssetUpdate(PreparedAssetUpdate &update);
   [[nodiscard]] bool clearAsset(std::uint32_t logicalId, std::uint32_t slot);
   [[nodiscard]] std::uint32_t assetState(std::uint32_t logicalId,
                                          std::uint32_t slot) const;
@@ -230,8 +252,10 @@ public:
   [[nodiscard]] std::uint64_t pipelinePlanRevision() const noexcept {
     return pipelinePlanRevision_.load(std::memory_order_acquire);
   }
+  // Control-side snapshot: source identities and bytes share the same lifetime.
   [[nodiscard]] std::uint32_t readTelemetry(std::span<std::uint8_t> destination,
-                                            std::uint32_t &droppedFrames) noexcept;
+                                            std::uint32_t &droppedFrames,
+                                            std::map<std::uint32_t, std::uint64_t> *sources = nullptr);
   void discardTelemetry() noexcept;
   [[nodiscard]] SpectrumCapture &spectrumCapture() noexcept { return spectrumCapture_; }
   [[nodiscard]] std::uint64_t latencyRevision() const noexcept {
@@ -328,6 +352,7 @@ private:
     std::uint32_t budget = kAggregateAssetBudgetBytes;
     std::atomic<std::uint32_t> state{
         static_cast<std::uint32_t>(ET_ASSET_STATE_NONE)};
+    std::atomic<std::uint64_t> requestRevision{0};
   };
   std::unordered_map<std::uint32_t, InstanceEntry> instances_;
   std::uint32_t nextCircuitFaultEpoch_ = 0;
@@ -337,6 +362,8 @@ private:
   bool assetPreparationLatencyPolling_ = false;
   struct TelemetryStorage;
   std::unique_ptr<TelemetryStorage> telemetry_;
+  std::map<std::uint32_t, std::uint64_t> telemetrySources_;
+  std::uint64_t nextTelemetrySourceId_ = 0;
   std::atomic<std::uint32_t> pipelineLatency_{0};
   std::atomic<std::uint64_t> latencyRevision_{0};
   std::atomic<std::uint64_t> pipelinePlanRevision_{0};

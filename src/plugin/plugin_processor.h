@@ -208,6 +208,9 @@ private:
   [[nodiscard]] bool prepareCapturedLatencyUpdate() noexcept;
   [[nodiscard]] bool applyPreparedLatencyUpdate() noexcept;
   void discardPendingLatencyUpdate() noexcept;
+  void serviceAssetUpdateBoundary() noexcept;
+  [[nodiscard]] bool replaceSfzAsset(RuntimeAsset asset, bool clear,
+                                      std::uint64_t stateEpoch, std::uint64_t requestRevision, std::string &error);
   // How long the rendered-block counter has to stand still before the transport
   // counts as stopped. It has to outlast one host block, and the host already
   // told us how long that is through setupProcessing().
@@ -511,12 +514,21 @@ private:
     RuntimeAsset asset;
     std::uint32_t budget = 0;
     std::uint64_t operationRevision = 0;
+    std::uint64_t stateEpoch = 0;
+    std::uint64_t requestRevision = 0;
     std::size_t receivedBytes = 0;
   };
 
   struct ControlServiceTimer;
 
   EngineHost engine_;
+  enum class AssetUpdateState : std::uint8_t { idle, requested, captured, prepared, retired };
+  std::atomic<AssetUpdateState> assetUpdateState_{AssetUpdateState::idle};
+  // One synchronous control request owns the storage under processingResourcesMutex_.
+  // The atomic state lends it to the engine owner only for capture or apply.
+  EngineHost::PreparedAssetUpdate *pendingAssetUpdate_ = nullptr;
+  std::uint64_t assetUpdateEpoch_ = 0;
+  bool assetUpdateSucceeded_ = false;
   Oversampler oversampler_;
   DryDelayLine dryDelay_;
   enum class LatencyUpdateState : std::uint8_t { idle, captured, prepared, retired };
@@ -818,6 +830,8 @@ private:
   std::function<std::optional<std::filesystem::path>(std::string_view)>
       backupSaveChooserForTesting_;
   std::function<std::optional<std::filesystem::path>()> sfzFolderChooserForTesting_;
+  std::function<std::vector<std::filesystem::path>()> sfzFilesChooserForTesting_;
+  std::function<void()> assetPreparationHookForTesting_;
   std::optional<void *> attachedEditorOwnerForTesting_;
   std::uint32_t pipelinePlanRefreshFailuresForTesting_ = 0;
   std::atomic_bool pauseControllerCommitBeforePublishForTesting_{false};

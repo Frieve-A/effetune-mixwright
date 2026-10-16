@@ -50,6 +50,12 @@ native pipeline output. The **Effect Pipeline** button returns to effect editing
 Visualizer presets and imported images use the VST WebView's local storage.
 The music player and music library remain outside the VST interface.
 Upstream's LAN remote control is not available in this VST build.
+The first-run tour explains DAW audio input and the supported views; reopen it
+with **Settings → Take the tour**. **Settings → Help** opens the guide.
+Visualizer supports Custom Analog Meter detectors and dials, plus per-item
+**Edge Fade** masks. The add-item menu omits Lyrics, and the bundled presets omit
+Lyric Stage. Lyrics items in existing or imported layouts and user presets remain
+editable; live player lyrics are unavailable because audio comes from the DAW.
 
 Use **Settings → Configuration → Controllers** to open controller mapping settings.
 Controller mappings can toggle master bypass, switch A/B, and step through saved
@@ -80,11 +86,14 @@ positions to the host output clock, applying additional audio output delay and
 reporting that applied delay to the host are still required. Visualizer analyzer
 sources have their own analysis settings.
 
-SFZ Note Player reads instruments and samples directly from the selected folder.
-Choose **Select SFZ Folder…**, then select an SFZ file when the folder contains
-several instruments. Folder references persist locally; the source files must
+SFZ Note Player reads instruments and samples directly from their original files.
+Open **SFZ Library…**, choose **Import files…** for selected instruments or
+**Import folder…** to register a folder, then **Load** an instrument. Search,
+filename/recent-import sorting, metadata badges, and bulk deletion are available.
+ARIA `.bank.xml` definitions alongside the instruments are used during preparation.
+File and folder references persist locally; the source files must
 remain available, and moving or deleting them makes the instrument unavailable
-until you select it again. **Remove** removes the local library reference and
+until you import it again. **Delete** removes the local library reference and
 leaves the source files in place. Projects store local SFZ identifiers, so choose
 the instrument again when opening a project on another machine. The configured limit applies to each bank's preparation and
 decoded sample data, with a native SFZ asset budget of 1 GiB. Impulse-response

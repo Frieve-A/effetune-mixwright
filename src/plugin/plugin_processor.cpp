@@ -2930,6 +2930,7 @@ tresult PLUGIN_API EffeTuneProcessor::process(ProcessData &data) {
   // non-real-time control thread. The engine keeps its previously configured
   // topology until then, so audio continues to be processed instead of falling
   // back to the input signal.
+  serviceAssetUpdateBoundary();
   copyDryToScratch(input, data.numSamples);
   const auto previewInBlock = frequencyPreview_.mix(dryTransitionPointers_.data(),
                         static_cast<std::uint32_t>(input.numChannels),
@@ -3230,6 +3231,72 @@ void EffeTuneProcessor::capturePendingLatencyUpdate() noexcept {
     latencyUpdateRevision_ = engine_.pipelinePlanRevision();
     latencyUpdateState_.store(LatencyUpdateState::captured, std::memory_order_release);
   }
+}
+
+void EffeTuneProcessor::serviceAssetUpdateBoundary() noexcept {
+  const auto state = assetUpdateState_.load(std::memory_order_acquire);
+  if (state != AssetUpdateState::requested && state != AssetUpdateState::prepared) return;
+  if (stateReplacementPending_.load(std::memory_order_acquire) ||
+      stateReplacementEpoch_.load(std::memory_order_acquire) != assetUpdateEpoch_) {
+    assetUpdateSucceeded_ = false;
+    assetUpdateState_.store(AssetUpdateState::retired, std::memory_order_release);
+    return;
+  }
+  if (state == AssetUpdateState::requested) {
+    assetUpdateSucceeded_ = engine_.captureAssetUpdate(*pendingAssetUpdate_);
+    assetUpdateState_.store(assetUpdateSucceeded_ ? AssetUpdateState::captured : AssetUpdateState::retired,
+                            std::memory_order_release);
+  } else {
+    assetUpdateSucceeded_ = engine_.applyAssetUpdate(*pendingAssetUpdate_);
+    assetUpdateState_.store(AssetUpdateState::retired, std::memory_order_release);
+  }
+}
+
+bool EffeTuneProcessor::replaceSfzAsset(RuntimeAsset asset, const bool clear,
+                                        const std::uint64_t stateEpoch,
+                                        const std::uint64_t requestRevision, std::string &error) {
+  // Caller holds the control resource mutex, keeping topology and the replay
+  // cache stable throughout. Audio never acquires it and keeps the old bank.
+  auto update = engine_.createAssetUpdate(std::move(asset), clear, &error, requestRevision);
+  if (!update) return false;
+  pendingAssetUpdate_ = update.get();
+  assetUpdateEpoch_ = stateEpoch;
+  assetUpdateSucceeded_ = false;
+  assetUpdateState_.store(AssetUpdateState::requested, std::memory_order_release);
+  const auto awaitBoundary = [&] {
+    for (;;) {
+      const auto state = assetUpdateState_.load(std::memory_order_acquire);
+      if (state != AssetUpdateState::requested && state != AssetUpdateState::prepared) return;
+      if (!componentActive_.load(std::memory_order_acquire) ||
+          !processingReady_.load(std::memory_order_seq_cst) ||
+          observeAudioIdle(std::chrono::steady_clock::now())) {
+        // A stopped host has no callback to perform the handoff. Borrow the
+        // existing exclusive ownership window only for these bounded operations;
+        // never hold it during allocation, validation or retired-bank release.
+        const EngineMutationWindow engineWindow{*this};
+        serviceAssetUpdateBoundary();
+      } else {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    }
+  };
+  awaitBoundary();
+  if (assetUpdateState_.load(std::memory_order_acquire) == AssetUpdateState::captured) {
+#if defined(EFFETUNE_PROCESSOR_TEST_HOOKS)
+    if (assetPreparationHookForTesting_) assetPreparationHookForTesting_();
+#endif
+    assetUpdateSucceeded_ = EngineHost::prepareAssetUpdate(*update);
+    if (assetUpdateSucceeded_) {
+      assetUpdateState_.store(AssetUpdateState::prepared, std::memory_order_release);
+      awaitBoundary();
+    }
+  }
+  const auto succeeded = assetUpdateSucceeded_;
+  engine_.finishAssetUpdate(*update);
+  assetUpdateState_.store(AssetUpdateState::idle, std::memory_order_release);
+  pendingAssetUpdate_ = nullptr;
+  if (!succeeded) error = "The instrument could not be loaded. Select another SFZ instrument.";
+  return succeeded;
 }
 
 bool EffeTuneProcessor::prepareCapturedLatencyUpdate() noexcept {
@@ -3916,18 +3983,22 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     }
     // Modal dialogs pump events. No service lock survives the chooser, and a
     // replaced or closed page cannot persist the abandoned selection.
+    const auto filesMode = choc::json::parse(message.content)["mode"].getWithDefault<std::string>("folder") == "files";
+    std::optional<std::filesystem::path> selected;
+    std::vector<std::filesystem::path> selectedFiles;
 #if defined(EFFETUNE_PROCESSOR_TEST_HOOKS)
-    const auto selected = sfzFolderChooserForTesting_
-        ? sfzFolderChooserForTesting_() : chooseSfzFolder();
+    if (filesMode) selectedFiles = sfzFilesChooserForTesting_ ? sfzFilesChooserForTesting_() : chooseSfzFiles();
+    else selected = sfzFolderChooserForTesting_ ? sfzFolderChooserForTesting_() : chooseSfzFolder();
 #else
-    const auto selected = chooseSfzFolder();
+    if (filesMode) selectedFiles = chooseSfzFiles();
+    else selected = chooseSfzFolder();
 #endif
     std::scoped_lock lock(sfzMutex_);
-    if (!selected || generation != sfzGeneration_ ||
+    if ((filesMode ? selectedFiles.empty() : !selected) || generation != sfzGeneration_ ||
         requestPageGeneration != uiPageGeneration_.load(std::memory_order_acquire)) {
       return R"({"ok":true,"data":null})";
     }
-    return sfzLibrary_.request("select", message.content, *selected);
+    return sfzLibrary_.request("select", message.content, selected.value_or(std::filesystem::path{}), selectedFiles);
   }
   if (message.action == UiAction::frequencyPreview) {
     frequencyPreview_.setFrequency(message.previewFrequency, message.previewSound);
@@ -4124,11 +4195,15 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     serviceLatencyUpdates();
     const auto context = readHostContext();
     std::uint32_t droppedFrames = 0;
+    std::map<std::uint32_t, std::uint64_t> pipelineSources;
     const auto pipelineBytes = engine_.readTelemetry(
-        std::span<std::uint8_t>(telemetryScratch_).first(EngineHost::kDefaultTelemetryBytes), droppedFrames);
+        std::span<std::uint8_t>(telemetryScratch_).first(EngineHost::kDefaultTelemetryBytes), droppedFrames,
+        &pipelineSources);
     std::uint32_t analyzerDropped = 0;
+    std::map<std::uint32_t, std::uint64_t> analyzerSources;
     const auto analyzerBytes = outputAnalyzers_.readTelemetry(
-        std::span<std::uint8_t>(telemetryScratch_).last(OutputAnalyzers::kTelemetryBytes), analyzerDropped);
+        std::span<std::uint8_t>(telemetryScratch_).last(OutputAnalyzers::kTelemetryBytes), analyzerDropped,
+        &analyzerSources);
     std::memmove(telemetryScratch_.data() + pipelineBytes,
                  telemetryScratch_.data() + EngineHost::kDefaultTelemetryBytes, analyzerBytes);
     const auto bytes = pipelineBytes + analyzerBytes;
@@ -4137,6 +4212,18 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     result.addMember("ok", true);
     result.addMember("bytes", static_cast<std::int64_t>(bytes));
     result.addMember("droppedFrames", static_cast<std::int64_t>(droppedFrames));
+    auto telemetrySources = choc::value::createObject({});
+    for (const auto &[tap, source] : pipelineSources) {
+      auto identity = choc::value::createObject({});
+      identity.addMember("instanceId", "pipeline:" + std::to_string(source));
+      telemetrySources.addMember(std::to_string(tap), std::move(identity));
+    }
+    for (const auto &[tap, source] : analyzerSources) {
+      auto identity = choc::value::createObject({});
+      identity.addMember("instanceId", "output:" + std::to_string(source));
+      telemetrySources.addMember(std::to_string(tap), std::move(identity));
+    }
+    result.addMember("telemetrySources", std::move(telemetrySources));
     std::uint32_t spectrumDropped = 0;
     const auto frames = engine_.spectrumCapture().read(spectrumDropped);
     auto overlays = choc::value::createEmptyArray();
@@ -4225,6 +4312,7 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     PendingAssetTransfer transfer;
     transfer.asset = std::move(message.asset);
     transfer.operationRevision = message.operationRevision;
+    transfer.stateEpoch = requestStateEpoch;
     try {
       std::scoped_lock transferLock(assetTransferMutex_);
       const auto key = assetKey(transfer.asset.logicalId, transfer.asset.slot);
@@ -4245,6 +4333,7 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
         return bridgeResult(false, "DSP asset transfer budget exceeded");
       }
       transfer.asset.payload.resize(message.assetByteSize);
+      transfer.requestRevision = engine_.supersedeAssetRequest(transfer.asset.logicalId, transfer.asset.slot);
       pendingAssetTransfers_.insert_or_assign(key, std::move(transfer));
     } catch (const std::bad_alloc &) {
       return bridgeResult(false, "DSP asset transfer could not be allocated");
@@ -4282,26 +4371,30 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
 
   if (message.action == UiAction::commitPluginAsset) {
     RuntimeAsset asset;
+    std::uint64_t requestRevision = 0;
     {
       std::scoped_lock transferLock(assetTransferMutex_);
       const auto key = assetKey(message.asset.logicalId, message.asset.slot);
       const auto found = pendingAssetTransfers_.find(key);
       if (found == pendingAssetTransfers_.end() ||
           found->second.operationRevision != message.operationRevision ||
+          found->second.stateEpoch != requestStateEpoch ||
           found->second.receivedBytes != found->second.asset.payload.size()) {
         return bridgeResult(false, "DSP asset transfer is incomplete");
       }
       asset = std::move(found->second.asset);
+      requestRevision = found->second.requestRevision;
       pendingAssetTransfers_.erase(found);
     }
     std::uint32_t assetState = 0;
     {
-      // Staging copies the payload into the engine's arena and commits it, so
-      // the audio thread has to be outside the DSP for the whole operation.
       std::scoped_lock resources(processingResourcesMutex_);
-      const EngineMutationWindow engineWindow{*this};
-      if (!engine_.setAsset(std::move(asset), &error)) {
-        return bridgeResult(false, error);
+      if (engine_.supportsPreparedAsset(asset.logicalId, asset.slot)) {
+        if (!replaceSfzAsset(std::move(asset), false, requestStateEpoch, requestRevision, error))
+          return bridgeResult(false, error);
+      } else {
+        const EngineMutationWindow engineWindow{*this};
+        if (!engine_.setAsset(std::move(asset), &error)) return bridgeResult(false, error);
       }
       assetState = engine_.assetState(message.asset.logicalId, message.asset.slot);
     }
@@ -4313,11 +4406,17 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
   }
 
   if (message.action == UiAction::clearPluginAsset) {
+    std::uint64_t requestRevision = 0;
     {
       std::scoped_lock transferLock(assetTransferMutex_);
       pendingAssetTransfers_.erase(assetKey(message.asset.logicalId, message.asset.slot));
+      requestRevision = engine_.supersedeAssetRequest(message.asset.logicalId, message.asset.slot);
     }
     std::scoped_lock resources(processingResourcesMutex_);
+    if (engine_.supportsPreparedAsset(message.asset.logicalId, message.asset.slot)) {
+      const auto cleared = replaceSfzAsset(std::move(message.asset), true, requestStateEpoch, requestRevision, error);
+      return bridgeResult(cleared, error);
+    }
     const EngineMutationWindow engineWindow{*this};
     (void)engine_.clearAsset(message.asset.logicalId, message.asset.slot);
     return bridgeResult(true);

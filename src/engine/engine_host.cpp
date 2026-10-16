@@ -29,6 +29,18 @@ struct EngineHost::LatencyUpdateStorage {
   std::uint64_t revision = 0;
 };
 
+struct EngineHost::PreparedAssetUpdate::Storage {
+  effetune::Engine::InstanceAssetSnapshot snapshot;
+  effetune::Engine::InstanceAssetUpdate update;
+  RuntimeAsset asset;
+  bool clear = false;
+  bool applied = false;
+  std::uint64_t requestRevision = 0;
+};
+
+EngineHost::PreparedAssetUpdate::PreparedAssetUpdate() : storage_(std::make_unique<Storage>()) {}
+EngineHost::PreparedAssetUpdate::~PreparedAssetUpdate() = default;
+
 struct EngineHost::TelemetryStorage {
   struct Slot {
     std::array<std::uint8_t, kDefaultTelemetryBytes> bytes{};
@@ -291,6 +303,17 @@ void EngineHost::reset() {
 }
 
 void EngineHost::clearInstancesUnlocked() noexcept {
+  // Rebuild owns the engine exclusively; polling holds engineMutex_ as well.
+  // Neither raw frames nor queued deliveries may outlive their source instances.
+  std::uint32_t dropped = 0;
+  while (engine_->readTelemetry(telemetry_->discard.data(),
+                               static_cast<std::uint32_t>(telemetry_->discard.size()),
+                               &dropped) != 0) {}
+  telemetry_->read.store(telemetry_->write.load(std::memory_order_acquire),
+                         std::memory_order_release);
+  telemetry_->producerDroppedFrames.store(0, std::memory_order_release);
+  telemetry_->deliveryDroppedFrames.store(0, std::memory_order_release);
+  telemetrySources_.clear();
   spectrumCapture_.invalidate();
   analysisNodes_.fill(nullptr);
   analysisSourcesDirty_ = true;
@@ -453,6 +476,14 @@ bool EngineHost::rebuild(const PipelineState &pipeline,
         return false;
       }
       spectrumInstanceIds_.emplace(instance, runtime.logicalId);
+      if (!runtime.contextuallyBypassed)
+        telemetrySources_.emplace(tap, ++nextTelemetrySourceId_);
+      if (runtime.type == "SFZNotePlayerPlugin") {
+        auto &cached = assets_[(static_cast<std::uint64_t>(runtime.logicalId) << 32u)];
+        cached.asset.logicalId = runtime.logicalId;
+        cached.budget = kSfzAssetBudgetBytes;
+        cached.requestRevision.fetch_add(1, std::memory_order_acq_rel);
+      }
     } catch (const std::bad_alloc &) {
       engine_->destroyInstance(instance);
       clearInstancesUnlocked();
@@ -461,7 +492,7 @@ bool EngineHost::rebuild(const PipelineState &pipeline,
     }
     for (const auto &[key, entry] : assets_) {
       (void)key;
-      if (entry.asset.logicalId == runtime.logicalId) {
+      if (entry.asset.logicalId == runtime.logicalId && !entry.asset.payload.empty()) {
         (void)stageAssetUnlocked(entry.asset);
       }
     }
@@ -740,6 +771,18 @@ bool EngineHost::stageAssetUnlocked(const RuntimeAsset &asset, std::string *erro
                                  asset.processingChannels,
                                  asset.footprintBytes,
                                  static_cast<std::uint32_t>(asset.payload.size())};
+  if (found->second.analysisRole == AnalysisRole::consumer && asset.slot == 0) {
+    Engine::InstanceAssetSnapshot snapshot;
+    Engine::InstanceAssetUpdate update;
+    if (engine_->captureInstanceAssetSnapshot(found->second.instance, 0, snapshot) != ET_OK ||
+        Engine::prepareInstanceAssetUpdate(snapshot, beginInfo, asset.payload.data(),
+            static_cast<std::uint32_t>(asset.payload.size()), asset.formatTag, update) != ET_OK ||
+        engine_->applyInstanceAssetUpdate(update) != ET_OK) {
+      setError(error, "The instrument could not be loaded. Select another SFZ instrument.");
+      return false;
+    }
+    return true;
+  }
   auto *staging = engine_->beginInstanceAsset(found->second.instance, asset.slot, beginInfo);
   if (staging == nullptr) {
     setError(error, "DSP asset could not be staged");
@@ -759,19 +802,113 @@ bool EngineHost::stageAssetUnlocked(const RuntimeAsset &asset, std::string *erro
 bool EngineHost::refreshAssetStatesUnlocked() noexcept {
   auto pending = false;
   for (auto &[key, entry] : assets_) {
-    (void)key;
-    const auto instance = instances_.find(entry.asset.logicalId);
+    const auto instance = instances_.find(static_cast<std::uint32_t>(key >> 32u));
     const auto state = instance == instances_.end() ||
                                instance->second.contextuallyBypassed
                            ? static_cast<std::uint32_t>(ET_ASSET_STATE_NONE)
                            : engine_->instanceAssetState(instance->second.instance,
-                                                         entry.asset.slot);
+                                                         static_cast<std::uint32_t>(key));
     entry.state.store(state, std::memory_order_release);
     const auto phase = state & 0xffu;
     pending = pending || phase == ET_ASSET_STATE_STAGED ||
               phase == ET_ASSET_STATE_PREPARING;
   }
   return pending;
+}
+
+bool EngineHost::supportsPreparedAsset(const std::uint32_t logicalId, const std::uint32_t slot) const {
+  std::scoped_lock lock(engineMutex_);
+  const auto instance = instances_.find(logicalId);
+  return slot == 0 && instance != instances_.end() &&
+         instance->second.analysisRole == AnalysisRole::consumer &&
+         !instance->second.contextuallyBypassed;
+}
+
+std::unique_ptr<EngineHost::PreparedAssetUpdate> EngineHost::createAssetUpdate(
+    RuntimeAsset asset, const bool clear, std::string *error, const std::uint64_t requestRevision) {
+  std::scoped_lock lock(engineMutex_);
+  const auto instance = instances_.find(asset.logicalId);
+  const auto key = static_cast<std::uint64_t>(asset.logicalId) << 32u;
+  if (asset.slot != 0 || instance == instances_.end() ||
+      instance->second.analysisRole != AnalysisRole::consumer || assets_.find(key) == assets_.end()) {
+    setError(error, "The instrument is no longer available.");
+    return {};
+  }
+  if (!clear) {
+    const auto capacity = et_kernel_asset_capacity(instance->second.kernelIndex, asset.slot);
+    std::uint64_t footprint = asset.footprintBytes;
+    for (const auto &[cachedKey, cached] : assets_) {
+      if (cachedKey != key && cached.budget == kSfzAssetBudgetBytes) footprint += cached.asset.footprintBytes;
+    }
+    if (!AssetLimits{capacity, kSfzAssetBudgetBytes}.accepts(asset.payload.size(), asset.footprintBytes) ||
+        footprint > kSfzAssetBudgetBytes) {
+      setError(error, "The instrument exceeds the available sample memory.");
+      return {};
+    }
+  }
+  try {
+    auto result = std::make_unique<PreparedAssetUpdate>();
+    result->storage_->asset = std::move(asset);
+    result->storage_->clear = clear;
+    result->storage_->requestRevision = requestRevision;
+    return result;
+  } catch (const std::bad_alloc &) {
+    setError(error, "There is not enough memory to load the instrument.");
+    return {};
+  }
+}
+
+std::uint64_t EngineHost::supersedeAssetRequest(const std::uint32_t logicalId, const std::uint32_t slot) {
+  std::scoped_lock lock(engineMutex_);
+  const auto cached = assets_.find((static_cast<std::uint64_t>(logicalId) << 32u) | slot);
+  return cached == assets_.end() ? 0 : cached->second.requestRevision.fetch_add(1, std::memory_order_acq_rel) + 1;
+}
+
+bool EngineHost::captureAssetUpdate(PreparedAssetUpdate &pending) noexcept {
+  auto &storage = *pending.storage_;
+  const auto instance = instances_.find(storage.asset.logicalId);
+  const auto cached = assets_.find(static_cast<std::uint64_t>(storage.asset.logicalId) << 32u);
+  return cached != assets_.end() &&
+         (storage.requestRevision == 0 || storage.requestRevision == cached->second.requestRevision.load(std::memory_order_acquire)) &&
+         instance != instances_.end() &&
+         engine_->captureInstanceAssetSnapshot(instance->second.instance, storage.asset.slot,
+                                                storage.snapshot) == ET_OK;
+}
+
+bool EngineHost::prepareAssetUpdate(PreparedAssetUpdate &pending) noexcept {
+  auto &storage = *pending.storage_;
+  if (storage.clear) return Engine::prepareInstanceAssetClear(storage.snapshot, storage.update) == ET_OK;
+  const auto &asset = storage.asset;
+  const AssetBeginInfo info{asset.channels, asset.frames, asset.topology, asset.headBlock,
+      asset.rateDivider, asset.pathCount, asset.inputCount, asset.processingChannels,
+      asset.footprintBytes, static_cast<std::uint32_t>(asset.payload.size())};
+  return Engine::prepareInstanceAssetUpdate(storage.snapshot, info, asset.payload.data(),
+      static_cast<std::uint32_t>(asset.payload.size()), asset.formatTag, storage.update) == ET_OK;
+}
+
+bool EngineHost::applyAssetUpdate(PreparedAssetUpdate &pending) noexcept {
+  auto &storage = *pending.storage_;
+  const auto current = assets_.find(static_cast<std::uint64_t>(storage.asset.logicalId) << 32u);
+  if (current == assets_.end() || (storage.requestRevision != 0 &&
+      storage.requestRevision != current->second.requestRevision.load(std::memory_order_acquire))) return false;
+  storage.applied = engine_->applyInstanceAssetUpdate(storage.update) == ET_OK;
+  if (storage.applied) {
+    const auto cached = assets_.find(static_cast<std::uint64_t>(storage.asset.logicalId) << 32u);
+    if (cached != assets_.end()) cached->second.state.store(
+        storage.clear ? ET_ASSET_STATE_NONE : ET_ASSET_STATE_ACTIVE, std::memory_order_release);
+  }
+  return storage.applied;
+}
+
+void EngineHost::finishAssetUpdate(PreparedAssetUpdate &pending) {
+  std::scoped_lock lock(engineMutex_);
+  auto &storage = *pending.storage_;
+  if (!storage.applied) return;
+  const auto cached = assets_.find(static_cast<std::uint64_t>(storage.asset.logicalId) << 32u);
+  if (cached == assets_.end()) return;
+  // Audio reads only the immutable map key and atomic state. The replay cache
+  // and its old payload are owned solely by control, including reclamation.
+  cached->second.asset = std::move(storage.asset);
 }
 
 bool EngineHost::setAsset(RuntimeAsset asset, std::string *error) {
@@ -852,7 +989,14 @@ bool EngineHost::clearAsset(const std::uint32_t logicalId, const std::uint32_t s
     engine_->abortInstanceAsset(found->second.instance, slot);
   }
   const auto key = (static_cast<std::uint64_t>(logicalId) << 32u) | slot;
-  assets_.erase(key);
+  if (found != instances_.end() && found->second.analysisRole == AnalysisRole::consumer && slot == 0) {
+    auto &cached = assets_[key];
+    cached.asset = {};
+    cached.asset.logicalId = logicalId;
+    cached.requestRevision.fetch_add(1, std::memory_order_acq_rel);
+  } else {
+    assets_.erase(key);
+  }
   assetPreparationLatencyPolling_ = refreshAssetStatesUnlocked();
   const auto instanceLatencyChanged =
       found != instances_.end() &&
@@ -1484,7 +1628,10 @@ void EngineHost::drainTelemetryUnlocked() noexcept {
 }
 
 std::uint32_t EngineHost::readTelemetry(const std::span<std::uint8_t> destination,
-                                        std::uint32_t &droppedFrames) noexcept {
+                                        std::uint32_t &droppedFrames,
+                                        std::map<std::uint32_t, std::uint64_t> *sources) {
+  std::scoped_lock lock(engineMutex_);
+  if (sources) *sources = telemetrySources_;
   const auto read = telemetry_->read.load(std::memory_order_relaxed);
   const auto write = telemetry_->write.load(std::memory_order_acquire);
   if (read == write || destination.empty()) {
@@ -1513,6 +1660,7 @@ std::uint32_t EngineHost::readTelemetry(const std::span<std::uint8_t> destinatio
 }
 
 void EngineHost::discardTelemetry() noexcept {
+  std::scoped_lock lock(engineMutex_);
   const auto read = telemetry_->read.load(std::memory_order_relaxed);
   const auto write = telemetry_->write.load(std::memory_order_acquire);
   std::uint64_t dropped = telemetry_->producerDroppedFrames.exchange(

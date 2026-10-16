@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { readFile, readdir } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import test from 'node:test';
@@ -36,7 +36,7 @@ test('shared history snapshots and restoration retain native logical plugin IDs'
     };
     const history = new HistoryManager({ audioManager, pluginManager, expandedPlugins: new Set(), core: {
       getSerializablePluginState: plugin => ({ nm: plugin.name, en: true, value: plugin.value }),
-      updatePipelineUI() {}
+      updatePipelineUI() {}, updateAllPluginDisplayState() {}
     } });
     const snapshot = history.createSnapshot();
     assert.equal(snapshot.pipelineA[0].id, 42);
@@ -91,6 +91,80 @@ test('bundled Visualizer module graph retains viewport menu clamping', async () 
     clampMenuToViewport(menu);
     assert.deepEqual(menu.style, { left: '4px', top: '4px' });
   } finally { globalThis.window = previousWindow; }
+});
+
+test('Visualizer add-item choices omit Lyrics while retaining every other type', async () => {
+  const { VisualizerEditor } = await assetModule('js/visualizer/visualizer-editor.js');
+  const { ITEM_TYPES, createDefaultLayout } = await assetModule('js/visualizer/visualizer-model.js');
+  const previousDocument = globalThis.document;
+  const reachedChoices = new Error('Reached add-item choices');
+  let choices;
+  globalThis.document = {
+    createElement: () => ({
+      children: [], classList: { add() {} },
+      replaceChildren() { this.children = []; },
+      appendChild(child) { this.children.push(child); return child; }
+    })
+  };
+  try {
+    const editor = {
+      navigationContent: document.createElement('div'), root: document.createElement('div'),
+      view: { layout: createDefaultLayout() }, t: key => key,
+      group: () => document.createElement('div'), button() {},
+      field(_parent, label, _kind, _value, _action, options) {
+        if (label !== 'visualizer.item') return;
+        choices = options.values.map(([type]) => type);
+        throw reachedChoices;
+      }
+    };
+    assert.throws(() => VisualizerEditor.prototype.render.call(editor), error => error === reachedChoices);
+    assert.ok(ITEM_TYPES.includes('lyrics'), 'Lyrics remains a supported saved item type');
+    assert.deepEqual(choices.toSorted(), ITEM_TYPES.filter(type => type !== 'lyrics').toSorted());
+  } finally { globalThis.document = previousDocument; }
+});
+
+test('bundled Visualizer system presets omit only Lyric Stage across all aspects', async () => {
+  const sourceDirectory = new URL('../../external/effetune/presets/visualizer/', import.meta.url);
+  const { VisualizerPresetStore } = await assetModule('js/visualizer/visualizer-preset-store.js');
+  const { ASPECT_FILES } = await assetModule('js/visualizer/visualizer-model.js');
+  const store = new VisualizerPresetStore({ fetch: async url => ({
+    ok: true, json: async () => JSON.parse(await readFile(url, 'utf8'))
+  }) });
+  const bundled = await store.loadSystemPresets();
+  const files = (await readdir(sourceDirectory)).filter(file => file.endsWith('.json')).sort();
+  assert.deepEqual((await readdir(path.join(assets, 'presets/visualizer')))
+    .filter(file => file.endsWith('.json')).sort(), files);
+  for (const file of files) {
+    const expected = JSON.parse(await readFile(new URL(file, sourceDirectory), 'utf8'));
+    delete expected['Lyric Stage'];
+    const actual = JSON.parse(await assetText(`presets/visualizer/${file}`));
+    assert.deepEqual(actual, expected, `${file} retains all other presets, including Cinema Strip`);
+    const aspect = Object.keys(ASPECT_FILES).find(aspect => ASPECT_FILES[aspect] === file);
+    assert.deepEqual(bundled[aspect], expected);
+  }
+});
+
+test('existing Lyrics layouts survive normalization, sharing and same-name user preset storage', async () => {
+  const { normalizeLayout, snapshotLayout, encodeLayoutShare, decodeLayoutShare } =
+    await assetModule('js/visualizer/visualizer-model.js');
+  const { VisualizerPresetStore } = await assetModule('js/visualizer/visualizer-preset-store.js');
+  const upstream = JSON.parse(await readFile(new URL(
+    '../../external/effetune/presets/visualizer/16x9.json', import.meta.url), 'utf8'));
+  const original = upstream['Lyric Stage'];
+  const lyrics = original.items.filter(item => item.type === 'lyrics');
+  assert.ok(lyrics.length > 0);
+  const normalized = normalizeLayout(original);
+  assert.deepEqual(normalized.items.filter(item => item.type === 'lyrics'), lyrics);
+  const snapshot = snapshotLayout(original);
+  assert.deepEqual(decodeLayoutShare(encodeLayoutShare(original)), snapshot);
+  const saved = new Map();
+  const store = new VisualizerPresetStore();
+  store.request = async (_name, _mode, action) => action({
+    put: (layout, name) => saved.set(name, structuredClone(layout)),
+    get: name => saved.get(name)
+  });
+  await store.saveUserPreset('Lyric Stage', original);
+  assert.deepEqual(await store.getUserPreset('Lyric Stage'), snapshot);
 });
 
 test('bundled Visualizer reads transient host metadata without an internal player', async () => {
@@ -257,6 +331,8 @@ test('startup navigation waits for native readiness and settles before revealing
         initializeAudioWorklet: async () => true,
         initializeAndBuildPipeline: async () => { assert.equal(await audioManager.rebuildPipeline(), ''); return true; },
         setupEventListeners() {}, handleErrors() {}, scheduleDeferredStartupTasks() {},
+        hasSavedPipelineState: async () => true,
+        maybeStartOnboardingTour: async () => {},
         processCommandLineArguments: async () => { startupContentHandled = true; } });
       window.app = app;
       const initialized = app.initialize();
@@ -378,48 +454,53 @@ test('bundled settings persist supported choices and restore rejected edits', as
   } finally { Object.assign(globalThis, previous); }
 });
 
-test('SFZ native folder selection preserves cancellation and offers multiple instruments', async () => {
-  const source = await assetText('plugins/others/sfz_note_player.js');
+test('SFZ browser imports files or folders, preserves cancellation and loads a selected instrument', async () => {
   const { NativeSfzLibraryService } = await assetModule('js/sfz/native-service.js');
-  for (const cancelled of [true, false]) {
+  const { openSfzLibraryBrowser } = await assetModule('js/sfz/browser.js');
+  for (const mode of ['files', 'folder']) for (const cancelled of [true, false]) {
     const banks = ['a', 'b'].map((letter, index) => ({ id: letter.repeat(24), name: `Instrument ${index}`,
-      selectedPath: `instrument-${index}.sfz` }));
+      selectedPath: `instrument-${index}.sfz`, importedAt: `2026-10-${14 + index}T00:00:00Z` }));
     const calls = [];
+    let registered = [];
     const context = await bootstrap(async serialized => {
       const call = JSON.parse(serialized);
       calls.push(call);
+      if (call.type === 'sfz/list') return { ok: true, data: registered };
+      assert.equal(call.type, 'sfz/select');
+      if (!cancelled) registered = banks;
       return { ok: true, data: cancelled ? null : { banks } };
     });
-    assert.equal(context.window.electronAPI.sfzLibraryV1.apiVersion, 1);
-    context.PluginBase = class {
-      registerProcessor() {}
-      createCheckboxControl() { return new Element('div'); }
-      createParameterControl() { return new Element('div'); }
-    };
-    vm.runInNewContext(source, context);
-    const plugin = new context.window.SFZNotePlayerPlugin();
     const service = new NativeSfzLibraryService(context.window.electronAPI.sfzLibraryV1);
+    service.readMetadata = null;
     const loaded = [];
-    Object.assign(plugin, { id: 7, _refreshBanks: async () => {}, _renderStatus() {}, _showLoadNotice() {},
-      _noteControl: () => new Element('div'), _resetLoadNotice() {}, updateParameters() {},
-      _getLibraryService: async () => service, _loadBank: async () => { loaded.push(plugin.sf); } });
-    const ui = plugin.createUI();
-    const folderButton = flatten(ui).find(element => element.tagName === 'BUTTON' && /Folder/.test(element.textContent));
-    assert.equal(folderButton.textContent, 'Select SFZ Folder…');
-    assert.equal(plugin._importRow.children[1].textContent, 'Select');
-    plugin.sf = 'c'.repeat(24);
-    const pending = plugin._selectNativeFolder();
-    if (!cancelled) {
-      await until(() => typeof plugin._finishImportSelection === 'function');
-      assert.equal(plugin._importRow.hidden, false);
-      assert.deepEqual(plugin._importChoices.children.map(option => option.value), banks.map(bank => bank.id));
-      plugin._finishImportSelection(banks[1].id);
+    const previous = { document: globalThis.document, window: globalThis.window };
+    Object.assign(globalThis, { document: context.document, window: context.window });
+    try {
+      const browser = openSfzLibraryBrowser({ service, onLoad: entry => loaded.push(entry.id) });
+      await browser.render();
+      const button = flatten(browser.element).find(node => node.tagName === 'BUTTON' &&
+        node.textContent === (mode === 'files' ? 'Import files…' : 'Import folder…'));
+      await button.click();
+      const selection = calls.filter(call => call.type === 'sfz/select');
+      assert.equal(selection.length, 1);
+      assert.deepEqual(selection[0].payload, { mode });
+      const rows = flatten(browser.element).filter(node => node.classList.contains('ir-library-entry'));
+      assert.equal(rows.length, cancelled ? 0 : 2);
+      if (!cancelled) {
+        assert.deepEqual((await service.list()).map(entry => entry.importedAt), banks.map(bank => bank.importedAt));
+        const sort = flatten(browser.element).find(node => node.tagName === 'SELECT');
+        sort.value = 'recent';
+        await sort.dispatch('change');
+        const recent = byClass(browser.element, 'ir-library-entry');
+        assert.equal(flatten(recent).find(node => node.tagName === 'STRONG').textContent, banks[1].name);
+        await flatten(recent).find(node => node.tagName === 'BUTTON' && node.textContent === 'Load').click();
+        assert.deepEqual(loaded, [banks[1].id]);
+      } else assert.deepEqual(loaded, []);
+      browser.dispose();
+    } finally {
+      if (previous.document === undefined) delete globalThis.document; else globalThis.document = previous.document;
+      if (previous.window === undefined) delete globalThis.window; else globalThis.window = previous.window;
     }
-    await pending;
-    assert.equal(calls.length, 1);
-    assert.equal(calls[0].type, 'sfz/select');
-    assert.equal(plugin.sf, cancelled ? 'c'.repeat(24) : banks[1].id);
-    assert.deepEqual(loaded, cancelled ? [] : [banks[1].id]);
   }
 });
 
@@ -577,6 +658,90 @@ test('SFZ stat probes upstream WAV headers past JUNK chunks without reading samp
   assert.equal(calls.at(-1).type, 'sfz/closeRead');
 });
 
+test('native SFZ preparation resolves ARIA bank definitions passed through the bridge', async () => {
+  const { NativeSfzLibraryService } = await assetModule('js/sfz/native-service.js');
+  const entry = { id: 'e'.repeat(24), name: 'ARIA tone', selectedPath: 'program.sfz',
+    bankPaths: ['instrument.bank.xml'], importedAt: '2026-10-15T00:00:00Z' };
+  const files = new Map([
+    ['program.sfz', new TextEncoder().encode('<region> sample=$tone key=60')],
+    ['instrument.bank.xml', new TextEncoder().encode(
+      '<AriaBank><AriaElement path="program.sfz"/><Define name="$tone" value="*sine"/></AriaBank>')]
+  ]);
+  const reads = [];
+  let current;
+  const context = await bootstrap(async serialized => {
+    const { type, payload } = JSON.parse(serialized);
+    if (type === 'sfz/list') return { ok: true, data: [entry] };
+    if (type === 'sfz/openRead') {
+      reads.push(payload.relativePath);
+      current = files.get(payload.relativePath);
+      return { ok: true, data: current ? { readId: sfzReadId, size: current.length } : null };
+    }
+    if (type === 'sfz/readChunk') return { ok: true, data: {
+      base64: Buffer.from(current.subarray(payload.offset, payload.offset + payload.length)).toString('base64') } };
+    if (type === 'sfz/closeRead') return { ok: true };
+    throw new Error(`Unexpected ARIA operation ${type}`);
+  });
+  const service = new NativeSfzLibraryService(context.window.electronAPI.sfzLibraryV1);
+  assert.equal((await service.list())[0].importedAt, entry.importedAt);
+  const prepared = await service.prepare(entry.id);
+  assert.equal(prepared.regionCount, 1);
+  assert.ok(prepared.descriptor.payload instanceof ArrayBuffer);
+  assert.deepEqual(reads, ['program.sfz', 'instrument.bank.xml']);
+});
+
+test('bundled tour teaches DAW workflows, persists first run and supports manual reopening', async () => {
+  const { OnboardingTour, TOUR_STEPS, shouldAutoStart } = await assetModule('js/ui/onboarding-tour.js');
+  const context = await bootstrap(async () => ({ ok: true }));
+  const previous = { document: globalThis.document, window: globalThis.window };
+  Object.assign(globalThis, { document: context.document, window: context.window });
+  Object.assign(context.window, { innerWidth: 1000, innerHeight: 800 });
+  context.document.createElement = tag => Object.assign(new Element(tag), {
+    style: {}, getBoundingClientRect: () => ({ width: 300, height: 200 })
+  });
+  const targets = new Map(TOUR_STEPS.filter(step => step.target).map(step => [step.target,
+    Object.assign(new Element('button'), { scrollIntoView() {}, getClientRects: () => [] })]));
+  context.document.querySelector = selector => targets.get(selector);
+  const locale = vm.runInNewContext(`(${await assetText('js/locales/en.json5')})`);
+  const saved = [];
+  const manager = { layoutMode: { isMobile: false, onChange() {} },
+    pluginListManager: { collapseManager: { isCollapsed: false } },
+    t: key => locale[key] || key };
+  const tour = new OnboardingTour(manager, { saveConfig: async (_electron, config) => saved.push(config) });
+  try {
+    assert.equal(shouldAutoStart({ initialized: true }), true);
+    assert.equal(shouldAutoStart({ initialized: true, hasSavedPipelineState: true }), false);
+    tour.start();
+    await Promise.resolve();
+    assert.equal(saved[0].onboardingTourShown, true);
+    assert.equal(shouldAutoStart({ initialized: true, config: saved[0] }), false);
+    for (const [index, step] of TOUR_STEPS.entries()) {
+      tour.showStep(index);
+      assert.equal(tour.root.attributes.get('data-step'), step.id);
+      assert.ok(!/Open music|Music Library|Audio Configuration|What's this app/.test(tour.body.textContent));
+      if (step.id === 'sound') {
+        assert.equal(step.target, '#pipeline');
+        assert.match(tour.body.textContent, /DAW/);
+      }
+      if (step.id === 'views') assert.equal(step.target, '#visualizerButton');
+      if (step.id === 'help') assert.match(tour.body.textContent, /Settings.*Help/);
+    }
+    tour.end(true);
+    const source = await assetText('js/ui-manager.js');
+    const manual = source.match(/    async startOnboardingTour\(\) \{[\s\S]*?\n    \}/)[0];
+    const Navigation = vm.runInNewContext(`(class { ${manual} })`);
+    const navigation = Object.assign(new Navigation(), { localizationReady: Promise.resolve(),
+      showEffectPipelineView: async () => true, onboardingTour: tour });
+    assert.equal(await navigation.startOnboardingTour(), true);
+    assert.equal(tour.isActive, true);
+    assert.equal(tour.stepIndex, 0);
+  } finally {
+    tour.end(true);
+    if (previous.document === undefined) delete globalThis.document; else globalThis.document = previous.document;
+    if (previous.window === undefined) delete globalThis.window; else globalThis.window = previous.window;
+  }
+});
+
 test('SFZ stat uses upstream AIFF and FLAC metadata and handles short or missing files', async () => {
   // Match the compact header fixtures used by the upstream native SFZ tests.
   const flac = Buffer.alloc(42);
@@ -653,6 +818,7 @@ class Element {
   }
   click() { return this.dispatch('click'); }
   setAttribute(name, value) { this.attributes.set(name, String(value)); }
+  removeAttribute(name) { this.attributes.delete(name); }
   querySelectorAll() { return []; }
   focus() { globalThis.document.activeElement = this; }
 }
@@ -821,6 +987,30 @@ test('shared Visualizer sources report readiness, decode host-rate telemetry and
     listeners.get('dspReady')();
     descriptor = messages.filter(message => message.type === 'setVisualizerSources').at(-1).sources[0];
     assert.notEqual(descriptor.tapId, resumed.tapId);
+    const { createDefaultLayout, createItem, normalizeEffect, encodeLayoutShare, decodeLayoutShare } =
+      await assetModule('js/visualizer/visualizer-model.js');
+    const custom = createItem('analog-meter', 'custom-meter');
+    Object.assign(custom.params, { md: 'Custom', de: 'RMS', it: 2, nr: 1000, os: 3, dc: 3 });
+    custom.effects = [normalizeEffect({ type: 'edge-fade', shape: 'circle', circleWidth: 0.4 })];
+    const layout = createDefaultLayout();
+    layout.items = [custom];
+    const restored = decodeLayoutShare(encodeLayoutShare(layout));
+    assert.equal(restored.items[0].params.md, 'Custom');
+    assert.equal(restored.items[0].params.dc, 3);
+    assert.equal(restored.items[0].effects[0].circleWidth, 0.4);
+    sources.setLayout(restored);
+    const meter = messages.filter(message => message.type === 'setVisualizerSources').at(-1).sources[0];
+    assert.equal(meter.type, 'AnalogMeterPlugin');
+    assert.deepEqual(Array.from(meter.params), [6, 2, 5, 1.5, 1, 1000, 3]);
+    restored.items[0].params.dc = 4;
+    sources.setLayout(restored);
+    assert.equal(messages.filter(message => message.type === 'setVisualizerSources').at(-1).sources[0].tapId, meter.tapId,
+      'changing the dial preserves the running native analyzer');
+    restored.items[0].params.de = 'True Peak';
+    sources.setLayout(restored);
+    const changedMeter = messages.filter(message => message.type === 'setVisualizerSources').at(-1).sources[0];
+    assert.notEqual(changedMeter.tapId, meter.tapId);
+    assert.equal(changedMeter.params[4], 3, 'the selected detector reaches the native parameter block');
     sources.setVisible(false);
     assert.equal(messages.filter(message => message.type === 'setVisualizerSources').at(-1).sources.length, 0);
     sources.dispose();
@@ -829,6 +1019,63 @@ test('shared Visualizer sources report readiness, decode host-rate telemetry and
     if (previous.document === undefined) delete globalThis.document; else globalThis.document = previous.document;
     if (previous.window === undefined) delete globalThis.window; else globalThis.window = previous.window;
   }
+});
+
+test('bundled Pitch Meter scopes telemetry counters and fences to the native source', async () => {
+  const { TelemetryHub } = await assetModule('js/audio/telemetry-hub.js');
+  const hub = new TelemetryHub();
+  const context = vm.createContext({
+    window: { dspTelemetryHub: hub },
+    PluginBase: class {
+      constructor() { this.enabled = true; this._sectionEnabled = true; }
+      registerProcessor() {}
+    }
+  });
+  for (const file of ['note_spectrogram', 'pitch_meter']) {
+    vm.runInContext(await assetText(`plugins/analyzer/${file}.js`), context);
+  }
+  const pitch = new context.window.PitchMeterPlugin();
+  pitch.id = 42;
+  assert.equal(pitch.ensureDspTelemetrySubscription(), true);
+  const send = (instanceId, frameIndex, generation, timeSeconds, midi) => {
+    hub.setSources({ 42: { instanceId } });
+    const packet = new ArrayBuffer(16 + 44);
+    const view = new DataView(packet);
+    view.setUint16(0, 26, true); view.setUint16(2, 1, true);
+    view.setUint32(4, 42, true); view.setUint16(12, 44, true);
+    view.setFloat32(16, 48000, true); view.setFloat32(20, timeSeconds, true);
+    view.setFloat32(24, 0.01, true); view.setUint32(28, frameIndex, true);
+    view.setUint32(32, generation, true); view.setFloat32(36, 440, true);
+    view.setFloat32(40, midi, true); view.setFloat32(44, 0, true);
+    view.setFloat32(48, 0.9, true); view.setFloat32(52, -12, true);
+    view.setUint16(56, 1, true);
+    hub.handleMessage({ type: 'dspTelemetry', packet, bytes: packet.byteLength });
+    assert.equal(hub.getStats().subscriberErrors, 0);
+  };
+  send(1, 100, 4, 10, 69);
+  assert.equal(pitch.currentNote, 'A4');
+  send(2, 0, 4, 0, 72);
+  assert.equal(pitch.currentNote, 'C5', 'a replacement can restart frames in the same generation');
+  assert.equal(pitch.lastFrameIndex, 0);
+  assert.equal(pitch.writeColumn, 1, 'history belongs to the replacement source');
+  send(2, 1, 4, 0.01, 74);
+  assert.equal(pitch.currentNote, 'D5');
+  send(2, 0, 4, 0, 76);
+  send(2, 2, 2, 0.02, 76);
+  assert.equal(pitch.currentNote, 'D5', 'same-source stale frames and generations stay rejected');
+  pitch.beginTelemetryEpoch();
+  assert.equal(pitch.generationFence, 4);
+  assert.ok(pitch.timeFence > 0);
+  send(2, 2, 4, 0, 76);
+  assert.equal(pitch.currentNote, '', 'same-source frames cannot bypass the epoch fences');
+  send(3, 0, 2, 0, 76);
+  assert.equal(pitch.currentNote, 'E5', 'a replacement clears the previous generation and time fences');
+  assert.equal(pitch.activeGeneration, 2);
+  assert.equal(pitch.lastFrameIndex, 0);
+  assert.equal(pitch.writeColumn, 1);
+  send(3, 1, 1, 0.01, 77);
+  assert.equal(pitch.currentNote, 'E5', 'older generations still fail after replacement');
+  pitch.disposeDspTelemetrySubscription();
 });
 
 test('bundled JSZip patch preserves cross-realm Uint8Array and ArrayBuffer bytes', async () => {

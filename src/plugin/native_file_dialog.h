@@ -4,10 +4,12 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace effetune::vst::plugin {
 
 [[nodiscard]] std::optional<std::filesystem::path> chooseSfzFolder();
+[[nodiscard]] std::vector<std::filesystem::path> chooseSfzFiles();
 [[nodiscard]] std::optional<std::filesystem::path> choosePresetToOpen();
 [[nodiscard]] std::optional<std::filesystem::path>
 choosePresetToSave(std::string_view defaultName);

@@ -1741,14 +1741,27 @@ int main(const int argc, char **argv) {
                 plugin = window.pluginManager.createPlugin('SFZ Note Player');
                 const ui = plugin.createUI();
                 const buttons = [...ui.querySelectorAll('button')].map(button => button.textContent);
-                if (!buttons.includes('Select SFZ Folder…') || buttons.includes('Import Folder…'))
-                  throw new Error('Native selection controls unavailable');
-                stage = 'SFZ native folder selection';
+                if (!buttons.includes('SFZ Library…'))
+                  throw new Error('SFZ library control unavailable');
+                stage = 'SFZ browser folder selection';
                 service = await plugin._getLibraryService();
                 const { NativeSfzLibraryService } = await import('./js/sfz/native-service.js');
                 if (!(service instanceof NativeSfzLibraryService) || service.backend)
                   throw new Error('Shared native SFZ library not selected');
-                const selected = await service.selectFolder();
+                await plugin._openLibraryBrowser();
+                const browser = plugin._libraryBrowser;
+                if (!browser) throw new Error('SFZ browser unavailable');
+                const folderButton = [...browser.element.querySelectorAll('button')]
+                  .find(button => button.textContent === 'Import folder…');
+                if (!folderButton) throw new Error('Native folder import unavailable');
+                folderButton.click();
+                const importDeadline = Date.now() + 10000;
+                while (folderButton.disabled || browser.element.querySelectorAll('.ir-library-entry').length !== 2) {
+                  if (Date.now() >= importDeadline) throw new Error('SFZ browser import did not finish');
+                  await new Promise(resolve => setTimeout(resolve, 10));
+                }
+                const selected = await service.list();
+                browser.dispose();
                 registeredIds = selected.map(entry => entry.id);
                 if (selected.length !== 2) throw new Error('Folder instruments unavailable');
                 bankId = selected.find(entry => entry.name === 'instrument.sfz')?.id;
@@ -1802,6 +1815,17 @@ int main(const int argc, char **argv) {
                 renderer.draw(layout, sources, null, performance.now() / 1000);
                 if (renderer.layers.get(item.id)?.display?.type !== 'guitar')
                   throw new Error('Guitar renderer unavailable');
+                stage = 'Edge Fade canvas mask';
+                const { applyEdgeFade } = await import('./js/visualizer/visualizer-effects.js');
+                const mask = document.createElement('canvas');
+                mask.width = canvas.width; mask.height = canvas.height;
+                const ctx = canvas.getContext('2d');
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+                applyEdgeFade(ctx, mask, { shape: 'rectangle', top: 1, bottom: 0, left: 0, right: 0 }, 1);
+                const topAlpha = ctx.getImageData(160, 0, 1, 1).data[3];
+                const bottomAlpha = ctx.getImageData(160, 179, 1, 1).data[3];
+                if (topAlpha > 4 || bottomAlpha < 250) throw new Error('Edge Fade mask did not fade item opacity');
                 window.__vstUpstream213Ready = true;
               } catch (error) {
                 window.__vstUpstream213Error = `${stage}: ${error.message}`;

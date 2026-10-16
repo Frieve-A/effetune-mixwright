@@ -441,6 +441,11 @@ bool MessageRouter::decode(const std::string_view json, RoutedUiMessage &message
         type == "sfz/openRead" || type == "sfz/readChunk" || type == "sfz/closeRead") {
       decoded.action = UiAction::sfzLibrary;
       decoded.path = type.substr(4);
+      const auto mode = payload["mode"].getWithDefault<std::string>("folder");
+      if (type == "sfz/select" && mode != "folder" && mode != "files") {
+        setError(error, "Invalid SFZ selection mode");
+        return false;
+      }
       decoded.content = choc::json::toString(payload);
     } else if (type == "host/getInfo") {
       decoded.action = UiAction::hostInfo;

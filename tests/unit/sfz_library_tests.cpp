@@ -72,6 +72,7 @@ void testLibrary(const fs::path &directory) {
   write(root / "first.sfz", "#include \"include/regions.sfzinc\"\n");
   write(root / "nested/second.SFZ", "<region> sample=samples/tone.wav");
   write(root / "include/regions.sfzinc", "<region> sample=samples/tone.wav");
+  write(root / "Example.bank.xml", "<AriaBank><Define name='sample' value='samples/tone.wav'/></AriaBank>");
   const std::string sample(SfzLibrary::chunkBytes * 2 + 17, 'z');
   write(root / "samples/tone.wav", sample);
   const auto registry = directory / "settings/sfz-references.json";
@@ -80,9 +81,16 @@ void testLibrary(const fs::path &directory) {
   expect(selected.size() == 2 && selected[0]["selectedPath"].getString() == "first.sfz",
          "all instruments retain relative paths");
   const auto id = selected[0]["id"].get<std::string>();
+  expect(selected[0]["bankPaths"].size() == 1 &&
+         selected[0]["bankPaths"][0].getString() == "Example.bank.xml" &&
+         selected[0]["importedAt"].getString().length() == 24,
+         "selection exposes bank definitions and an ISO import timestamp");
   expect(id.size() == 24, "cryptographic reference identifier");
   expect(selectFolder(library, root / ".")[0]["id"].getString() == id, "canonical reselect preserves identifier");
   SfzLibrary reopened(registry);
+  expect(call(reopened, "list")["data"][0]["bankPaths"][0].getString() == "Example.bank.xml" &&
+         call(reopened, "list")["data"][0]["importedAt"].isString(), "bank metadata survives reopening");
+  expect(readAll(reopened, id, "Example.bank.xml").starts_with("<AriaBank>"), "bank definitions use bounded reference reads");
   expect(call(reopened, "list")["data"].size() == 2, "registry survives reopening");
   expect(selectFolder(reopened, fs::canonical(root))[0]["id"].getString() == id, "identifier survives reopening");
   expect(readAll(library, id, "samples/tone.wav") == sample, "multi-chunk sample read is exact");
@@ -108,7 +116,7 @@ void testLibrary(const fs::path &directory) {
   auto closeHeld = choc::value::createObject({}); closeHeld.addMember("readId", heldId);
   expect(call(library, "closeRead", closeHeld)["data"].getBool(), "failed logical read can be closed");
   const auto metadata = choc::json::parse(contents(registry));
-  expect(metadata[0].size() == 4 && metadata[0]["path"].isString() && metadata[0]["root"].isString(),
+  expect(metadata[0].size() == 6 && metadata[0]["path"].isString() && metadata[0]["root"].isString(),
          "registry stores only reference metadata");
   for (const auto &file : fs::recursive_directory_iterator(directory))
     expect(file.path().extension() != ".sfzbank", "never creates copied SFZ banks");
@@ -156,6 +164,36 @@ void testLibrary(const fs::path &directory) {
          "corrupt registry cannot be overwritten by mutation");
   write(registry, std::string(1024 * 1024 + 1, ' '));
   expect(call(library, "list")["code"].getString() == "too-large", "bounded registry read");
+}
+void testSelectedFilesAndLegacyMetadata(const fs::path &directory) {
+  const auto root = directory / "selected-files";
+  const auto registry = directory / "files-registry/references.json";
+  write(root / "selected.sfz", "<region> sample=samples/tone.wav");
+  write(root / "unselected.sfz", "unselected");
+  write(root / "nested/also-unselected.sfz", "unselected");
+  write(root / "bank.bank.xml", "bank definition");
+  SfzLibrary library(registry);
+  const auto selected = choc::json::parse(library.request("select", R"({"mode":"files"})", {},
+      {root / "selected.sfz"}));
+  expect(selected["ok"].getBool() && selected["data"]["banks"].size() == 1 &&
+         call(library, "list")["data"].size() == 1, "file mode registers only chosen instruments");
+  const auto id = selected["data"]["banks"][0]["id"].get<std::string>();
+  expect(readAll(library, id, "bank.bank.xml") == "bank definition", "file mode exposes sibling bank XML");
+  auto legacy = choc::json::parse(contents(registry));
+  auto entry = choc::value::createObject({});
+  for (const auto key : {"id", "name", "path", "root"}) entry.addMember(key, legacy[0][key]);
+  auto array = choc::value::createEmptyArray(); array.addArrayElement(entry);
+  write(registry, choc::json::toString(array));
+  expect(call(library, "list")["ok"].getBool() && readAll(library, id, "selected.sfz").starts_with("<region>"),
+         "old registry entries without metadata remain readable");
+  for (const auto path : {"../escape.bank.xml", "/absolute.bank.xml", "x/../../escape.bank.xml", "..\\escape.bank.xml"}) {
+    auto invalid = entry;
+    auto banks = choc::value::createEmptyArray(); banks.addArrayElement(std::string(path));
+    invalid.addMember("bankPaths", std::move(banks));
+    auto bad = choc::value::createEmptyArray(); bad.addArrayElement(std::move(invalid));
+    write(registry, choc::json::toString(bad));
+    expect(!call(library, "list")["ok"].getBool(), "registry rejects escaping bank references");
+  }
 }
 void testConcurrent(const fs::path &directory) {
   const auto registry = directory / "concurrent/sfz-references.json";
@@ -318,7 +356,7 @@ int main(int argc, char **argv) {
       std::chrono::steady_clock::now().time_since_epoch().count()));
   try {
     fs::create_directories(directory); directory = fs::canonical(directory);
-    testLibrary(directory); testConcurrent(directory);
+    testLibrary(directory); testSelectedFilesAndLegacyMetadata(directory); testConcurrent(directory);
     testConcurrentProcesses(directory, fs::canonical(fs::absolute(argv[0])));
     fs::remove_all(directory);
     std::cout << "SFZ direct-reference tests passed\n"; return 0;

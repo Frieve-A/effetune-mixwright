@@ -8,6 +8,8 @@
 #include <cctype>
 #include <cerrno>
 #include <cstdint>
+#include <chrono>
+#include <ctime>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -74,6 +76,12 @@ bool isSfz(const fs::path &path) {
                  [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
   return extension == ".sfz";
 }
+bool isBankXml(const fs::path &path) {
+  auto name = utf8(path.filename());
+  std::transform(name.begin(), name.end(), name.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return name.ends_with(".bank.xml");
+}
 bool missing(const std::error_code &error) {
   return error == std::errc::no_such_file_or_directory || error == std::errc::not_a_directory;
 }
@@ -137,12 +145,21 @@ private:
 #endif
 };
 
-struct Entry { std::string id, name; fs::path path, root; };
+struct Entry {
+  std::string id, name;
+  fs::path path, root;
+  std::vector<fs::path> bankPaths;
+  std::string importedAt;
+};
 Value publicEntry(const Entry &entry) {
   auto result = choc::value::createObject({});
   result.addMember("id", entry.id);
   result.addMember("name", entry.name);
   result.addMember("selectedPath", utf8(entry.path.lexically_relative(entry.root)));
+  auto banks = choc::value::createEmptyArray();
+  for (const auto &path : entry.bankPaths) banks.addArrayElement(utf8(path));
+  result.addMember("bankPaths", std::move(banks));
+  if (!entry.importedAt.empty()) result.addMember("importedAt", entry.importedAt);
   return result;
 }
 std::vector<Entry> load(const fs::path &path) {
@@ -168,12 +185,29 @@ std::vector<Entry> load(const fs::path &path) {
     require(item.isObject() && item["id"].isString() && item["name"].isString() &&
             item["path"].isString() && item["root"].isString(), "Invalid SFZ registry entry");
     Entry entry{item["id"].get<std::string>(), item["name"].get<std::string>(),
-                fromUtf8(item["path"].get<std::string>()), fromUtf8(item["root"].get<std::string>())};
+                fromUtf8(item["path"].get<std::string>()), fromUtf8(item["root"].get<std::string>()), {}, {}};
     require(validId(entry.id) && entry.path.is_absolute() && entry.root.is_absolute() &&
             entry.path == entry.path.lexically_normal() && entry.root == entry.root.lexically_normal() &&
             within(entry.root, entry.path) && isSfz(entry.path) &&
             utf8(entry.path).find('\0') == std::string::npos &&
             utf8(entry.root).find('\0') == std::string::npos, "Invalid SFZ reference");
+    const auto banks = item["bankPaths"];
+    require(banks.isVoid() || (banks.isArray() && banks.size() <= entryLimit), "Invalid SFZ bank paths");
+    if (banks.isArray()) for (const auto bank : banks) {
+      require(bank.isString(), "Invalid SFZ bank path");
+      const auto bankPath = bank.get<std::string>();
+      const auto relative = fromUtf8(bankPath);
+      require(!bankPath.empty() && bankPath.find('\0') == std::string::npos &&
+              bankPath.find(':') == std::string::npos && bankPath.find('\\') == std::string::npos && !relative.has_root_path() &&
+              relative == relative.lexically_normal() && isBankXml(relative), "Invalid SFZ bank path");
+      for (const auto &part : relative) require(part != "..", "Invalid SFZ bank traversal");
+      entry.bankPaths.push_back(relative);
+    }
+    const auto timestamp = item["importedAt"];
+    require(timestamp.isVoid() || timestamp.isString(), "Invalid SFZ import time");
+    entry.importedAt = timestamp.getWithDefault<std::string>({});
+    require(entry.importedAt.size() <= 32 && entry.importedAt.find('\0') == std::string::npos,
+            "Invalid SFZ import time");
     require(std::none_of(entries.begin(), entries.end(), [&](const Entry &old) {
       return old.id == entry.id || samePath(old.path, entry.path);
     }), "Duplicate SFZ reference");
@@ -188,6 +222,10 @@ void save(const fs::path &path, const std::vector<Entry> &entries) {
     auto value = choc::value::createObject({});
     value.addMember("id", entry.id); value.addMember("name", entry.name);
     value.addMember("path", utf8(entry.path)); value.addMember("root", utf8(entry.root));
+    auto banks = choc::value::createEmptyArray();
+    for (const auto &bank : entry.bankPaths) banks.addArrayElement(utf8(bank));
+    value.addMember("bankPaths", std::move(banks));
+    value.addMember("importedAt", entry.importedAt);
     array.addArrayElement(std::move(value));
   }
   const auto text = choc::json::toString(array);
@@ -302,7 +340,8 @@ struct SfzLibrary::Impl {
   std::mutex mutex;
   std::map<std::string, std::unique_ptr<ReadFile>> reads;
 
-  Value perform(std::string_view operation, ValueView payload, const fs::path &folder) {
+  Value perform(std::string_view operation, ValueView payload, const fs::path &folder,
+                const std::vector<fs::path> &selectedFiles) {
     if (operation == "closeRead") { reads.erase(identifier(payload, "readId")); return Value(true); }
     if (operation == "readChunk") {
       const auto found = reads.find(identifier(payload, "readId"));
@@ -329,11 +368,22 @@ struct SfzLibrary::Impl {
       save(registry, entries); return Value(true);
     }
     if (operation == "select") {
-      if (folder.empty()) return {};
-      const auto root = fs::canonical(folder);
+      const auto filesMode = payload["mode"].getWithDefault<std::string>("folder") == "files";
+      if (filesMode ? selectedFiles.empty() : folder.empty()) return {};
+      if (selectedFiles.size() > entryLimit) throw TooLarge();
+      const auto root = fs::canonical(filesMode ? selectedFiles.front().parent_path() : folder);
       require(fs::is_directory(root), "Invalid SFZ selected folder");
       std::vector<fs::path> files;
+      if (filesMode) for (const auto &selected : selectedFiles) {
+        const auto path = fs::canonical(selected);
+        require(within(root, path) && fs::is_regular_file(path) && isSfz(path), "Invalid SFZ selected file");
+        files.push_back(path);
+      }
+      std::vector<fs::path> bankPaths;
+      std::size_t scanned = 0;
       for (fs::recursive_directory_iterator it(root), end; it != end; ++it) {
+        if (++scanned > 100000) throw TooLarge();
+        if (filesMode && it->is_directory()) it.disable_recursion_pending();
         require(it.depth() <= 32, "SFZ folder exceeds depth limit");
         bool link = it->is_symlink();
 #if defined(_WIN32)
@@ -342,12 +392,31 @@ struct SfzLibrary::Impl {
         if (link) { it.disable_recursion_pending(); continue; }
         const auto path = fs::canonical(it->path());
         require(within(root, path), "SFZ scan escaped its folder");
-        if (it->is_regular_file() && isSfz(path)) {
+        if (it->is_regular_file() && isBankXml(path)) {
+          if (bankPaths.size() >= entryLimit) throw TooLarge();
+          bankPaths.push_back(path.lexically_relative(root));
+        }
+        if (!filesMode && it->is_regular_file() && isSfz(path)) {
           if (files.size() >= entryLimit) throw TooLarge();
           files.push_back(path);
         }
       }
       std::sort(files.begin(), files.end());
+      files.erase(std::unique(files.begin(), files.end()), files.end());
+      std::sort(bankPaths.begin(), bankPaths.end());
+      const auto now = std::chrono::system_clock::now();
+      const auto seconds = std::chrono::system_clock::to_time_t(now);
+      std::tm utc{};
+#if defined(_WIN32)
+      gmtime_s(&utc, &seconds);
+#else
+      gmtime_r(&seconds, &utc);
+#endif
+      std::array<char, 32> importedAt{};
+      const auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000;
+      std::snprintf(importedAt.data(), importedAt.size(), "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
+                    utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday, utc.tm_hour, utc.tm_min, utc.tm_sec,
+                    static_cast<int>(millis));
       auto banks = choc::value::createEmptyArray();
       for (const auto &path : files) {
         auto found = std::find_if(entries.begin(), entries.end(), [&](const Entry &entry) {
@@ -355,9 +424,11 @@ struct SfzLibrary::Impl {
         });
         if (found == entries.end()) {
           if (entries.size() >= entryLimit) throw TooLarge();
-          entries.push_back({randomId(), {}, path, root}); found = std::prev(entries.end());
+          entries.push_back({randomId(), {}, path, root, {}, {}}); found = std::prev(entries.end());
         }
         found->path = path; found->root = root; found->name = utf8(path.lexically_relative(root));
+        found->bankPaths = bankPaths;
+        found->importedAt = importedAt.data();
         banks.addArrayElement(publicEntry(*found));
       }
       save(registry, entries);
@@ -398,14 +469,15 @@ SfzLibrary::SfzLibrary(fs::path registryPath) : impl_(std::make_unique<Impl>(std
 SfzLibrary::~SfzLibrary() = default;
 void SfzLibrary::closeReads() { std::scoped_lock lock(impl_->mutex); impl_->reads.clear(); }
 std::string SfzLibrary::request(std::string_view operation, std::string_view payload,
-                                const fs::path &selectedFolder) {
+                                const fs::path &selectedFolder,
+                                const std::vector<fs::path> &selectedFiles) {
   auto result = choc::value::createObject({});
   try {
     require(payload.size() <= 64u * 1024u, "SFZ request exceeds size limit");
     const auto value = choc::json::parse(payload);
     require(value.isObject(), "Invalid SFZ request object");
     std::scoped_lock lock(impl_->mutex);
-    auto data = impl_->perform(operation, value, selectedFolder);
+    auto data = impl_->perform(operation, value, selectedFolder, selectedFiles);
     result.addMember("ok", true); result.addMember("data", std::move(data));
   } catch (const std::exception &error) {
     std::fprintf(stderr, "SFZ file reference diagnostic: %.*s: %s\n",

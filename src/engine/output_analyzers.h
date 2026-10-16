@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -35,8 +36,10 @@ public:
                              std::uint32_t maxFrames, std::string *error = nullptr);
   void process(float *const *output, std::uint32_t channels,
                std::uint32_t frames, double sampleRate) noexcept;
+  // Control-side snapshot, serialized with source configuration and replacement.
   [[nodiscard]] std::uint32_t readTelemetry(std::span<std::uint8_t> output,
-                                           std::uint32_t &dropped) noexcept;
+                                           std::uint32_t &dropped,
+                                           std::map<std::uint32_t, std::uint64_t> *sources = nullptr);
   void discardTelemetry() noexcept;
   void stopCapture() noexcept { enabled_.store(false, std::memory_order_release); }
 

@@ -252,7 +252,7 @@
   };
   const sfzLibraryV1 = Object.freeze({
     apiVersion: 1,
-    select: () => sfzResponse(() => sfzCall('select')),
+    select: options => sfzResponse(() => sfzCall('select', options)),
     list: () => sfzResponse(() => sfzCall('list')),
     remove: request => sfzResponse(() => sfzCall('remove', request)),
     readRelative: request => sfzResponse(() => withSfzRead(request, async (size, readRange) => {

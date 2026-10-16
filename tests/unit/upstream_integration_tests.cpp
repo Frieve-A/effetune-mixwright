@@ -3,6 +3,7 @@
 #include "engine/engine_host.h"
 #include "engine/output_analyzers.h"
 #include "engine/frequency_preview.h"
+#include "engine.h"
 #include "BassManagementPluginParams.h"
 #include "OscilloscopePluginParams.h"
 #include "PhaseSelectEqPluginParams.h"
@@ -35,6 +36,14 @@
 namespace effetune::vst {
 class EngineHostTestAccess {
 public:
+  static bool processRawTelemetry(EngineHost &host, std::uint32_t logicalId,
+                                  float *audio, double time) {
+    return host.engine_->processInstance(host.resolveInstance(logicalId), audio, 2, 1024, time) == ET_OK;
+  }
+  static std::uint32_t readRawTelemetry(EngineHost &host, std::span<std::uint8_t> output) {
+    std::uint32_t dropped = 0;
+    return host.engine_->readTelemetry(output.data(), static_cast<std::uint32_t>(output.size()), &dropped);
+  }
   static bool analysisSource(const EngineHost &host, std::uint32_t consumer,
                              std::uint32_t producer) {
     const auto found = host.instances_.find(consumer);
@@ -47,6 +56,15 @@ public:
 namespace {
 using namespace effetune::vst;
 void expect(bool value, const char *message) { if (!value) throw std::runtime_error(message); }
+
+template <typename Params> std::vector<float> packedFixture(const Params &params) {
+  const auto *values = reinterpret_cast<const float *>(&params);
+  return {values, values + Params::kFloatCount};
+}
+
+effetune::generated::SFZNotePlayerPluginParams sfzDefaults() {
+  return {.5f, -30, 3, 28, 91, 32, 0, 100, 0, 0, 1, 1, 1, 0, 18, 0, 0, -1, 100};
+}
 
 std::uint32_t u32(const std::uint8_t *data) {
   std::uint32_t result;
@@ -118,10 +136,10 @@ void testOutputAnalyzers() {
       {0xf0000002u, "SpectrogramPlugin", "R", {-96, 10, 0}, 0x3e6e0819u, 1},
       {0xf0000003u, "OscilloscopePlugin", "1", {.01f, 0, 0, 0, .0001f, 0, 0}, effetune::generated::OscilloscopePluginParams::kHash, 1},
       {0xf0000004u, "StereoMeterPlugin", "", {.1f}, 0xb0de3212u, 1},
-      {0xf0000005u, "NoteSpectrogramPlugin", "", {60, 72}, effetune::generated::NoteSpectrogramPluginParams::kHash, 1},
+      {0xf0000005u, "NoteSpectrogramPlugin", "", packedFixture(effetune::generated::NoteSpectrogramPluginParams{60, 72, 1}), effetune::generated::NoteSpectrogramPluginParams::kHash, 1},
       {0xf0000006u, "ChromaSpiralPlugin", "", {}, 0x811c9dc5u, 1},
       {0xf0000007u, "PhaseSelectEqPlugin", "", std::vector<float>(effetune::generated::PhaseSelectEqPluginParams::kFloatCount), effetune::generated::PhaseSelectEqPluginParams::kHash, 1},
-      {0xf0000008u, "AnalogMeterPlugin", "", {0, .3f, 5, 1.5f}, effetune::generated::AnalogMeterPluginParams::kHash, 1},
+      {0xf0000008u, "AnalogMeterPlugin", "", packedFixture(effetune::generated::AnalogMeterPluginParams{0, .3f, 5, 1.5f, 0, .3f, 0}), effetune::generated::AnalogMeterPluginParams::kHash, 1},
       {0xf0000009u, "RhythmAnalyzerPlugin", "", {40, 240, 0}, effetune::generated::RhythmAnalyzerPluginParams::kHash, 1}};
   expect(analyzers.setSources(sources, &error), "all Visualizer analyzers configure");
   std::array<std::array<float, 1024>, 8> audio;
@@ -148,8 +166,8 @@ void testOutputAnalyzers() {
       }
       const auto payload = static_cast<std::uint32_t>(packet[offset + 12]) |
                            (static_cast<std::uint32_t>(packet[offset + 13]) << 8);
-      if (tap == sources[5].tapId) {
-        expect(packet[offset] == 24 && packet[offset + 2] == 5 && payload == 8840,
+      if (tap == sources[5].tapId && packet[offset] == 24) {
+        expect(packet[offset + 2] == 6 && payload == 9192,
                "Note/Guitar source forwards the current revision-rich note packet");
         expect(u32(packet.data() + offset + 36) == 5,
                "note telemetry retains five fine pitch divisions");
@@ -194,6 +212,91 @@ void testOutputAnalyzers() {
   expect(!analyzers.setSources({sources.front(), sources.front()}, &error), "reject duplicate taps");
   RoutedUiMessage message;
   expect(MessageRouter::decode(R"({"type":"visualizer/setSources","payload":{"sources":[{"tapId":4026531840,"type":"LevelMeterPlugin","params":[],"paramsHash":2166136261,"channel":null,"gain":1}]}})", message, &error), "decode upstream analyzer descriptor");
+}
+
+void testTelemetrySourceLifetimes() {
+  auto engine = std::make_unique<EngineHost>();
+  OutputAnalyzers analyzers;
+  std::string error;
+  expect(engine->prepare(48000, 2, 1024, EngineHost::kDefaultTelemetryBytes, &error), "prepare telemetry lifetimes");
+  RuntimePlugin meter;
+  meter.logicalId = 7;
+  meter.tapId = 19;
+  meter.type = "AnalogMeterPlugin";
+  meter.paramsHash = effetune::generated::AnalogMeterPluginParams::kHash;
+  meter.packedParameters = packedFixture(effetune::generated::AnalogMeterPluginParams{0, .3f, 5, 1.5f, 0, .3f, 0});
+  PipelineState pipeline;
+  pipeline.plugins = {PluginState{7, "AnalogMeterPlugin", true}};
+  expect(engine->rebuild(pipeline, {meter}, &error), "build telemetry source");
+  OutputAnalyzerSource output{0xf0000000u, "LevelMeterPlugin", "", {}, 0x811c9dc5u, 1};
+  expect(analyzers.prepare(48000, 2, 1024, &error) && analyzers.setSources({output}, &error),
+         "prepare independent output source");
+  std::map<std::uint32_t, std::uint64_t> pipelineSources, outputSources;
+  std::uint32_t dropped = 0;
+  std::vector<std::uint8_t> packet(EngineHost::kDefaultTelemetryBytes);
+  expect(engine->readTelemetry(packet, dropped, &pipelineSources) == 0 && pipelineSources.size() == 1,
+         "empty poll publishes custom tap identity");
+  const auto first = pipelineSources.at(19);
+  (void)analyzers.readTelemetry(packet, dropped, &outputSources);
+  const auto firstOutput = outputSources.at(output.tapId);
+  meter.packedParameters[0] = 1;
+  expect(engine->updateParameters(7, meter.packedParameters, meter.paramsHash), "update existing telemetry source");
+  pipeline.plugins.front().enabled = false;
+  expect(engine->updateDescriptor(pipeline, &error), "disable existing telemetry source");
+  pipeline.plugins.front().enabled = true;
+  expect(engine->updateDescriptor(pipeline, &error), "enable existing telemetry source");
+  (void)engine->readTelemetry(packet, dropped, &pipelineSources);
+  expect(pipelineSources.at(19) == first, "parameter and enable edits retain source lifetime");
+
+  std::array<float, 2048> audio{};
+  float *channels[]{audio.data(), audio.data() + 1024};
+  const auto render = [&] {
+    for (int i = 0; i < 8; ++i) {
+      effetune::allocation_guard::Scope guard;
+      expect(engine->tryProcessBlock(channels, 2, 1024, i * 1024.0 / 48000, false), "render telemetry without allocation");
+    }
+  };
+  render();
+  expect(engine->readTelemetry(packet, dropped) > 0, "fixture produces queued telemetry");
+  const auto renderRaw = [&] {
+    for (int i = 0; i < 8; ++i)
+      expect(EngineHostTestAccess::processRawTelemetry(*engine, 7, audio.data(), i * 1024.0 / 48000),
+             "fixture produces raw telemetry before host drain");
+  };
+  renderRaw();
+  expect(EngineHostTestAccess::readRawTelemetry(*engine, packet) > 0, "fixture produces undrained native telemetry");
+  render();
+  renderRaw();
+  pipeline.plugins.push_back(PluginState{8, "VolumePlugin", true});
+  RuntimePlugin gain;
+  gain.logicalId = 8;
+  gain.type = "VolumePlugin";
+  gain.paramsHash = engine->kernels().at(gain.type).paramsHash;
+  gain.packedParameters = {0};
+  expect(engine->rebuild(pipeline, {meter, gain}, &error), "add another effect to rebuild sources");
+  expect(engine->readTelemetry(packet, dropped, &pipelineSources) == 0 && pipelineSources.at(19) != first,
+         "rebuild clears queued frames before exposing replacement identity");
+  expect(EngineHostTestAccess::readRawTelemetry(*engine, packet) == 0,
+         "rebuild clears raw frames before the next audio drain can mislabel them");
+  (void)analyzers.readTelemetry(packet, dropped, &outputSources);
+  expect(outputSources.at(output.tapId) == firstOutput, "pipeline rebuild preserves independent output identity");
+  render();
+  expect(engine->readTelemetry(packet, dropped, &pipelineSources) > 0, "replacement source delivers fresh telemetry");
+
+  expect(analyzers.setSources({output}, &error), "retain unchanged output source");
+  (void)analyzers.readTelemetry(packet, dropped, &outputSources);
+  expect(outputSources.at(output.tapId) == firstOutput, "unchanged output configuration retains identity");
+  analyzers.process(channels, 2, 1024, 48000);
+  (void)analyzers.readTelemetry({}, dropped);
+  output.gain = 2;
+  expect(analyzers.setSources({output}, &error), "replace output instance");
+  expect(analyzers.readTelemetry(packet, dropped, &outputSources) == 0 &&
+             outputSources.at(output.tapId) != firstOutput,
+         "output replacement cannot relabel raw telemetry left by a short read");
+  const auto replacementOutput = outputSources.at(output.tapId);
+  expect(analyzers.prepare(96000, 2, 1024, &error), "replace output engine");
+  (void)analyzers.readTelemetry(packet, dropped, &outputSources);
+  expect(outputSources.at(output.tapId) != replacementOutput, "source identity survives engine ID reuse");
 }
 
 void testOutputAnalyzerClockFollowsConsumedAudio() {
@@ -273,6 +376,46 @@ void testOutputAnalyzerClockFollowsConsumedAudio() {
   render();
 }
 
+void testCustomMeterAndLongScope() {
+  OutputAnalyzers analyzers;
+  std::string error;
+  expect(analyzers.prepare(48000, 2, 1024, &error), "prepare updated visualizers");
+  const OutputAnalyzerSource meter{0xf0000000u, "AnalogMeterPlugin", "",
+      packedFixture(effetune::generated::AnalogMeterPluginParams{6, .3f, 5, 1.5f, 0, .3f, 1.25f}),
+      effetune::generated::AnalogMeterPluginParams::kHash, 1};
+  const OutputAnalyzerSource scope{0xf0000001u, "OscilloscopePlugin", "L",
+      packedFixture(effetune::generated::OscilloscopePluginParams{10, 2, 0, 0, .0001f, 0, 0}),
+      effetune::generated::OscilloscopePluginParams::kHash, 1};
+  expect(analyzers.setSources({meter, scope}, &error), "configure Custom meter and ten-second scope");
+  std::array<float, 1024> audio{}; audio.fill(.25f); float *channels[]{audio.data(), audio.data()};
+  std::vector<std::uint8_t> packet(OutputAnalyzers::kTelemetryBytes);
+  bool customSeen = false, longSeen = false;
+  for (int block = 0; block < 80; ++block) {
+    { effetune::allocation_guard::Scope guard; analyzers.process(channels, 2, 1024, 48000); }
+    std::uint32_t dropped = 0;
+    const auto bytes = analyzers.readTelemetry(packet, dropped);
+    expect(dropped == 0, "updated visualizer packets fit the bridge transport");
+    for (std::uint32_t offset = 0; offset + 16 <= bytes;) {
+      const auto tap = u32(packet.data() + offset + 4);
+      const auto payload = static_cast<std::uint32_t>(packet[offset + 12]) |
+                           (static_cast<std::uint32_t>(packet[offset + 13]) << 8);
+      if (tap == meter.tapId) {
+        customSeen = true;
+        expect(packet[offset + 16] == 6 && std::isfinite(f32(packet.data() + offset + 20)),
+               "Custom meter retains its native mode and finite level");
+      }
+      if (tap == scope.tapId) {
+        longSeen = true;
+        expect(packet[offset + 2] == 3 && payload >= 28 && packet[offset + 30] == 2 &&
+               u32(packet.data() + offset + 20) == 480000,
+               "long scope forwards rolling envelope encoding and full ten-second range");
+      }
+      offset += (16u + payload + 3u) & ~3u;
+    }
+  }
+  expect(customSeen && longSeen, "both new visualizer features emit telemetry");
+}
+
 void testInstanceResetAndPreviewMeasurementGate() {
   using Params = effetune::generated::TonalBalanceEQPluginParams;
   auto engine = std::make_unique<EngineHost>();
@@ -300,7 +443,7 @@ void testInstanceResetAndPreviewMeasurementGate() {
   meter.logicalId = 42;
   meter.type = "AnalogMeterPlugin";
   meter.paramsHash = effetune::generated::AnalogMeterPluginParams::kHash;
-  meter.packedParameters = {3, .3f, 5, 1.5f};
+  meter.packedParameters = packedFixture(effetune::generated::AnalogMeterPluginParams{3, .3f, 5, 1.5f, 0, .3f, 0});
   PipelineState pipeline;
   pipeline.plugins = {PluginState{41, "TonalBalanceEQPlugin", true}, PluginState{42, "AnalogMeterPlugin", true}};
   expect(engine->rebuild(pipeline, {tonal, meter}, &error), "build measurement reset pipeline");
@@ -723,8 +866,7 @@ void testSfzAssetAdmissionAndReplay() {
   auto engine = std::make_unique<EngineHost>();
   std::string error;
   expect(engine->prepare(48000, 2, 1024, EngineHost::kDefaultTelemetryBytes, &error), "prepare SFZ");
-  effetune::generated::SFZNotePlayerPluginParams params{
-      .5f, -30, 3, 28, 91, 32, 0, 100, 0, 0, 1, 1, 1, 0, 18, 0};
+  const auto params = sfzDefaults();
   RuntimePlugin runtime;
   runtime.logicalId = 55;
   runtime.type = "SFZNotePlayerPlugin";
@@ -788,9 +930,9 @@ void testNoteAnalysisSharing() {
     return result;
   };
   std::vector<RuntimePlugin> plugins{
-      runtime(1, "NoteSpectrogramPlugin", {28, 91}),
-      runtime(2, "SFZNotePlayerPlugin", {.5f, -30, 3, 28, 91, 32, 0, 100, 0, 0, 1, 1, 1, 0, 18, 0}),
-      runtime(3, "VolumePlugin", {0}), runtime(4, "NoteSpectrogramPlugin", {29, 91}),
+      runtime(1, "NoteSpectrogramPlugin", packedFixture(effetune::generated::NoteSpectrogramPluginParams{28, 91, 1})),
+      runtime(2, "SFZNotePlayerPlugin", packedFixture(sfzDefaults())),
+      runtime(3, "VolumePlugin", {0}), runtime(4, "NoteSpectrogramPlugin", packedFixture(effetune::generated::NoteSpectrogramPluginParams{29, 91, 1})),
       runtime(5, "RhythmAnalyzerPlugin", {60, 180, 0}), runtime(6, "LevelMeterPlugin", {})};
   const PluginState note{1, "Note Spectrogram", true}, sfz{2, "SFZ Note Player", true};
   PipelineState pipeline;
@@ -874,7 +1016,8 @@ void testNoteAnalysisSharing() {
     time += 128.0 / 48000.0;
   }
   route({note, sfz}, 1);
-  const std::array<float, 2> changedRange{29, 91}, restoredRange{28, 91};
+  const auto changedRange = packedFixture(effetune::generated::NoteSpectrogramPluginParams{29, 91, 1});
+  const auto restoredRange = packedFixture(effetune::generated::NoteSpectrogramPluginParams{28, 91, 1});
   expect(engine->updateParameters(1, changedRange, plugins[0].paramsHash), "update source MIDI range");
   render(0);
   auto commands = std::make_unique<AudioCommandQueue>();
@@ -882,7 +1025,7 @@ void testNoteAnalysisSharing() {
   parameters.type = AudioCommandType::setParameters;
   parameters.logicalId = 1;
   parameters.paramsHash = plugins[0].paramsHash;
-  parameters.floatCount = 2;
+  parameters.floatCount = effetune::generated::NoteSpectrogramPluginParams::kFloatCount;
   std::copy(restoredRange.begin(), restoredRange.end(), parameters.packed.begin());
   expect(commands->push(parameters), "enqueue restored analysis range");
   expect(engine->tryProcessBlock(channels, 2, 128, time, false, commands.get()), "apply queued range");
@@ -937,6 +1080,8 @@ void testNoteAnalysisSharing() {
          "load shared and self-analysis banks");
   std::array<float, 128> referenceLeft{}, referenceRight{};
   float *referenceChannels[]{referenceLeft.data(), referenceRight.data()};
+  std::vector<std::uint8_t> timbrePacket(EngineHost::kDefaultTelemetryBytes);
+  bool timbreSeen = false;
   for (int pass = 0; pass < 2; ++pass) {
     engine->reset();
     own->reset();
@@ -958,6 +1103,18 @@ void testNoteAnalysisSharing() {
         ok = engine->tryProcessBlock(channels, 2, frames, at / 48000.0, false) &&
              own->tryProcessBlock(referenceChannels, 2, frames, at / 48000.0, false); }
       expect(ok, "shared and self-analysis variable blocks remain allocation-free");
+      std::uint32_t dropped = 0;
+      const auto bytes = engine->readTelemetry(timbrePacket, dropped);
+      for (std::uint32_t offset = 0; offset + 16 <= bytes;) {
+        const auto payload = static_cast<std::uint32_t>(timbrePacket[offset + 12]) |
+                             (static_cast<std::uint32_t>(timbrePacket[offset + 13]) << 8);
+        if (timbrePacket[offset] == 31) {
+          timbreSeen = true;
+          expect(timbrePacket[offset + 2] == 1 && payload == 80,
+                 "native bridge preserves timbre event frames beside note analysis");
+        }
+        offset += (16u + payload + 3u) & ~3u;
+      }
       expect(EngineHostTestAccess::analysisSource(*engine, 2, 1) &&
              EngineHostTestAccess::analysisSource(*own, 2, 0), "comparison actually uses distinct analysis paths");
       expect(engine->pipelineLatency() == own->pipelineLatency(), "sharing preserves advertised latency");
@@ -970,6 +1127,80 @@ void testNoteAnalysisSharing() {
     }
     expect(heard, "shared SFZ comparison renders detected notes");
   }
+  expect(timbreSeen, "shared note analyzer emits new timbre classifications");
+}
+
+void testPreparedSfzAssetsAndPreview() {
+  using namespace effetune::plugins::others::sfz;
+  auto engine = std::make_unique<EngineHost>();
+  std::string error;
+  expect(engine->prepare(48000, 2, 128, EngineHost::kDefaultTelemetryBytes, &error), "prepare bank handoff fixture");
+  auto params = sfzDefaults();
+  RuntimePlugin runtime;
+  runtime.logicalId = 55; runtime.type = "SFZNotePlayerPlugin";
+  runtime.paramsHash = params.kHash; runtime.packedParameters = packedFixture(params);
+  PipelineState pipeline; pipeline.plugins = {PluginState{55, "SFZ Note Player", true}};
+  expect(engine->rebuild(pipeline, {runtime}, &error), "build bank handoff fixture");
+  auto asset = sfzTestAsset(55);
+  const float key = 61;
+  std::memcpy(asset.payload.data() + (8u + kHeader + LowKey) * sizeof(float), &key, sizeof(key));
+  std::memcpy(asset.payload.data() + (8u + kHeader + HighKey) * sizeof(float), &key, sizeof(key));
+  const auto capture = [&](EngineHost::PreparedAssetUpdate &update) {
+    effetune::allocation_guard::Scope guard;
+    return engine->captureAssetUpdate(update);
+  };
+  const auto apply = [&](EngineHost::PreparedAssetUpdate &update) {
+    effetune::allocation_guard::Scope guard;
+    return engine->applyAssetUpdate(update);
+  };
+  auto first = engine->createAssetUpdate(asset, false, &error);
+  expect(first && capture(*first) && EngineHost::prepareAssetUpdate(*first) && apply(*first),
+         "SFZ snapshot and activation allocate nothing on engine owner");
+  engine->finishAssetUpdate(*first); first.reset();
+  const auto latency = engine->pipelineLatency();
+  std::array<float, 128> left{}, right{}; float *channels[]{left.data(), right.data()};
+  const auto preview = [&](float sampleShift) {
+    params.previewMidi = -1;
+    expect(engine->updateParameters(55, packedFixture(params), params.kHash), "release preview before retrigger");
+    left.fill(0); right.fill(0);
+    expect(engine->tryProcessBlock(channels, 2, 128, 0, false), "render preview release");
+    params.sampleShift = sampleShift; params.previewMidi = 60; params.previewVelocity = 100;
+    expect(engine->updateParameters(55, packedFixture(params), params.kHash), "set preview and neighboring sample selection");
+    float peak = 0;
+    for (int block = 0; block < 12; ++block) {
+      left.fill(0); right.fill(0);
+      { effetune::allocation_guard::Scope guard;
+        expect(engine->tryProcessBlock(channels, 2, 128, block / 375.0, false), "preview renders without allocations"); }
+      for (const auto value : left) peak = std::max(peak, std::abs(value));
+    }
+    return peak;
+  };
+  expect(preview(0) == 0 && preview(1) > .01f, "sampleShift selects neighboring timbre for preview without detected input notes");
+  auto invalid = asset; invalid.payload[0] = 0;
+  auto rejected = engine->createAssetUpdate(std::move(invalid), false, &error);
+  expect(rejected && capture(*rejected) && !EngineHost::prepareAssetUpdate(*rejected), "malformed bank fails before installation");
+  expect(engine->assetState(55, 0) == ET_ASSET_STATE_ACTIVE && preview(1) > .01f,
+         "failed replacement retains the playing bank");
+  auto older = engine->createAssetUpdate(asset, false, &error);
+  auto newer = engine->createAssetUpdate(asset, false, &error);
+  expect(older && newer && capture(*older) && EngineHost::prepareAssetUpdate(*older) && capture(*newer) &&
+         EngineHost::prepareAssetUpdate(*newer), "prepare superseding requests");
+  expect(!apply(*older) && apply(*newer), "only the newest bank request can apply");
+  engine->finishAssetUpdate(*newer);
+  auto resetStale = engine->createAssetUpdate(asset, false, &error);
+  expect(resetStale && capture(*resetStale) && EngineHost::prepareAssetUpdate(*resetStale), "prepare request before reset");
+  engine->reset();
+  expect(!apply(*resetStale) && engine->pipelineLatency() == latency, "reset invalidates captured request and retains latency");
+  RuntimeAsset clear; clear.logicalId = 55;
+  auto cleared = engine->createAssetUpdate(clear, true, &error);
+  expect(cleared && capture(*cleared) && EngineHost::prepareAssetUpdate(*cleared) && apply(*cleared),
+         "clear uses the same bounded handoff");
+  engine->finishAssetUpdate(*cleared);
+  expect(engine->assetState(55, 0) == ET_ASSET_STATE_NONE && engine->assetFootprint(EngineHost::kSfzAssetBudgetBytes, {}) == 0,
+         "clear retires the bank and releases its replay budget off audio");
+  auto removed = engine->createAssetUpdate(asset, false, &error);
+  expect(removed && capture(*removed) && EngineHost::prepareAssetUpdate(*removed), "prepare request before node deletion");
+  expect(engine->rebuild({}, {}, &error) && !apply(*removed), "deleted instance cannot receive an old bank");
 }
 
 void testBackupExport() {
@@ -1006,12 +1237,15 @@ int main() {
   try {
     testDeferredBassLatency();
     testOutputAnalyzers();
+    testTelemetrySourceLifetimes();
+    testCustomMeterAndLongScope();
     testOutputAnalyzerClockFollowsConsumedAudio();
     testInstanceResetAndPreviewMeasurementGate();
     testSpectrumCapture();
     testSpectrumRouter();
     testCircuitFaultPublication();
     testSfzAssetAdmissionAndReplay();
+    testPreparedSfzAssetsAndPreview();
     testNoteAnalysisSharing();
     testBackupExport();
     std::cout << "Upstream integration tests passed\n";

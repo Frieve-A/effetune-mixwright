@@ -6,6 +6,24 @@ import { fileURLToPath } from 'node:url';
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(scriptDirectory, '..');
 const productName = 'EffeTune Mixwright';
+const vstTourLocales = {
+  en: {
+    'tour.step.welcome.body': 'Take a short tour to learn how to process audio from your DAW, add effects, and adjust your sound.',
+    'tour.step.sound.body': 'Insert Mixwright on a track or bus in your DAW, then start playback or enable input monitoring. The DAW supplies the audio.',
+    'tour.step.views.title': 'Explore the sound',
+    'tour.step.views.body': 'Visualizer displays the native pipeline output. Use Effect Pipeline to return to your effects.',
+    'tour.step.settings.body': 'Open Settings for Configuration (language, theme, startup view, and controllers) and Backup / Restore.',
+    'tour.step.help.body': 'Open Settings and choose Help to read the guide. Each effect also has a ? button. Choose Take the tour in Settings to see this tour again.'
+  },
+  ja: {
+    'tour.step.welcome.body': 'DAWの音声を処理し、エフェクトを追加して音を調整する方法を紹介します。',
+    'tour.step.sound.body': 'DAWのトラックやバスにMixwrightを挿入し、再生または入力モニターを開始してください。音声はDAWから供給されます。',
+    'tour.step.views.title': '音を見てみよう',
+    'tour.step.views.body': 'Visualizerでネイティブパイプラインの出力を表示できます。エフェクト編集に戻るにはEffect Pipelineを使います。',
+    'tour.step.settings.body': '設定からConfiguration（言語、テーマ、起動画面、コントローラー）やバックアップ／復元を開けます。',
+    'tour.step.help.body': '設定のHelpからガイドを開けます。各エフェクトの?ボタンでも説明を読めます。設定のツアー項目から、このツアーを再度開けます。'
+  }
+};
 const vstLocaleAdditions = {
   en: {
     'roomEq.action.import': 'Import\u2026',
@@ -60,6 +78,16 @@ await mkdir(output, { recursive: true });
 
 for (const entry of ['js', 'plugins', 'presets', 'images', 'css']) {
   await cp(path.join(source, entry), path.join(output, entry), { recursive: true });
+}
+// Omit the player-lyrics system preset without touching saved or imported layouts.
+const visualizerPresetsDirectory = path.join(output, 'presets', 'visualizer');
+for (const entry of await readdir(visualizerPresetsDirectory)) {
+  if (!entry.endsWith('.json')) continue;
+  const presetPath = path.join(visualizerPresetsDirectory, entry);
+  const presets = JSON.parse(await readText(presetPath));
+  if (!Object.hasOwn(presets, 'Lyric Stage')) continue;
+  delete presets['Lyric Stage'];
+  await writeFile(presetPath, JSON.stringify(presets, null, 2) + '\n', 'utf8');
 }
 // Shared modal/controller styling lives in the upstream library stylesheet.
 for (const entry of ['effetune-mobile.css', 'pipeline-analyzer.css']) {
@@ -331,6 +359,8 @@ const visualizerViewPath = path.join(output, 'js', 'visualizer', 'visualizer-vie
 let visualizerView = await readText(visualizerViewPath);
 const playerMetadata = `    metadata() {
         const player = this.uiManager.audioPlayer;
+        // OpenHome can retain the player and its last track after the UI closes.
+        if (!player?.ui?.container) return null;
         const snapshot = player?.stateManager?.getStateSnapshot();
         return snapshot?.currentTrack ? player.mediaSessionManager?.buildMetadata(snapshot) : null;
     }`;
@@ -342,8 +372,36 @@ visualizerView = visualizerView.replace(playerMetadata, `    metadata() {
     }`);
 await writeFile(visualizerViewPath, visualizerView, 'utf8');
 
+const tourPath = path.join(output, 'js', 'ui', 'onboarding-tour.js');
+let tour = await readText(tourPath);
+for (const [original, replacement] of [
+  ["{ id: 'sound', target: '#openMusicButton', mobileTarget: '#mobilePlayerView .mobile-open-music', mobileBody: true, view: 'player' }", "{ id: 'sound', target: '#pipeline' }"],
+  ["{ id: 'views', target: '#openLibraryButton', mobileTarget: '.mobile-bottom-button[data-view=\"library\"]', mobileBody: true }", "{ id: 'views', target: '#visualizerButton' }"],
+  ["{ id: 'help', target: '#whatsThisLink', mobileTarget: null, mobileBody: true }", "{ id: 'help', target: '#settingsMenuButton' }"]
+]) {
+  if (tour.split(original).length !== 2) throw new Error('Unable to adapt an upstream tour target');
+  tour = tour.replace(original, replacement);
+}
+await writeFile(tourPath, tour, 'utf8');
+
+const eventHandlerPath = path.join(output, 'js', 'ui', 'pipeline', 'ui-event-handler.js');
+let eventHandler = await readText(eventHandlerPath);
+const lyricsAttachmentImport = "import { attachLyricsFiles } from '../audio-player/lyrics-file-links.js';\n";
+const lyricsAttachmentCall = "                            attachLyricsFiles(musicFiles, files.filter(file => /\\.lrc$/i.test(file.name || '')));\n";
+if (eventHandler.split(lyricsAttachmentImport).length !== 2 || eventHandler.split(lyricsAttachmentCall).length !== 2) {
+  throw new Error('Unable to locate the excluded music lyrics attachment workflow');
+}
+eventHandler = eventHandler.replace(lyricsAttachmentImport, '').replace(lyricsAttachmentCall, '');
+await writeFile(eventHandlerPath, eventHandler, 'utf8');
+
 const visualizerEditorPath = path.join(output, 'js', 'visualizer', 'visualizer-editor.js');
 let visualizerEditor = await readText(visualizerEditorPath);
+const visualizerAddChoices = 'byLabel(ITEM_TYPES.map(type =>';
+if (visualizerEditor.split(visualizerAddChoices).length - 1 !== 1) {
+  throw new Error('Unable to locate Visualizer add-item choices');
+}
+visualizerEditor = visualizerEditor.replace(visualizerAddChoices,
+  "byLabel(ITEM_TYPES.filter(type => type !== 'lyrics').map(type =>");
 const visualizerChannels = `            const channels = [['', '1–2'], ['L', 'L'], ['R', 'R'], ...Array.from({ length: 7 }, (_, i) => [\`\${i * 2 + 3}\${i * 2 + 4}\`, \`\${i * 2 + 3}–\${i * 2 + 4}\`]), ...Array.from({ length: 16 }, (_, i) => [\`\${i + 1}\`, \`\${i + 1}\`])];
             this.field(properties, this.t('visualizer.channel', 'Channel'), 'select', item.channel || '', value => { item.channel = value || null; this.changed(); }, { values: channels });`;
 if (visualizerEditor.split(visualizerChannels).length - 1 !== 1) {
@@ -357,6 +415,28 @@ visualizerEditor = visualizerEditor.replace(visualizerChannels, `            con
                 for (const option of channelSelect.options) option.disabled = option.value === item.channel;
             }`);
 await writeFile(visualizerEditorPath, visualizerEditor, 'utf8');
+
+const pitchMeterPath = path.join(output, 'plugins', 'analyzer', 'pitch_meter.js');
+let pitchMeter = await readText(pitchMeterPath);
+const pitchMeterTelemetryStart = `        const snapshot = this.parseTelemetryFrame(frame);
+        if (!snapshot) return;
+        if (this.activeGeneration === null) {`;
+if (pitchMeter.split(pitchMeterTelemetryStart).length - 1 !== 1) {
+  throw new Error('Unable to locate the Pitch Meter telemetry epoch boundary');
+}
+// Native topology rebuilds replace kernels while retaining the UI and tap ID.
+// Frame counters, generations and time fences belong to the physical source.
+pitchMeter = pitchMeter.replace(pitchMeterTelemetryStart, `        const snapshot = this.parseTelemetryFrame(frame);
+        if (!snapshot) return;
+        if (frame.source && frame.source !== this.telemetrySource) {
+            this.telemetrySource = frame.source;
+            this.activeGeneration = null;
+            this.generationFence = null;
+            this.timeFence = null;
+            this.clearHistory();
+        }
+        if (this.activeGeneration === null) {`);
+await writeFile(pitchMeterPath, pitchMeter, 'utf8');
 
 const fifteenBandGeqPath = path.join(output, 'plugins', 'eq', 'fifteen_band_geq.js');
 let fifteenBandGeq = await readText(fifteenBandGeqPath);
@@ -555,6 +635,7 @@ uiManager = uiManager.replace(urlReflectionGate, `        // The VST WebView has
         // would only re-encode the whole pipeline on every parameter change.
         this.urlReflectionEnabled = false;`);
 for (const excludedImport of [
+  `import { attachLyricsFiles } from './ui/audio-player/lyrics-file-links.js';\n`,
   `import { PipelineAnalyzerController } from './pipeline-analyzer/controller.js';\n`,
   `import { PipelineAnalyzerUI } from './pipeline-analyzer/ui.js';\n`,
   `import { AudioPlayer } from './ui/audio-player.js';\n`,
@@ -747,6 +828,13 @@ for (const localeFile of await readdir(localesPath)) {
   const localePath = path.join(localesPath, localeFile);
   const localeSource = await readText(localePath);
   let localized = applyProductBranding(localeSource);
+  // Other locales use the supported English workflow until translated here.
+  for (const [key, value] of Object.entries(vstTourLocales[path.basename(localeFile, '.json5')] || vstTourLocales.en)) {
+    const field = `${JSON.stringify(key)}:`;
+    const expression = new RegExp(`(${field.replaceAll('.', '\\.')}\\s*)"(?:[^"\\\\]|\\\\.)*"`);
+    if (!expression.test(localized)) throw new Error(`Unable to adapt tour locale: ${localeFile}: ${key}`);
+    localized = localized.replace(expression, (_match, prefix) => prefix + JSON.stringify(value));
+  }
   const additions = vstLocaleAdditions[path.basename(localeFile, '.json5')];
   if (additions) {
     const closing = localized.match(/\s*}\s*$/);
@@ -838,6 +926,13 @@ columns = columns.replace(saveColumns, `${saveColumns}
             }`);
 await writeFile(columnsPath, columns, 'utf8');
 await rm(path.join(output, 'js', 'library'), { recursive: true, force: true });
+// Imported layouts may contain lyrics. Retain the pure renderer dependencies,
+// while the music player and its file association workflow remain excluded.
+await mkdir(path.join(output, 'js', 'library', 'metadata'), { recursive: true });
+for (const helper of ['lyrics.js', 'text-encoding.js']) {
+  await cp(path.join(source, 'js', 'library', 'metadata', helper),
+           path.join(output, 'js', 'library', 'metadata', helper));
+}
 await rm(path.join(output, 'js', 'ui', 'library'), { recursive: true, force: true });
 await rm(path.join(output, 'js', 'ui', 'audio-player'), { recursive: true, force: true });
 await rm(path.join(output, 'js', 'ui', 'audio-player.js'), { force: true });

@@ -1053,6 +1053,9 @@ export class AudioManager extends BrowserAudioManager {
         void this.synchronizeNativeContext(result).catch(() => {});
       }
       if (hidden) return;
+      // The single-flight poll pairs these identities with this packet, including
+      // empty polls that must invalidate delayed frames from replaced instances.
+      this.telemetryHub?.setSources?.(result.telemetrySources || {});
       this.nativePort.dispatchSpectrumOverlays(result.spectrumOverlays, spectrumRevision);
       if (!result.packet || !result.bytes) return;
       const binary = atob(result.packet);

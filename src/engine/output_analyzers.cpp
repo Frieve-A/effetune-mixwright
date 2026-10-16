@@ -46,6 +46,7 @@ struct OutputAnalyzers::Storage {
     OutputAnalyzerSource source;
     et_instance instance = 0;
     std::array<std::uint32_t, 2> channels{};
+    std::uint64_t sourceId = 0;
   };
   std::array<Block, kSlots> blocks;
   std::atomic<std::uint32_t> read{0};
@@ -55,6 +56,8 @@ struct OutputAnalyzers::Storage {
   std::unique_ptr<effetune::Engine> engine;
   std::uint64_t processedFrames = 0;
   std::vector<Instance> instances;
+  std::uint64_t nextSourceId = 0;
+  std::array<std::uint8_t, kTelemetryBytes> discard{};
   std::array<float, kFrames * 2> stereo{};
 };
 
@@ -90,6 +93,14 @@ bool OutputAnalyzers::configure(std::string *error) {
     }
   }
   // Preserve history and telemetry sequence for every unchanged source.
+  if (std::any_of(storage.instances.begin(), storage.instances.end(),
+                 [&](const auto &entry) {
+                   return std::find(sources_.begin(), sources_.end(), entry.source) == sources_.end();
+                 })) {
+    // A short read can leave raw frames queued; never label them as replacements.
+    std::uint32_t dropped = 0;
+    while (storage.engine->readTelemetry(storage.discard.data(), kTelemetryBytes, &dropped) != 0) {}
+  }
   for (auto it = storage.instances.begin(); it != storage.instances.end();) {
     if (std::find(sources_.begin(), sources_.end(), it->source) != sources_.end()) {
       ++it;
@@ -109,7 +120,7 @@ bool OutputAnalyzers::configure(std::string *error) {
       setError(error, "Unable to configure output analysis");
       return false;
     }
-    storage.instances.push_back({source, instance, selectedChannels(source.channel)});
+    storage.instances.push_back({source, instance, selectedChannels(source.channel), ++storage.nextSourceId});
   }
   return true;
 }
@@ -179,9 +190,15 @@ void OutputAnalyzers::process(float *const *output, const std::uint32_t channels
 }
 
 std::uint32_t OutputAnalyzers::readTelemetry(std::span<std::uint8_t> output,
-                                            std::uint32_t &dropped) noexcept {
+                                            std::uint32_t &dropped,
+                                            std::map<std::uint32_t, std::uint64_t> *sources) {
   std::scoped_lock lock(controlMutex_);
   auto &storage = *storage_;
+  if (sources) {
+    sources->clear();
+    for (const auto &entry : storage.instances)
+      sources->emplace(entry.source.tapId, entry.sourceId);
+  }
   auto read = storage.read.load(std::memory_order_relaxed);
   const auto write = storage.write.load(std::memory_order_acquire);
   dropped = storage.dropped.exchange(0, std::memory_order_relaxed);

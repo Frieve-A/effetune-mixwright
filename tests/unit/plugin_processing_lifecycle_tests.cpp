@@ -5,6 +5,7 @@
 #include "../../external/effetune/dsp/generated/cpp/AdaptivePredictionEffectPluginParams.h"
 #include "../../external/effetune/dsp/generated/cpp/SFZNotePlayerPluginParams.h"
 #include "../../external/effetune/dsp/generated/cpp/IRReverbPluginParams.h"
+#include "../../external/effetune/dsp/plugins/others/sfz_note_player/bank.h"
 
 #include "pluginterfaces/base/ustring.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
@@ -84,6 +85,14 @@ public:
   static void setSfzFolderChooser(EffeTuneProcessor &processor,
       std::function<std::optional<std::filesystem::path>()> chooser) {
     processor.sfzFolderChooserForTesting_ = std::move(chooser);
+  }
+
+  static void setSfzFilesChooser(EffeTuneProcessor &processor,
+      std::function<std::vector<std::filesystem::path>()> chooser) {
+    processor.sfzFilesChooserForTesting_ = std::move(chooser);
+  }
+  static void setAssetPreparationHook(EffeTuneProcessor &processor, std::function<void()> hook) {
+    processor.assetPreparationHookForTesting_ = std::move(hook);
   }
 
   static void setBackupSaveChooser(EffeTuneProcessor &processor,
@@ -7236,6 +7245,14 @@ void testSfzChooserReentrantCancellation() {
   }
   auto processor = std::make_unique<EffeTuneProcessor>();
   expect(processor->initialize(nullptr) == kResultOk, "initialize SFZ control boundary");
+  auto filesChosen = false;
+  PluginProcessorTestAccess::setSfzFilesChooser(*processor, [&] {
+    filesChosen = true;
+    return std::vector<std::filesystem::path>{};
+  });
+  const auto filesReply = choc::json::parse(processor->handleUiMessage(R"({"type":"sfz/select","payload":{"mode":"files"}})"));
+  expect(filesChosen && filesReply["ok"].getBool() && filesReply["data"].isVoid(),
+         "file selection uses the native file chooser and preserves cancellation");
   {
     const auto lock = PluginProcessorTestAccess::lockProcessingResources(*processor);
     const auto reply = choc::json::parse(processor->handleUiMessage(
@@ -7243,6 +7260,106 @@ void testSfzChooserReentrantCancellation() {
     expect(reply["ok"].getBool(), "SFZ operations do not acquire the audio resources lock or drain automation");
   }
   expect(processor->terminate() == kResultOk, "terminate SFZ control boundary");
+}
+
+void testSfzReplacementKeepsWetProcessing() {
+  using namespace effetune::plugins::others::sfz;
+  auto processor = std::make_unique<EffeTuneProcessor>();
+  expect(processor->initialize(nullptr) == kResultOk, "initialize prepared bank processor");
+  auto processSetup = setup(48000, 64);
+  expect(processor->setupProcessing(processSetup) == kResultOk, "prepare bank processor");
+  const auto request = [&](const std::string &json) { return choc::json::parse(processor->handleUiMessage(json)); };
+  const auto sfz = std::string(R"({"id":55,"type":"SFZNotePlayerPlugin","name":"SFZ","enabled":false,"parameters":{},"wasmParams":[0.5,-30,3,28,91,32,0,100,0,0,1,1,1,0,18,0,0,-1,100],"wasmParamsHash":)") +
+      std::to_string(effetune::generated::SFZNotePlayerPluginParams::kHash) + "}";
+  expect(request(std::string(R"({"type":"pipeline/rebuild","payload":{"plugins":[{"id":1,"type":"VolumePlugin","name":"Volume","enabled":true,"parameters":{"vl":-6},"wasmParams":[-6],"wasmParamsHash":1719233191},)") + sfz + "]}}")["ok"].getBool(),
+         "install gain path and loadable instrument");
+  std::vector<float> words(8u + kHeader + kStride + 16u, .25f);
+  auto *bytes = reinterpret_cast<std::uint8_t *>(words.data());
+  std::fill_n(bytes, 32u, std::uint8_t{0});
+  const auto write = [&](std::size_t offset, std::uint32_t value) { std::memcpy(bytes + offset, &value, 4); };
+  write(0, 0x31415445u); write(4, 1); write(8, static_cast<std::uint32_t>(words.size()) - 8u); write(12, 1);
+  const std::array<std::uint32_t, 8> header{kMagic, kVersion, 1, kStride, kHeader + kStride,
+      static_cast<std::uint32_t>(words.size() - 8u), 1, 0};
+  for (std::size_t i = 0; i < header.size(); ++i) write(32u + 4u * i, header[i]);
+  std::array<float, kStride> region{};
+  region[Frames] = 16; region[Channels] = 1; region[Rate] = 48000;
+  region[HighKey] = 127; region[LowVelocity] = 1; region[HighVelocity] = 127; region[HighRandom] = 1;
+  region[SequenceLength] = region[SequencePosition] = 1; region[KeyCenter] = 60;
+  region[KeyTrack] = 100; region[End] = region[LoopEnd] = 15; region[Sustain] = 100;
+  for (std::uint32_t field = 0; field < kStride; ++field) {
+    if (isIndexField(field)) write((8u + kHeader + field) * 4u, static_cast<std::uint32_t>(region[field]));
+    else words[8u + kHeader + field] = region[field];
+  }
+  const auto byteSize = words.size() * sizeof(float);
+  const auto identity = [](int revision) {
+    return std::string(R"("pluginId":55,"slot":0,"operationRevision":)") + std::to_string(revision);
+  };
+  const auto transfer = [&](int revision, bool valid) {
+    const auto metadata = identity(revision) + R"(,"formatTag":1,"channels":1,"frames":)" +
+        std::to_string(words.size() - 8u) + R"(,"topology":0,"headBlock":128,"rateDivider":1,"pathCount":0,"inputCount":0,"processingChannels":1,"byteSize":)" +
+        std::to_string(byteSize) + R"(,"footprintBytes":)" + std::to_string(byteSize + 4u * (131u + 128u));
+    expect(request(R"({"type":"pipeline/assetBegin","payload":{)" + metadata + "}}")["ok"].getBool(), "reserve bank transfer");
+    auto payload = std::vector<std::uint8_t>(bytes, bytes + byteSize);
+    if (!valid) payload[0] = 0;
+    expect(request(R"({"type":"pipeline/assetChunk","payload":{)" + identity(revision) +
+        R"(,"offset":0,"data":")" + choc::base64::encodeToString(payload) + R"("}})")["ok"].getBool(), "transfer bank payload");
+  };
+  const auto commit = [&](int revision) {
+    return request(R"({"type":"pipeline/assetCommit","payload":{)" + identity(revision) + "}}")["ok"].getBool();
+  };
+  transfer(1, true);
+  expect(commit(1), "stopped host installs a prepared bank without waiting for a callback");
+  expect(processor->setActive(true) == kResultOk, "activate bank processor");
+  gate_ordering::AudioRig rig(.5f);
+  for (int block = 0; block < 32; ++block) expect(processor->process(rig.data) == kResultOk, "warm gain path");
+  const auto render = [&] {
+    const auto before = PluginProcessorTestAccess::processCounters(*processor).completedBatches;
+    { effetune::allocation_guard::Scope guard; expect(processor->process(rig.data) == kResultOk, "render during bank handoff"); }
+    expect(PluginProcessorTestAccess::processCounters(*processor).completedBatches == before + 1,
+           "every bank handoff block reaches wet processing");
+    for (const auto value : rig.outputLeft)
+      expect(std::abs(value - .5f * std::pow(10.0f, -6.0f / 20.0f)) < .00001f, "bank handoff never substitutes dry input");
+  };
+  for (int pass = 0; pass < 3; ++pass) {
+    const int revision = 2 + pass * 2;
+    transfer(revision, pass != 1);
+    std::atomic_bool entered{false}, release{false}, done{false};
+    bool result = false;
+    PluginProcessorTestAccess::setAssetPreparationHook(*processor, [&] {
+      entered.store(true, std::memory_order_release);
+      while (!release.load(std::memory_order_acquire)) std::this_thread::yield();
+    });
+    std::jthread control([&] { result = commit(revision); done.store(true, std::memory_order_release); });
+    struct ReleaseOnExit {
+      std::atomic_bool &flag;
+      ~ReleaseOnExit() { flag.store(true, std::memory_order_release); }
+    } releaseOnExit{release};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    while (!entered.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
+      render(); std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const auto captured = entered.load(std::memory_order_acquire);
+    for (int block = 0; block < 32 && captured; ++block) render();
+    if (pass == 2) transfer(revision + 1, true);
+    release.store(true, std::memory_order_release);
+    while (!done.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
+      render(); std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    control.join();
+    expect(captured && done.load() && result == (pass == 0), "valid replacement applies, invalid and superseded banks are rejected");
+    expect(request(R"({"type":"pipeline/assetState","payload":{"pluginId":55,"slot":0}})")["state"].getInt64() == ET_ASSET_STATE_ACTIVE,
+           "rejected bank keeps the previous instrument active");
+  }
+  PluginProcessorTestAccess::setAssetPreparationHook(*processor, {});
+  expect(processor->setActive(false) == kResultOk, "stop bank processor");
+  expect(request(R"({"type":"pipeline/assetClear","payload":{"pluginId":55,"slot":0}})")["ok"].getBool(),
+         "stopped-host clear completes without a callback");
+  ResizableMemoryIBStream saved;
+  expect(processor->getState(&saved) == kResultOk, "save state before stale transfer");
+  transfer(20, true);
+  saved.rewind();
+  expect(processor->setState(&saved) == kResultOk && !commit(20), "state replacement rejects an earlier bank transfer");
+  expect(processor->terminate() == kResultOk, "terminate bank processor");
 }
 
 void testSfzReferencesSurviveAbAndState() {
@@ -7255,7 +7372,7 @@ void testSfzReferencesSurviveAbAndState() {
   const auto plugin = [&](int id, const std::string &reference) {
     return std::string(R"({"id":)") + std::to_string(id) +
         R"(,"type":"SFZNotePlayerPlugin","name":"SFZ Note Player","enabled":true,"parameters":{"sf":")" + reference +
-        R"("},"wasmParams":[0.5,-30,3,28,91,32,0,100,0,0,1,1,1,0,18,0],"wasmParamsHash":)" +
+        R"("},"wasmParams":[0.5,-30,3,28,91,32,0,100,0,0,1,1,1,0,18,0,0,-1,100],"wasmParamsHash":)" +
         std::to_string(effetune::generated::SFZNotePlayerPluginParams::kHash) + "}";
   };
   for (const auto pipeline : {"A", "B", "A"}) {
@@ -7296,7 +7413,7 @@ void testSfzAndIrTransferAdmissionBudgets() {
   };
   const auto sfz = [&](int id) {
     return std::string(R"({"id":)") + std::to_string(id) +
-        R"(,"type":"SFZNotePlayerPlugin","name":"SFZ","enabled":true,"parameters":{},"wasmParams":[0.5,-30,3,28,91,32,0,100,0,0,1,1,1,0,18,0],"wasmParamsHash":)" +
+        R"(,"type":"SFZNotePlayerPlugin","name":"SFZ","enabled":true,"parameters":{},"wasmParams":[0.5,-30,3,28,91,32,0,100,0,0,1,1,1,0,18,0,0,-1,100],"wasmParamsHash":)" +
         std::to_string(effetune::generated::SFZNotePlayerPluginParams::kHash) + "}";
   };
   const auto ir = [&](int id) {
@@ -11678,6 +11795,7 @@ int main() {
     testSfzAndIrTransferAdmissionBudgets();
     testSfzChooserReentrantCancellation();
     testSfzReferencesSurviveAbAndState();
+    testSfzReplacementKeepsWetProcessing();
     testOscilloscopeSweepsSurviveProcessorReactivation();
     testDeferredBassManagementHostAndBypassLatency();
     testLiveLatencyCommitAlignsWetBypassAndHost();

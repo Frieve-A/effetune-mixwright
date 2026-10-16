@@ -5,6 +5,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace effetune::vst {
 
@@ -22,7 +23,8 @@ public:
   // selectedFolder, which must come from a native folder chooser.
   [[nodiscard]] std::string request(std::string_view operation,
                                     std::string_view payload = "{}",
-                                    const std::filesystem::path &selectedFolder = {});
+                                    const std::filesystem::path &selectedFolder = {},
+                                    const std::vector<std::filesystem::path> &selectedFiles = {});
   void closeReads();
 
 private:

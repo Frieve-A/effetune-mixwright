@@ -164,6 +164,67 @@ std::optional<std::filesystem::path> chooseSfzFolder() {
 #endif
 }
 
+std::vector<std::filesystem::path> chooseSfzFiles() {
+  std::vector<std::filesystem::path> paths;
+  constexpr std::size_t maximumFiles = 10000;
+#if defined(_WIN32)
+  ComScope com;
+  IFileOpenDialog *dialog = nullptr;
+  if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                               IID_PPV_ARGS(&dialog)))) return paths;
+  FILEOPENDIALOGOPTIONS options{};
+  (void)dialog->GetOptions(&options);
+  (void)dialog->SetOptions(options | FOS_ALLOWMULTISELECT | FOS_FORCEFILESYSTEM |
+                         FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST);
+  const COMDLG_FILTERSPEC filter[]{ {L"SFZ instruments", L"*.sfz"} };
+  (void)dialog->SetFileTypes(1, filter);
+  IShellItemArray *items = nullptr;
+  if (dialog->Show(nullptr) == S_OK && SUCCEEDED(dialog->GetResults(&items))) {
+    DWORD count = 0;
+    if (SUCCEEDED(items->GetCount(&count)) && count <= maximumFiles) {
+      for (DWORD index = 0; index < count; ++index) {
+        IShellItem *item = nullptr;
+        PWSTR value = nullptr;
+        if (SUCCEEDED(items->GetItemAt(index, &item))) {
+          if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &value)) && value)
+            paths.emplace_back(value);
+          CoTaskMemFree(value);
+          item->Release();
+        }
+      }
+    }
+    items->Release();
+  }
+  dialog->Release();
+#elif defined(__APPLE__)
+  using SendId = id (*)(id, SEL);
+  using SendBool = void (*)(id, SEL, bool);
+  using SendInteger = unsigned long (*)(id, SEL);
+  using SendIndex = id (*)(id, SEL, unsigned long);
+  using SendCString = const char *(*)(id, SEL);
+  const auto panel = reinterpret_cast<SendId>(objc_msgSend)(
+      reinterpret_cast<id>(objc_getClass("NSOpenPanel")), sel_registerName("openPanel"));
+  if (!panel) return paths;
+  reinterpret_cast<SendBool>(objc_msgSend)(panel, sel_registerName("setCanChooseDirectories:"), false);
+  reinterpret_cast<SendBool>(objc_msgSend)(panel, sel_registerName("setCanChooseFiles:"), true);
+  reinterpret_cast<SendBool>(objc_msgSend)(panel, sel_registerName("setAllowsMultipleSelection:"), true);
+  if (reinterpret_cast<SendInteger>(objc_msgSend)(panel, sel_registerName("runModal")) != 1) return paths;
+  const auto urls = reinterpret_cast<SendId>(objc_msgSend)(panel, sel_registerName("URLs"));
+  const auto count = reinterpret_cast<SendInteger>(objc_msgSend)(urls, sel_registerName("count"));
+  if (count > maximumFiles) return paths;
+  for (unsigned long index = 0; index < count; ++index) {
+    const auto url = reinterpret_cast<SendIndex>(objc_msgSend)(urls, sel_registerName("objectAtIndex:"), index);
+    const auto path = reinterpret_cast<SendId>(objc_msgSend)(url, sel_registerName("path"));
+    const auto value = reinterpret_cast<SendCString>(objc_msgSend)(path, sel_registerName("UTF8String"));
+    if (value) paths.push_back(presetPathFromUtf8(value));
+  }
+#endif
+  if (std::any_of(paths.begin(), paths.end(), [](const auto &path) {
+        return !hasExchangeExtension(path, ".sfz");
+      })) paths.clear();
+  return paths;
+}
+
 std::optional<std::filesystem::path> choosePresetToOpen() {
 #if defined(_WIN32)
   return runWindowsDialog<IFileOpenDialog>(CLSID_FileOpenDialog, {});
