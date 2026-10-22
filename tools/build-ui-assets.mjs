@@ -127,7 +127,8 @@ html = applyProductBranding(html)
     `<meta http-equiv="Content-Security-Policy" content="default-src 'self' blob: data:; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:; connect-src 'self' blob:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline' blob:;">`)
   .replace(/\s*<script>\s*\(function\(\) \{\s*var measurementId =[\s\S]*?<\/script>/, '')
   .replace(/\s*<script>\s*\/\/ Apply the Web startup view preference[\s\S]*?<\/script>/, '')
-  .replace(/\s*<button class="pipeline-menu-item" id="doubleBlindTestButton">[\s\S]*?<\/button>/, '')
+  .replace(/\s*<button class="pipeline-menu-item" id="doubleBlindTestButton"[^>]*>[\s\S]*?<\/button>/, '')
+  .replace(/\s*<button\b[^>]*\bid="browserButton"[^>]*>[\s\S]*?<\/button>/, '')
   .replace(/\s*<button class="header-button pipeline-analyzer-button" id="pipelineAnalyzerButton"[\s\S]*?<\/button>/, '')
   .replace(/\s*<aside class="pipeline-analyzer-panel" id="pipelineAnalyzerPanel" hidden><\/aside>/, '')
   .replace(/\s*<script src="js\/vendor\/jsmediatags-3\.9\.5\.min\.js"><\/script>/g, '')
@@ -370,6 +371,35 @@ if (visualizerView.split(playerMetadata).length - 1 !== 1) {
 visualizerView = visualizerView.replace(playerMetadata, `    metadata() {
         return this.uiManager.audioManager.getNowPlayingMetadata();
     }`);
+// The native host owns project transport. Neither the excluded player nor an
+// editor-local wall clock can represent stopped playback, seeks, or loops.
+const counterProvider = /    counters\(now = performance\.now\(\)\) \{[\s\S]*?\n    \}\n(?=    resetCounter)/;
+const videoProvider = /    videoFrame\(\) \{[\s\S]*?\n    \}\n(?=    async openPresets)/;
+if (!counterProvider.test(visualizerView) || !videoProvider.test(visualizerView)) {
+  throw new Error('Unable to locate the Visualizer transport and video providers');
+}
+visualizerView = visualizerView.replace(counterProvider, `    counters(now = performance.now()) {
+        const transport = this.uiManager.audioManager.getHostTransport();
+        return new Map(this.layout.items.filter(item => item.type === 'counter').map(item => [item.id, {
+            time: transport ? Math.max(0, transport.projectTimeSamples / transport.sampleRate) : 0,
+            trackIndex: 0, external: false, playing: transport?.playing === true,
+            speed: 1, source: 'vst-host-project', stamp: now / 1000
+        }]));
+    }
+`).replace(videoProvider, '    videoFrame() { return null; }\n');
+for (const integration of [
+  "import { SynchronizedVideo } from '../ui/audio-player/synchronized-video.js';\n",
+  "import { hasPlaybackRegionDescriptor } from '../ui/audio-player/playback-region.js';\n",
+  '        this.video = new SynchronizedVideo();\n',
+  "        this.video.setEnabled(this.layout.items.some(item => item.type === 'video'));\n",
+  '        this.video.setActive(!!this.feed?.visible);\n',
+  '        this.video.setActive(visible || !!this.feed?.visible);\n'
+]) {
+  if (visualizerView.split(integration).length !== 2) {
+    throw new Error('Unable to locate an excluded Visualizer video integration');
+  }
+  visualizerView = visualizerView.replace(integration, '');
+}
 await writeFile(visualizerViewPath, visualizerView, 'utf8');
 
 const tourPath = path.join(output, 'js', 'ui', 'onboarding-tour.js');
@@ -401,7 +431,7 @@ if (visualizerEditor.split(visualizerAddChoices).length - 1 !== 1) {
   throw new Error('Unable to locate Visualizer add-item choices');
 }
 visualizerEditor = visualizerEditor.replace(visualizerAddChoices,
-  "byLabel(ITEM_TYPES.filter(type => type !== 'lyrics').map(type =>");
+  "byLabel(ITEM_TYPES.filter(type => type !== 'lyrics' && type !== 'video').map(type =>");
 const visualizerChannels = `            const channels = [['', '1–2'], ['L', 'L'], ['R', 'R'], ...Array.from({ length: 7 }, (_, i) => [\`\${i * 2 + 3}\${i * 2 + 4}\`, \`\${i * 2 + 3}–\${i * 2 + 4}\`]), ...Array.from({ length: 16 }, (_, i) => [\`\${i + 1}\`, \`\${i + 1}\`])];
             this.field(properties, this.t('visualizer.channel', 'Channel'), 'select', item.channel || '', value => { item.channel = value || null; this.changed(); }, { values: channels });`;
 if (visualizerEditor.split(visualizerChannels).length - 1 !== 1) {
@@ -575,6 +605,18 @@ await writeFile(pipelineManagerPath, pipelineManager, 'utf8');
 
 const uiManagerPath = path.join(output, 'js', 'ui-manager.js');
 let uiManager = await readText(uiManagerPath);
+const browserImport = "import { BrowserView } from './browser/browser-view.js';\n";
+const browserProvider = /    showBrowserView\(\) \{[\s\S]*?\n    \}\n(?=\n    updateViewSwitchButtons)/;
+if (uiManager.split(browserImport).length !== 2 || !browserProvider.test(uiManager)) {
+  throw new Error('Unable to locate the excluded desktop Browser integration');
+}
+uiManager = uiManager.replace(browserImport, '')
+  .replace(browserProvider, '    showBrowserView() { return Promise.resolve(false); }\n');
+const browserButtonSetup = /        this\.browserButton = document\.getElementById\('browserButton'\);\n        if \(this\.browserButton && window\.electronAPI\?\.browser\) \{[\s\S]*?\n        \}\n/;
+if (!browserButtonSetup.test(uiManager)) {
+  throw new Error('Unable to locate the desktop Browser button setup');
+}
+uiManager = uiManager.replace(browserButtonSetup, '');
 const pipelineManagerConstruction = `        this.pipelineManager = new PipelineManager(audioManager, pluginManager, this.expandedPlugins, this.pluginListManager);`;
 if (uiManager.split(pipelineManagerConstruction).length - 1 !== 1) {
   throw new Error('Unable to locate the PipelineManager construction');
@@ -798,6 +840,11 @@ uiManager = uiManager.replace(localizationInitializer, `    refreshDynamicLocali
 ${localizationInitializer}`);
 await writeFile(uiManagerPath, uiManager, 'utf8');
 await rm(path.join(output, 'js', 'ui', 'double-blind-test'), { recursive: true, force: true });
+// The A/B action availability policy is shared with ordinary pipeline actions.
+await mkdir(path.join(output, 'js', 'ui', 'double-blind-test'), { recursive: true });
+await cp(path.join(source, 'js', 'ui', 'double-blind-test', 'pipeline-availability.js'),
+         path.join(output, 'js', 'ui', 'double-blind-test', 'pipeline-availability.js'));
+await rm(path.join(output, 'js', 'browser'), { recursive: true, force: true });
 
 const electronIntegrationPath = path.join(output, 'js', 'electron-integration.js');
 let electronIntegration = await readText(electronIntegrationPath);
@@ -903,6 +950,15 @@ configIntegration = configIntegration.replace(configCategories,
 // Keep nonselectable panels for upstream initialization and translated control IDs.
 configIntegration = configIntegration.replace(configPanels,
   '${Object.keys(categoryPanels).map(category => `\n          <div class="config-category-panel" id="config-panel-${category}" hidden>');
+const browserStartup = /            \$\{isElectron \? `<div class="radio-container">\n              <input type="radio" name="startup-view" id="startup-view-browser"[\s\S]*?\n            <\/div>` : ''\}\n/;
+const browserCategory = /      browser: `[\s\S]*?`,\n(?=      remoteControl:)/;
+const startupChoices = "const startupViews = isElectron ? ['effects', 'library', 'visualizer', 'browser'] : ['effects', 'library', 'visualizer'];";
+if (!browserStartup.test(configIntegration) || !browserCategory.test(configIntegration) ||
+    !configIntegration.includes(startupChoices)) {
+  throw new Error('Unable to locate the excluded desktop Browser settings');
+}
+configIntegration = configIntegration.replace(browserStartup, '').replace(browserCategory, '')
+  .replace(startupChoices, "const startupViews = ['effects', 'visualizer'];");
 await writeFile(configIntegrationPath, configIntegration, 'utf8');
 
 const clipboardPath = path.join(output, 'js', 'ui', 'pipeline', 'clipboard-manager.js');

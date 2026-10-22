@@ -32,6 +32,8 @@
     .config-dialog .device-section { display: none !important; }
     .config-dialog .device-section:has(#language-select) { display: block !important; }
     .config-dialog .device-section:has(#theme-select),
+    .config-dialog .device-section:has(#pipeline-column-mode),
+    .config-dialog .device-section:has(#visualizer-hdr),
     .config-dialog .device-section:has(#frequency-preview-sound),
     .config-dialog .device-section:has(#sfz-size-limit),
     .config-dialog .device-section:has(#startup-view-effects),

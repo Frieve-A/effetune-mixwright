@@ -156,7 +156,9 @@ function createNativePort() {
     nowPlayingRevision: 0,
     nowPlayingMetadata: null,
     getNowPlayingMetadata: context.NowPlayingManager.prototype.getNowPlayingMetadata,
-    applyNativeNowPlaying: context.NowPlayingManager.prototype.applyNativeNowPlaying
+    applyNativeNowPlaying: context.NowPlayingManager.prototype.applyNativeNowPlaying,
+    getHostTransport: context.NowPlayingManager.prototype.getHostTransport,
+    applyNativeHostTransport: context.NowPlayingManager.prototype.applyNativeHostTransport
   };
   const port = new context.NativePort(owner);
   const node = { port };
@@ -309,6 +311,36 @@ test('host track metadata replaces and clears without DSP packets and reuses unc
     assert.equal(port.owner.getNowPlayingMetadata(), null, 'an empty snapshot clears while the editor is hidden');
     port.owner.applyNativeNowPlaying({ nowPlayingRevision: 2, nowPlaying: { title: 'Stale startup reply' } });
     assert.equal(port.owner.getNowPlayingMetadata(), null, 'an overlapping old reply cannot restore a cleared track');
+  } finally { port.close(); }
+});
+
+test('native project transport is cached from visible and hidden polls without DSP packets', async () => {
+  const fixture = createNativePort();
+  const { context, port } = fixture;
+  const poll = installSpectrumPolling(fixture);
+  const calls = [];
+  let transport = { available: true, projectTimeSamples: 96000, sampleRate: 48000, playing: true };
+  context.window.__effetuneHostCall = async type => {
+    calls.push(type);
+    return { bytes: 0, hostTransport: transport };
+  };
+  try {
+    assert.equal(port.owner.getHostTransport(), null);
+    await poll();
+    assert.deepEqual({ ...port.owner.getHostTransport() }, transport);
+    transport = { ...transport, projectTimeSamples: -24000, playing: false };
+    context.document.hidden = true;
+    await poll();
+    assert.equal(calls.at(-1), 'host/getInfo');
+    assert.equal(port.owner.getHostTransport().projectTimeSamples, -24000);
+    assert.equal(port.owner.getHostTransport().playing, false);
+    context.document.hidden = false;
+    await poll();
+    assert.equal(calls.at(-1), 'telemetry/discard');
+    transport = { available: false, projectTimeSamples: 0, sampleRate: 0, playing: false };
+    await poll();
+    assert.equal(calls.at(-1), 'telemetry/read');
+    assert.equal(port.owner.getHostTransport(), null);
   } finally { port.close(); }
 });
 
@@ -952,6 +984,7 @@ test('startup rebuilds a pending state replacement but preserves an ordinary rea
       const appliedExecutionStates = [];
       const preparedPipelines = [];
       const nowPlaying = { title: 'Host track', album: '', artist: '', artwork: [] };
+      const hostTransport = { available: true, projectTimeSamples: 144000, sampleRate: 48000, playing: false };
       const executionStates = [{
         pluginId: 17,
         pluginType: 'AMRadioSimulatorPlugin',
@@ -976,6 +1009,7 @@ test('startup rebuilds a pending state replacement but preserves an ordinary rea
               masterBypass: false,
               nowPlayingRevision: 5,
               nowPlaying,
+              hostTransport,
               executionStates
             };
           }
@@ -1024,6 +1058,8 @@ test('startup rebuilds a pending state replacement but preserves an ordinary rea
 
       assert.equal(await manager.initAudio(), '');
       assert.equal(manager.getNowPlayingMetadata(), nowPlaying);
+      assert.deepEqual({ ...manager.getHostTransport() }, hostTransport,
+        'every fresh editor receives the retained project transport in its startup handshake');
       assert.equal(manager.nowPlayingRevision, 5, 'each fresh editor receives the retained host track at startup');
       assert.equal(await manager.rebuildPipeline(), '');
       return { calls, appliedExecutionStates, executionStates, preparedPipelines };

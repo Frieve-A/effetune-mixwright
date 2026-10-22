@@ -53,9 +53,16 @@ Upstream's LAN remote control is not available in this VST build.
 The first-run tour explains DAW audio input and the supported views; reopen it
 with **Settings → Take the tour**. **Settings → Help** opens the guide.
 Visualizer supports Custom Analog Meter detectors and dials, plus per-item
-**Edge Fade** masks. The add-item menu omits Lyrics, and the bundled presets omit
+**Edge Fade** masks. Counter items and the Counter Gallery presets display the
+host's project time, including stopped positions, seeks, and loops. They use the
+host sample rate regardless of oversampling; clicking a Counter does not reset
+it. Negative project positions display as zero. A host that supplies no process
+context displays zero until it provides a position.
+The desktop Browser and Video playback remain outside the VST interface.
+The add-item menu omits Lyrics and Video, and the bundled presets omit
 Lyric Stage. Lyrics items in existing or imported layouts and user presets remain
 editable; live player lyrics are unavailable because audio comes from the DAW.
+Saved or imported Video items retain their layout data, with playback unavailable.
 
 Use **Settings → Configuration → Controllers** to open controller mapping settings.
 Controller mappings can toggle master bypass, switch A/B, and step through saved
@@ -67,7 +74,10 @@ size limit (64, 128, 256, 512, or 1024 MiB; 256 MiB by default).
 **Startup** selects the Effect Pipeline or Visualizer view when the editor opens;
 the pipeline itself continues to come from the host's plug-in state.
 **Display** selects instantaneous or Peak Hold spectra for per-effect Spectrum
-Overlays. These preferences are saved in the Mixwright UI configuration.
+Overlays, automatic or manual pipeline columns, and Visualizer HDR rendering.
+Automatic columns adapt to the editor width while retaining the saved manual
+count. These preferences are saved in the Mixwright UI configuration or, for HDR,
+the Visualizer's local storage.
 
 **Settings → Backup / Restore** transfers saved pipeline, effect and Visualizer
 presets, impulse responses and measurements in an `.effetune_backup` archive.

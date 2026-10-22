@@ -76,6 +76,7 @@ const requiredFiles = [
   'js/midi/playback-speed.js',
   'js/ui/visualizer-shared.js',
   'js/library/metadata/lyrics.js',
+  'js/ui/double-blind-test/pipeline-availability.js',
   'js/library/metadata/text-encoding.js',
   'js/ui/onboarding-tour.js',
   'js/startup.js',
@@ -322,6 +323,8 @@ if (!bootstrap.includes('.subtitle-container,') ||
 if (!bootstrap.includes('.config-dialog .device-section { display: none !important; }') ||
     !bootstrap.includes('.config-dialog .device-section:has(#language-select) { display: block !important; }') ||
     !bootstrap.includes('.config-dialog .device-section:has(#theme-select),') ||
+    !bootstrap.includes('.config-dialog .device-section:has(#pipeline-column-mode),') ||
+    !bootstrap.includes('.config-dialog .device-section:has(#visualizer-hdr),') ||
     !bootstrap.includes('.config-dialog .device-section:has(#startup-view-effects),') ||
     !bootstrap.includes('.config-dialog .device-section:has(#spectrum-overlay-display) { display: block !important; }') ||
     !bootstrap.includes('.config-dialog .radio-container:has(#startup-view-library),') ||
@@ -331,6 +334,8 @@ if (!bootstrap.includes('.config-dialog .device-section { display: none !importa
 }
 const configIntegration = await readFile(path.join(assets, 'js', 'electron', 'configIntegration.js'), 'utf8');
 if (!configIntegration.includes("const categories = ['general', 'startup', 'display', 'controllers'];") ||
+    configIntegration.includes('id="startup-view-browser"') ||
+    configIntegration.includes('id="browser-user-agent"') ||
     !configIntegration.includes('${Object.keys(categoryPanels).map(category => `') ||
     !configIntegration.includes('id="config-panel-${category}" hidden>')) {
   throw new Error('The VST settings navigation exposes unsupported standalone categories');
@@ -363,6 +368,9 @@ if (!bootstrap.includes("aboutButton.id = 'aboutSettingsButton';") ||
   throw new Error('The VST About dialog or complete third-party notices viewer is missing');
 }
 if (uiManager.includes('double-blind-test/double-blind-test.js') ||
+    html.includes('id="doubleBlindTestButton"') ||
+    html.includes('id="browserButton"') ||
+    uiManager.includes("from './browser/browser-view.js'") ||
     uiManager.includes("from './ui/audio-player.js'") ||
     uiManager.includes("from './library/") ||
     browserAudioManager.includes("from './audio/offline-processor.js'") ||
@@ -371,6 +379,19 @@ if (uiManager.includes('double-blind-test/double-blind-test.js') ||
     !clipboard.includes("searchParams.get('p')") ||
     !clipboard.includes('JSON.parse(text)') || !html.includes('id="pasteButton"')) {
   throw new Error('DBT alternate entries were not removed without preserving normal paste');
+}
+if ((await readdir(path.join(assets, 'js', 'ui', 'double-blind-test'))).join(',') !==
+    'pipeline-availability.js') {
+  throw new Error('Only the shared A/B availability policy may remain from Double Blind Test');
+}
+const visualizerView = await readFile(path.join(assets, 'js', 'visualizer', 'visualizer-view.js'), 'utf8');
+const visualizerEditor = await readFile(path.join(assets, 'js', 'visualizer', 'visualizer-editor.js'), 'utf8');
+if (visualizerView.includes('ui/audio-player/') || visualizerView.includes('this.video.') ||
+    !visualizerView.includes('this.uiManager.audioManager.getHostTransport()') ||
+    !visualizerView.includes("source: 'vst-host-project'") ||
+    !visualizerView.includes('trackIndex: 0, external: false') ||
+    !visualizerEditor.includes("type !== 'lyrics' && type !== 'video'")) {
+  throw new Error('Visualizer does not use native project transport or still exposes excluded Video');
 }
 if (pipelineManager.includes("from './pipeline/file-processor.js'") ||
     pipelineManager.includes('new FileProcessor(') ||
@@ -810,7 +831,8 @@ for (const excluded of [
   'css/pipeline-analyzer.css',
   'js/vendor/jsmediatags-3.9.5.min.js',
   'js/vendor/music-metadata-browser.mjs',
-  'js/ui/double-blind-test',
+  'js/ui/double-blind-test/double-blind-test.js',
+  'js/browser',
   'js/pipeline-analyzer',
   'js/library/library-manager-v2.js',
   'js/ui/library',

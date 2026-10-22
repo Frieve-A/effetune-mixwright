@@ -170,6 +170,8 @@ private:
 
   void appendNowPlayingSnapshot(choc::value::Value &result,
                                 std::uint64_t knownRevision);
+  void publishHostTransport(const Steinberg::Vst::ProcessContext *context) noexcept;
+  void appendHostTransport(choc::value::Value &result) const;
 
   [[nodiscard]] bool configureDsp(std::string *error = nullptr,
                                   bool waitForUiRepack = false);
@@ -674,6 +676,16 @@ private:
   std::array<float *, EngineHost::kMaxChannels> engineOutputPointers_{};
   std::array<float *, EngineHost::kMaxChannels> dryTransitionPointers_{};
   std::atomic<double> hostSampleRate_{44100.0};
+  static_assert(std::atomic<std::uint64_t>::is_always_lock_free &&
+                std::atomic<std::int64_t>::is_always_lock_free,
+                "Host transport publication must remain lock-free");
+  // The audio thread publishes a fixed-size snapshot; readers retry only a
+  // bounded number of times and never hold up processing.
+  std::atomic<std::uint64_t> transportSequence_{0};
+  std::atomic<std::int64_t> transportProjectTimeSamples_{0};
+  std::atomic<double> transportSampleRate_{0.0};
+  std::atomic_bool transportPlaying_{false};
+  std::atomic_bool transportAvailable_{false};
   double engineFramesProcessed_ = 0.0;
   std::int64_t processedHostFrames_ = 0;
   std::int64_t previousProjectTimeSamples_ = 0;

@@ -63,7 +63,7 @@ template <typename Params> std::vector<float> packedFixture(const Params &params
 }
 
 effetune::generated::SFZNotePlayerPluginParams sfzDefaults() {
-  return {.5f, -30, 3, 28, 91, 32, 0, 100, 0, 0, 1, 1, 1, 0, 18, 0, 0, -1, 100};
+  return {.5f, -30, 3, 28, 91, 32, 0, 100, 0, 0, 1, 1, 1, 0, 18, 0, 0, -1, 100, 0};
 }
 
 std::uint32_t u32(const std::uint8_t *data) {

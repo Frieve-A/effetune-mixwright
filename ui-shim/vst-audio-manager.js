@@ -978,6 +978,7 @@ export class AudioManager extends BrowserAudioManager {
     this.ioManager.sourceNode = fakeNode({ postMessage: noop });
     this.nowPlayingRevision = 0;
     this.nowPlayingMetadata = null;
+    this.hostTransport = null;
     this.telemetryTimer = setInterval(() => this.pollNativeTelemetry(), 1000 / 60);
     this.nativeContextGeneration = 0;
     this.nativeExecutionStateGeneration = 0;
@@ -1000,6 +1001,20 @@ export class AudioManager extends BrowserAudioManager {
 
   getNowPlayingMetadata() {
     return this.nowPlayingMetadata ?? null;
+  }
+
+  getHostTransport() {
+    return this.hostTransport ?? null;
+  }
+
+  applyNativeHostTransport(info) {
+    if (!Object.prototype.hasOwnProperty.call(info ?? {}, 'hostTransport')) return;
+    const transport = info.hostTransport;
+    this.hostTransport = transport?.available === true &&
+      Number.isFinite(transport.projectTimeSamples) &&
+      Number.isFinite(transport.sampleRate) && transport.sampleRate > 0
+      ? { ...transport, playing: transport.playing === true }
+      : null;
   }
 
   applyNativeNowPlaying(info) {
@@ -1039,6 +1054,7 @@ export class AudioManager extends BrowserAudioManager {
         nowPlayingRevision: this.nowPlayingRevision
       });
       this.applyNativeNowPlaying(result);
+      this.applyNativeHostTransport(result);
       this.applyNativePerformanceStatus(result);
       this.applyHostAutomationDeltas(result.automationDeltas);
       this.applyHostDiagnostics(result.diagnostics);
@@ -1084,6 +1100,7 @@ export class AudioManager extends BrowserAudioManager {
         startup: true, nowPlayingRevision: 0
       });
       this.applyNativeNowPlaying(info);
+      this.applyNativeHostTransport(info);
       this.contextManager.audioContext = fakeAudioContext(info.engineSampleRate, info.channels);
       this.nativeContextGeneration = info.contextGeneration || 0;
       this.preserveReadyNativePipelineDuringStartup =

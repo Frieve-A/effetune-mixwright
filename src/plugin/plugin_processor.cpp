@@ -2607,7 +2607,48 @@ void EffeTuneProcessor::restoreDryFromScratch(AudioBusBuffers &output, const int
   output.silenceFlags = 0;
 }
 
+void EffeTuneProcessor::publishHostTransport(const ProcessContext *context) noexcept {
+  transportSequence_.fetch_add(1);
+  const auto available = context != nullptr && std::isfinite(context->sampleRate) &&
+                         context->sampleRate > 0.0;
+  transportProjectTimeSamples_.store(available ? context->projectTimeSamples : 0);
+  transportSampleRate_.store(available ? context->sampleRate : 0.0);
+  transportPlaying_.store(available && (context->state & ProcessContext::kPlaying) != 0);
+  transportAvailable_.store(available);
+  transportSequence_.fetch_add(1);
+}
+
+void EffeTuneProcessor::appendHostTransport(choc::value::Value &result) const {
+  auto transport = choc::value::createObject({});
+  bool available = false, playing = false;
+  bool captured = false;
+  std::int64_t samples = 0;
+  double sampleRate = 0.0;
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    const auto sequence = transportSequence_.load();
+    if ((sequence & 1u) != 0) continue;
+    samples = transportProjectTimeSamples_.load();
+    sampleRate = transportSampleRate_.load();
+    playing = transportPlaying_.load();
+    const auto valid = transportAvailable_.load();
+    if (sequence == transportSequence_.load()) {
+      available = valid;
+      captured = true;
+      break;
+    }
+  }
+  // A raced read is not evidence of a missing context. Omit this update so an
+  // open editor retains its last coherent position until the next poll.
+  if (!captured) return;
+  transport.addMember("available", available);
+  transport.addMember("projectTimeSamples", available ? samples : std::int64_t{0});
+  transport.addMember("sampleRate", available ? sampleRate : 0.0);
+  transport.addMember("playing", available && playing);
+  result.addMember("hostTransport", std::move(transport));
+}
+
 tresult PLUGIN_API EffeTuneProcessor::process(ProcessData &data) {
+  publishHostTransport(data.processContext);
   // Names this thread for every record emitted below it, including the ones the
   // helpers it calls emit. Two thread-local accesses; see
   // plugin/automation_trace.h.
@@ -4104,6 +4145,7 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     auto result = choc::value::createObject({});
     result.addMember("ok", true);
     result.addMember("sampleRate", context.sampleRate);
+    appendHostTransport(result);
     result.addMember("engineSampleRate", context.engineSampleRate);
     result.addMember("nativeSpectrumTap", engine_.spectrumCapture().nativeAnalysisSupported());
     result.addMember("channels", static_cast<std::int64_t>(context.channels));
@@ -4212,6 +4254,7 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     result.addMember("ok", true);
     result.addMember("bytes", static_cast<std::int64_t>(bytes));
     result.addMember("droppedFrames", static_cast<std::int64_t>(droppedFrames));
+    appendHostTransport(result);
     auto telemetrySources = choc::value::createObject({});
     for (const auto &[tap, source] : pipelineSources) {
       auto identity = choc::value::createObject({});

@@ -1907,6 +1907,7 @@ int main(const int argc, char **argv) {
               document.getElementById('config-category-startup').click();
               if (!visible(document.getElementById('startup-view-effects')) ||
                   !visible(document.getElementById('startup-view-visualizer')) ||
+                  document.getElementById('startup-view-browser') ||
                   visible(document.getElementById('startup-view-library')) ||
                   visible(document.getElementById('pl-last')) || visible(document.getElementById('auto-launch')))
                 throw new Error('Startup visibility');
@@ -1918,6 +1919,21 @@ int main(const int argc, char **argv) {
               const display = document.getElementById('spectrum-overlay-display');
               if (!visible(display) || visible(document.getElementById('spectrum-overlay-quality')) ||
                   visible(document.getElementById('visual-sync'))) throw new Error('Display visibility');
+              const columnMode = document.getElementById('pipeline-column-mode');
+              const hdr = document.getElementById('visualizer-hdr');
+              if (!visible(columnMode) || !visible(hdr)) throw new Error('Column/HDR visibility');
+              for (const value of ['manual', 'auto']) {
+                columnMode.value = value;
+                columnMode.dispatchEvent(new Event('change', { bubbles: true }));
+                await waitFor(() => window.appConfig.pipelineColumnMode === value);
+              }
+              const initialHdr = hdr.checked;
+              hdr.checked = !initialHdr;
+              hdr.dispatchEvent(new Event('change', { bubbles: true }));
+              if (localStorage.getItem('effetune_visualizer_hdr') !== String(!initialHdr))
+                throw new Error('HDR preference persistence');
+              hdr.checked = initialHdr;
+              hdr.dispatchEvent(new Event('change', { bubbles: true }));
               for (const value of ['peakHold', 'instant']) {
                 display.value = value;
                 display.dispatchEvent(new Event('change', { bubbles: true }));

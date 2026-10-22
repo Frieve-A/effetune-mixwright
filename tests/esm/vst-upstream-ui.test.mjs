@@ -93,7 +93,7 @@ test('bundled Visualizer module graph retains viewport menu clamping', async () 
   } finally { globalThis.window = previousWindow; }
 });
 
-test('Visualizer add-item choices omit Lyrics while retaining every other type', async () => {
+test('Visualizer add-item choices omit Lyrics and Video while retaining Counter', async () => {
   const { VisualizerEditor } = await assetModule('js/visualizer/visualizer-editor.js');
   const { ITEM_TYPES, createDefaultLayout } = await assetModule('js/visualizer/visualizer-model.js');
   const previousDocument = globalThis.document;
@@ -119,7 +119,9 @@ test('Visualizer add-item choices omit Lyrics while retaining every other type',
     };
     assert.throws(() => VisualizerEditor.prototype.render.call(editor), error => error === reachedChoices);
     assert.ok(ITEM_TYPES.includes('lyrics'), 'Lyrics remains a supported saved item type');
-    assert.deepEqual(choices.toSorted(), ITEM_TYPES.filter(type => type !== 'lyrics').toSorted());
+    assert.ok(ITEM_TYPES.includes('video'), 'Video remains a supported saved item type');
+    assert.ok(choices.includes('counter'));
+    assert.deepEqual(choices.toSorted(), ITEM_TYPES.filter(type => !['lyrics', 'video'].includes(type)).toSorted());
   } finally { globalThis.document = previousDocument; }
 });
 
@@ -181,6 +183,56 @@ test('bundled Visualizer reads transient host metadata without an internal playe
   assert.equal(VisualizerView.prototype.metadata.call(view), null);
 });
 
+test('Visualizer Counter follows project transport and cannot reset on click or editor reopen', async () => {
+  const { VisualizerView } = await assetModule('js/visualizer/visualizer-view.js');
+  let transport = null;
+  const createView = () => ({ layout: { items: [{ id: 'counter', type: 'counter' }] },
+    uiManager: { audioManager: { getHostTransport: () => transport } },
+    counters: VisualizerView.prototype.counters });
+  let view = createView();
+  const descriptor = now => view.counters(now).get('counter');
+  assert.deepEqual(descriptor(100), { time: 0, trackIndex: 0, external: false, playing: false,
+    speed: 1, source: 'vst-host-project', stamp: .1 });
+  for (const [samples, playing] of [[96000, true], [144000, false], [480000, true], [48000, true], [-24000, false]]) {
+    transport = { projectTimeSamples: samples, sampleRate: 48000, playing };
+    assert.equal(descriptor(5000).time, Math.max(0, samples / 48000));
+    assert.equal(descriptor(9000).time, descriptor(5000).time, 'wall time never advances the project clock');
+    assert.equal(descriptor(9000).playing, playing);
+    assert.equal(VisualizerView.prototype.resetCounter.call(view, 'counter', 10000), false);
+    view = createView();
+    assert.equal(descriptor(11000).time, Math.max(0, samples / 48000), 'a reopened editor uses the same project position');
+  }
+  transport = null;
+  assert.equal(descriptor(20000).time, 0);
+  assert.equal(descriptor(20000).playing, false);
+  assert.equal(VisualizerView.prototype.videoFrame.call(view), null);
+});
+
+test('excluded desktop entries leave ordinary A/B availability and imported Video data intact', async () => {
+  const { UIManager } = await assetModule('js/ui-manager.js');
+  const html = await assetText('effetune.html');
+  assert.ok(!html.includes('id="doubleBlindTestButton"'));
+  assert.ok(!html.includes('id="browserButton"'));
+  const manager = { audioManager: { pipelineA: [], pipelineB: [] },
+    copyAToBButton: {}, copyBToAButton: {}, isDoubleBlindActive: () => false,
+    refreshApplicationMenu() {} };
+  UIManager.prototype.updatePipelineMenuState.call(manager);
+  assert.equal(manager.copyAToBButton.disabled, false);
+  assert.equal(manager.copyBToAButton.disabled, false);
+  manager.audioManager.pipelineB = null;
+  UIManager.prototype.updatePipelineMenuState.call(manager);
+  assert.equal(manager.copyAToBButton.disabled, false);
+  assert.equal(manager.copyBToAButton.disabled, true);
+  assert.equal(await UIManager.prototype.showBrowserView.call(manager), false);
+  const { createDefaultLayout, createItem, normalizeLayout, snapshotLayout, encodeLayoutShare, decodeLayoutShare } =
+    await assetModule('js/visualizer/visualizer-model.js');
+  const layout = createDefaultLayout();
+  const video = createItem('video', 'imported-video');
+  layout.items.push(video);
+  assert.deepEqual(normalizeLayout(layout).items.find(item => item.id === video.id), video);
+  assert.deepEqual(decodeLayoutShare(encodeLayoutShare(layout)), snapshotLayout(layout));
+});
+
 test('categorized settings select supported UI panels and retain category selection', async () => {
   const source = await assetText('js/electron/configIntegration.js');
   const selectCategory = source.match(/  function selectCategory\(category\) \{[\s\S]*?\n  \}/)?.[0];
@@ -214,8 +266,42 @@ test('categorized settings select supported UI panels and retain category select
   for (const category of [...unsupported, 'startup', 'display']) assert.equal(nodes[`config-panel-${category}`].hidden, true);
 });
 
+test('automatic columns use available width while preserving the saved manual count', async () => {
+  const { PipelineColumnManager } = await assetModule('js/ui/pipeline/pipeline-column-manager.js');
+  const previous = Object.fromEntries(['window', 'document', 'localStorage', 'requestAnimationFrame']
+    .map(key => [key, globalThis[key]]));
+  const storage = new Map([['pipelineColumns', '3']]);
+  const saved = [];
+  let automaticColumns = 2;
+  let rendered = 0;
+  Object.assign(globalThis, {
+    localStorage: { getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, String(value)) },
+    window: { appConfig: { pipelineColumnMode: 'auto' }, uiManager: { layoutMode: { isMobile: false } },
+      electronIntegration: { saveConfig: config => saved.push(config) } },
+    document: { documentElement: { style: { setProperty() {} } }, getElementById: () => null },
+    requestAnimationFrame: action => action()
+  });
+  try {
+    const manager = new PipelineColumnManager({ audioManager: {}, pipelineList: null });
+    manager.getAutomaticColumnCount = () => automaticColumns;
+    manager.rebuildPipelineColumns = columns => { rendered = columns; };
+    manager.updatePipelineColumns(manager.getCurrentColumns());
+    assert.equal(rendered, 2);
+    automaticColumns = 1;
+    manager.adjustColumnsToWindow();
+    assert.equal(rendered, 1);
+    assert.equal(manager.getCurrentColumns(), 3);
+    assert.equal(storage.get('pipelineColumns'), '3');
+    assert.equal(saved.length, 0, 'responsive layout does not overwrite the manual preference');
+    window.appConfig.pipelineColumnMode = 'manual';
+    manager.updatePipelineColumns(manager.getCurrentColumns());
+    assert.equal(rendered, 3);
+    assert.deepEqual(saved, [{ columns: 3 }]);
+  } finally { Object.assign(globalThis, previous); }
+});
+
 test('VST config loads supported startup views and normal PCM quality without losing preferences', async () => {
-  for (const startupView of ['effects', 'visualizer', 'library', undefined]) {
+  for (const startupView of ['effects', 'visualizer', 'library', 'browser', undefined]) {
     const context = await bootstrap(async () => ({ ok: true,
       config: { startupView, theme: 'paper', spectrumOverlayQuality: 'hq', spectrumOverlayPeakHold: true, future: 42 } }));
     const { config } = await context.window.electronAPI.loadConfig();
@@ -386,7 +472,7 @@ test('a native Spectrum Tap build preserves HQ configuration and reveals the qua
 
 test('bundled settings persist supported choices and restore rejected edits', async () => {
   const bootstrapSource = await assetText('vst-bootstrap.js');
-  for (const id of ['frequency-preview-sound', 'sfz-size-limit']) {
+  for (const id of ['frequency-preview-sound', 'sfz-size-limit', 'pipeline-column-mode', 'visualizer-hdr']) {
     assert.ok(bootstrapSource.includes(`.config-dialog .device-section:has(#${id}),`),
       `${id} must be visible in VST settings`);
   }
@@ -395,9 +481,12 @@ test('bundled settings persist supported choices and restore rejected edits', as
   try {
     for (const success of [true, false]) {
       let saved = { theme: 'midnight', startupView: 'effects', spectrumOverlayPeakHold: false,
-        spectrumOverlayQuality: 'normal', frequencyPreviewSound: 'sine', sfzMaxSizeMiB: 256, future: 42 };
+        spectrumOverlayQuality: 'normal', frequencyPreviewSound: 'sine', sfzMaxSizeMiB: 256,
+        pipelineColumnMode: 'auto', future: 42 };
       const calls = [];
       const applied = [];
+      const hdrStorage = new Map();
+      const hdrApplied = [];
       const context = await bootstrap(async serialized => {
         const call = JSON.parse(serialized);
         calls.push(call);
@@ -408,15 +497,20 @@ test('bundled settings persist supported choices and restore rejected edits', as
       });
       globalThis.window = context.window;
       globalThis.document = createFakeDocument();
-      window.uiManager = { t: key => key, setThemePreference: theme => applied.push(['theme', theme]), setError() {} };
+      window.localStorage = { getItem: key => hdrStorage.get(key), setItem: (key, value) => hdrStorage.set(key, value) };
+      window.uiManager = { t: key => key, setThemePreference: theme => applied.push(['theme', theme]), setError() {},
+        visualizerView: { setHdrEnabled: enabled => hdrApplied.push(enabled) } };
       window.SpectrumOverlay = { setSettings: settings => applied.push(['spectrum', settings]) };
       await showConfigDialog(true, {});
+      assert.equal(document.getElementById('startup-view-browser'), null);
       const theme = document.getElementById('theme-select');
       assert.deepEqual(theme.children.map(option => option.value), ['graphite', 'paper', 'midnight', 'ember', 'mint']);
       const sound = document.getElementById('frequency-preview-sound');
       assert.deepEqual(sound.children.map(option => option.value), ['sine', 'bandpassNoise']);
       const sfzLimit = document.getElementById('sfz-size-limit');
       assert.deepEqual(sfzLimit.children.map(option => option.value), ['64', '128', '256', '512', '1024']);
+      const columnMode = document.getElementById('pipeline-column-mode');
+      assert.deepEqual(columnMode.children.map(option => option.value), ['manual', 'auto']);
       const originalError = console.error;
       try {
         if (!success) console.error = () => {};
@@ -433,14 +527,23 @@ test('bundled settings persist supported choices and restore rejected edits', as
         sfzLimit.value = '1024';
         await sfzLimit.dispatchEvent('change');
         assert.equal(sfzLimit.value, success ? '1024' : '256');
+        columnMode.value = 'manual';
+        await columnMode.dispatchEvent('change');
+        assert.equal(columnMode.value, success ? 'manual' : 'auto');
+        const hdr = document.getElementById('visualizer-hdr');
+        hdr.checked = true;
+        await hdr.dispatchEvent('change');
       } finally { console.error = originalError; }
       assert.equal(theme.value, success ? 'paper' : 'midnight');
       assert.equal(saved.startupView, success ? 'visualizer' : 'effects');
       assert.equal(saved.spectrumOverlayPeakHold, success);
       assert.equal(saved.frequencyPreviewSound, success ? 'bandpassNoise' : 'sine');
       assert.equal(saved.sfzMaxSizeMiB, success ? 1024 : 256);
+      assert.equal(saved.pipelineColumnMode, success ? 'manual' : 'auto');
+      assert.equal(hdrStorage.get('effetune_visualizer_hdr'), 'true');
+      assert.deepEqual(hdrApplied, [true]);
       assert.equal(saved.future, 42);
-      assert.equal(calls.filter(call => call.type === 'config/save').length, 5);
+      assert.equal(calls.filter(call => call.type === 'config/save').length, 6);
       assert.deepEqual(applied, success ? [['theme', 'paper'], ['spectrum', { quality: 'normal', peakHold: true }]] : []);
       await document.getElementById('close-btn').dispatchEvent('click');
       await showConfigDialog(true, {});
@@ -449,6 +552,8 @@ test('bundled settings persist supported choices and restore rejected edits', as
       assert.equal(document.getElementById('spectrum-overlay-display').value, success ? 'peakHold' : 'instant');
       assert.equal(document.getElementById('frequency-preview-sound').value, saved.frequencyPreviewSound);
       assert.equal(document.getElementById('sfz-size-limit').value, String(saved.sfzMaxSizeMiB));
+      assert.equal(document.getElementById('pipeline-column-mode').value, saved.pipelineColumnMode);
+      assert.equal(document.getElementById('visualizer-hdr').checked, true);
       await document.getElementById('close-btn').dispatchEvent('click');
     }
   } finally { Object.assign(globalThis, previous); }

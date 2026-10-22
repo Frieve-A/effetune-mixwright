@@ -7269,7 +7269,7 @@ void testSfzReplacementKeepsWetProcessing() {
   auto processSetup = setup(48000, 64);
   expect(processor->setupProcessing(processSetup) == kResultOk, "prepare bank processor");
   const auto request = [&](const std::string &json) { return choc::json::parse(processor->handleUiMessage(json)); };
-  const auto sfz = std::string(R"({"id":55,"type":"SFZNotePlayerPlugin","name":"SFZ","enabled":false,"parameters":{},"wasmParams":[0.5,-30,3,28,91,32,0,100,0,0,1,1,1,0,18,0,0,-1,100],"wasmParamsHash":)") +
+  const auto sfz = std::string(R"({"id":55,"type":"SFZNotePlayerPlugin","name":"SFZ","enabled":false,"parameters":{},"wasmParams":[0.5,-30,3,28,91,32,0,100,0,0,1,1,1,0,18,0,0,-1,100,0],"wasmParamsHash":)") +
       std::to_string(effetune::generated::SFZNotePlayerPluginParams::kHash) + "}";
   expect(request(std::string(R"({"type":"pipeline/rebuild","payload":{"plugins":[{"id":1,"type":"VolumePlugin","name":"Volume","enabled":true,"parameters":{"vl":-6},"wasmParams":[-6],"wasmParamsHash":1719233191},)") + sfz + "]}}")["ok"].getBool(),
          "install gain path and loadable instrument");
@@ -7372,7 +7372,7 @@ void testSfzReferencesSurviveAbAndState() {
   const auto plugin = [&](int id, const std::string &reference) {
     return std::string(R"({"id":)") + std::to_string(id) +
         R"(,"type":"SFZNotePlayerPlugin","name":"SFZ Note Player","enabled":true,"parameters":{"sf":")" + reference +
-        R"("},"wasmParams":[0.5,-30,3,28,91,32,0,100,0,0,1,1,1,0,18,0,0,-1,100],"wasmParamsHash":)" +
+        R"("},"wasmParams":[0.5,-30,3,28,91,32,0,100,0,0,1,1,1,0,18,0,0,-1,100,0],"wasmParamsHash":)" +
         std::to_string(effetune::generated::SFZNotePlayerPluginParams::kHash) + "}";
   };
   for (const auto pipeline : {"A", "B", "A"}) {
@@ -7413,7 +7413,7 @@ void testSfzAndIrTransferAdmissionBudgets() {
   };
   const auto sfz = [&](int id) {
     return std::string(R"({"id":)") + std::to_string(id) +
-        R"(,"type":"SFZNotePlayerPlugin","name":"SFZ","enabled":true,"parameters":{},"wasmParams":[0.5,-30,3,28,91,32,0,100,0,0,1,1,1,0,18,0,0,-1,100],"wasmParamsHash":)" +
+        R"(,"type":"SFZNotePlayerPlugin","name":"SFZ","enabled":true,"parameters":{},"wasmParams":[0.5,-30,3,28,91,32,0,100,0,0,1,1,1,0,18,0,0,-1,100,0],"wasmParamsHash":)" +
         std::to_string(effetune::generated::SFZNotePlayerPluginParams::kHash) + "}";
   };
   const auto ir = [&](int id) {
@@ -11721,6 +11721,103 @@ void testAutomationTraceFollowsItsEnvironmentVariable() {
          "block, are never filtered out");
 }
 
+void testHostProjectTransportSnapshot() {
+  auto processor = std::make_unique<EffeTuneProcessor>();
+  expect(processor->initialize(nullptr) == kResultOk, "initialize host transport fixture");
+  const auto request = [&](const char *json) {
+    return choc::json::parse(processor->handleUiMessage(json));
+  };
+  expect(!hostInfo(*processor)["hostTransport"]["available"].getBool(),
+         "transport is unavailable until the host supplies a process context");
+  auto processSetup = setup(48000, 64);
+  expect(processor->setupProcessing(processSetup) == kResultOk, "prepare host transport fixture");
+  expect(request(R"({"type":"os/set","payload":{"factor":4,"phase":"minimum","quality":"medium"}})")["ok"].getBool(),
+         "oversample transport fixture independently of project time");
+  installGainPipeline(*processor);
+  expect(processor->setActive(true) == kResultOk, "activate host transport fixture");
+  gate_ordering::AudioRig rig(0);
+  ProcessContext context{};
+  context.sampleRate = 48000;
+  context.continousTimeSamples = 9000000;
+  rig.data.processContext = &context;
+  const auto render = [&] {
+    tresult result;
+    { effetune::allocation_guard::Scope guard; result = processor->process(rig.data); }
+    expect(result == kResultOk, "publish project transport without audio allocation");
+  };
+  for (const auto samples : {std::int64_t{96000}, std::int64_t{480000},
+                              std::int64_t{48000}, std::int64_t{-24000}}) {
+    context.projectTimeSamples = samples;
+    context.state = ProcessContext::kPlaying | ProcessContext::kContTimeValid |
+                    ProcessContext::kCycleActive;
+    render();
+    for (const auto *message : {R"({"type":"host/getInfo"})", R"({"type":"telemetry/read"})"}) {
+      const auto reply = request(message);
+      const auto transport = reply["hostTransport"];
+      expect(transport["available"].getBool() && transport["playing"].getBool() &&
+                 transport["projectTimeSamples"].getInt64() == samples &&
+                 transport["sampleRate"].getWithDefault<double>(0) == 48000,
+             "both bridges preserve playing, seeks, loops and negative project time at host rate");
+    }
+  }
+  context.state = 0;
+  context.projectTimeSamples = 144000;
+  rig.data.numSamples = 0;
+  render();
+  const auto reopenedReply = request(R"({"type":"host/getInfo","payload":{"startup":true}})");
+  const auto reopened = reopenedReply["hostTransport"];
+  expect(!reopened["playing"].getBool() && reopened["projectTimeSamples"].getInt64() == 144000,
+         "flush-only stopped blocks publish transport and editor reopening retains it");
+  rig.data.processContext = nullptr;
+  render();
+  expect(!request(R"({"type":"telemetry/read"})")["hostTransport"]["available"].getBool(),
+         "missing host context invalidates transport instead of advancing a wall clock");
+  expect(processor->setActive(false) == kResultOk && processor->terminate() == kResultOk,
+         "terminate host transport fixture");
+}
+
+void testSfzEventDetectionRefreshesHostLatency() {
+  auto processor = std::make_unique<EffeTuneProcessor>();
+  expect(processor->initialize(nullptr) == kResultOk, "initialize SFZ detection latency fixture");
+  auto processSetup = setup(48000, 64);
+  expect(processor->setupProcessing(processSetup) == kResultOk, "prepare SFZ detection latency fixture");
+  using Params = effetune::generated::SFZNotePlayerPluginParams;
+  Params params{.5f, -30, 3, 28, 91, 32, 0, 100, 0, 0, 1, 1, 1, 0, 18, 0, 0, -1, 100, 0};
+  const auto packed = [&] {
+    return std::span<const float>(reinterpret_cast<const float *>(&params), Params::kFloatCount);
+  };
+  auto values = choc::value::createEmptyArray();
+  for (const auto value : packed()) values.addArrayElement(value);
+  const auto installed = choc::json::parse(processor->handleUiMessage(
+      std::string{R"({"type":"pipeline/rebuild","payload":{"plugins":[{"id":55,"type":"SFZNotePlayerPlugin","name":"SFZ Note Player","enabled":true,"parameters":{},"wasmParams":)"} +
+      choc::json::toString(values) + R"(,"wasmParamsHash":)" + std::to_string(Params::kHash) + "}]}}"));
+  expect(installed["ok"].getBool(), "the imported twenty-field SFZ layout is accepted");
+  expect(processor->setActive(true) == kResultOk, "activate SFZ detection latency fixture");
+  gate_ordering::AudioRig rig(0);
+  const auto render = [&] {
+    tresult result;
+    { effetune::allocation_guard::Scope guard; result = processor->process(rig.data); }
+    expect(result == kResultOk, "render SFZ detection transition without audio allocation");
+    PluginProcessorTestAccess::serviceLatencyUpdates(*processor);
+  };
+  for (int block = 0; block < 32; ++block) render();
+  const auto classicLatency = processor->getLatencySamples();
+  expect(classicLatency > 0, "classic detection advertises analysis latency");
+  auto command = std::make_unique<effetune::vst::AudioCommand>();
+  for (const float detection : {1.0f, 0.0f}) {
+    params.detection = detection;
+    expect(PluginProcessorTestAccess::publishParameterImage(
+        *processor, *command, 55, Params::kHash, packed()), "queue detection mode through the native parameter path");
+    for (int block = 0; block < 32; ++block) render();
+    const auto latency = processor->getLatencySamples();
+    expect((detection == 1 ? latency > classicLatency : latency == classicLatency) &&
+               PluginProcessorTestAccess::enginePipelineLatency(*processor) == latency,
+           "the existing latency observer aligns host and engine after both detection transitions");
+  }
+  expect(processor->setActive(false) == kResultOk && processor->terminate() == kResultOk,
+         "terminate SFZ detection latency fixture");
+}
+
 } // namespace
 
 int main() {
@@ -11730,6 +11827,8 @@ int main() {
     testHostGateFixturePublishesThreeParameters();
 #endif
     testProcessingSurvivesHostReconfiguration();
+    testHostProjectTransportSnapshot();
+    testSfzEventDetectionRefreshesHostLatency();
     testContextualExecutionAdmissionSurvivesEngineContextChanges();
     testConcurrentHostContextChangeWinsPluginUpdateAdmission();
     testOversamplingFailureRestoresPreviousPlayableGeneration();
