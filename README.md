@@ -48,7 +48,7 @@ rejects unexpected changes to the construction code when the dependency is updat
 Use the **Visualizer** header button to view and edit analyzer layouts fed by the
 native pipeline output. The **Effect Pipeline** button returns to effect editing.
 Visualizer presets and imported images use the VST WebView's local storage.
-The music player and music library remain outside the VST interface.
+The music player, music library, and network music remain outside the VST interface.
 Upstream's LAN remote control is not available in this VST build.
 The first-run tour explains DAW audio input and the supported views; reopen it
 with **Settings → Take the tour**. **Settings → Help** opens the guide.
@@ -59,10 +59,13 @@ host sample rate regardless of oversampling; clicking a Counter does not reset
 it. Negative project positions display as zero. A host that supplies no process
 context displays zero until it provides a position.
 The desktop Browser and Video playback remain outside the VST interface.
-The add-item menu omits Lyrics and Video, and the bundled presets omit
-Lyric Stage. Lyrics items in existing or imported layouts and user presets remain
+The add-item menu omits Lyrics, Video, Playback Control, Seek Bar, and Track
+Information, and the bundled presets omit Lyric Stage. Lyrics items in existing or imported layouts and user presets remain
 editable; live player lyrics are unavailable because audio comes from the DAW.
 Saved or imported Video items retain their layout data, with playback unavailable.
+Imported Playback Control, Seek Bar, and Track Information items also retain their layout data.
+Effect parameter locks and collapsed panels are saved with the host's plug-in
+state, A/B pipelines, presets, and undo history.
 
 Use **Settings → Configuration → Controllers** to open controller mapping settings.
 Controller mappings can toggle master bypass, switch A/B, and step through saved
@@ -72,7 +75,8 @@ presets. Player transport controls are omitted from the mapping choices.
 It also selects sine or bandpass noise for frequency audition and the SFZ bank
 size limit (64, 128, 256, 512, or 1024 MiB; 256 MiB by default).
 **Startup** selects the Effect Pipeline or Visualizer view when the editor opens;
-the pipeline itself continues to come from the host's plug-in state.
+Visualizer can also start expanded. The pipeline itself continues to come from
+the host's plug-in state.
 **Display** selects instantaneous or Peak Hold spectra for per-effect Spectrum
 Overlays, automatic or manual pipeline columns, and Visualizer HDR rendering.
 Automatic columns adapt to the editor width while retaining the saved manual

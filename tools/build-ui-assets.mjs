@@ -90,7 +90,7 @@ for (const entry of await readdir(visualizerPresetsDirectory)) {
   await writeFile(presetPath, JSON.stringify(presets, null, 2) + '\n', 'utf8');
 }
 // Shared modal/controller styling lives in the upstream library stylesheet.
-for (const entry of ['effetune-mobile.css', 'pipeline-analyzer.css']) {
+for (const entry of ['effetune-mobile.css', 'pipeline-analyzer.css', 'effetune-network-music.css']) {
   await rm(path.join(output, 'css', entry), { force: true });
 }
 await cp(path.join(projectRoot, 'ui-shim', 'vst-bootstrap.js'),
@@ -163,6 +163,13 @@ if (!app.includes(originalImport)) {
 }
 app = app.replace(originalImport,
   `import { AudioManager } from '../vst-audio-manager.js';`);
+const remoteStartup = `            // LAN remote control (remote-v1); does nothing unless enabled in main.
+            import('./remote/remote-control.js')
+                .then(module => module.startRemoteControl(window))
+                .catch(error => console.warn('Remote control unavailable:', error));
+`;
+if (app.split(remoteStartup).length !== 2) throw new Error('Unable to locate excluded remote startup');
+app = app.replace(remoteStartup, '');
 const libraryConstantsImport = `import { normalizeMusicLibraryStartupView } from './library/constants.js';`;
 if (!app.includes(libraryConstantsImport)) {
   throw new Error('Unable to locate the music-library constants import');
@@ -190,7 +197,11 @@ app = app.replace(startupViewPreference, `    applyStartupViewPreference() {
 
     async openConfiguredStartupView() {
         if (this.startupConfig?.startupView === 'visualizer') {
-            try { await this.uiManager?.showVisualizerView?.(); }
+            try {
+                if (await this.uiManager?.showVisualizerView?.() && this.startupConfig.visualizerStartupExpanded === true) {
+                    this.uiManager.visualizerView.setExpanded(true);
+                }
+            }
             catch (error) {
                 console.error('Error opening Visualizer startup view:', error);
                 this.uiManager?.setError?.('Visualizer could not be opened. Please try the Visualizer button.', true);
@@ -363,7 +374,13 @@ const playerMetadata = `    metadata() {
         // OpenHome can retain the player and its last track after the UI closes.
         if (!player?.ui?.container) return null;
         const snapshot = player?.stateManager?.getStateSnapshot();
-        return snapshot?.currentTrack ? player.mediaSessionManager?.buildMetadata(snapshot) : null;
+        if (!snapshot?.currentTrack && !snapshot?.liveInputActive) return null;
+        const metadata = player.mediaSessionManager?.buildMetadata(snapshot);
+        if (!metadata) return null;
+        const information = snapshot.liveInputActive ? snapshot.liveInputInformation
+            : getTrackInformation(snapshot.currentTrack, metadata);
+        return { ...metadata, 'track-info': formatTrackInformation(information,
+            (key, fallback) => this.t(key, fallback), snapshot.liveInputActive ? 'AirPlay' : '') };
     }`;
 if (visualizerView.split(playerMetadata).length - 1 !== 1) {
   throw new Error('Unable to locate the Visualizer metadata provider');
@@ -389,6 +406,7 @@ visualizerView = visualizerView.replace(counterProvider, `    counters(now = per
 `).replace(videoProvider, '    videoFrame() { return null; }\n');
 for (const integration of [
   "import { SynchronizedVideo } from '../ui/audio-player/synchronized-video.js';\n",
+  "import { formatTrackInformation, getTrackInformation } from '../ui/audio-player/track-information.js';\n",
   "import { hasPlaybackRegionDescriptor } from '../ui/audio-player/playback-region.js';\n",
   '        this.video = new SynchronizedVideo();\n',
   "        this.video.setEnabled(this.layout.items.some(item => item.type === 'video'));\n",
@@ -402,9 +420,23 @@ for (const integration of [
 }
 await writeFile(visualizerViewPath, visualizerView, 'utf8');
 
+const visualizerRendererPath = path.join(output, 'js', 'visualizer', 'visualizer-renderer.js');
+let visualizerRenderer = await readText(visualizerRendererPath);
+for (const integration of [
+  "import { isPwaNetworkArtworkUrl } from '../network-music/pwa-connection.js';\n",
+  "            if (isPwaNetworkArtworkUrl(url)) image.crossOrigin = 'anonymous';\n"
+]) {
+  if (visualizerRenderer.split(integration).length !== 2) {
+    throw new Error('Unable to locate excluded network artwork integration');
+  }
+  visualizerRenderer = visualizerRenderer.replace(integration, '');
+}
+await writeFile(visualizerRendererPath, visualizerRenderer, 'utf8');
+
 const tourPath = path.join(output, 'js', 'ui', 'onboarding-tour.js');
 let tour = await readText(tourPath);
 for (const [original, replacement] of [
+  ["    { id: 'browser', target: '#browserButton' },\n", ''],
   ["{ id: 'sound', target: '#openMusicButton', mobileTarget: '#mobilePlayerView .mobile-open-music', mobileBody: true, view: 'player' }", "{ id: 'sound', target: '#pipeline' }"],
   ["{ id: 'views', target: '#openLibraryButton', mobileTarget: '.mobile-bottom-button[data-view=\"library\"]', mobileBody: true }", "{ id: 'views', target: '#visualizerButton' }"],
   ["{ id: 'help', target: '#whatsThisLink', mobileTarget: null, mobileBody: true }", "{ id: 'help', target: '#settingsMenuButton' }"]
@@ -431,7 +463,7 @@ if (visualizerEditor.split(visualizerAddChoices).length - 1 !== 1) {
   throw new Error('Unable to locate Visualizer add-item choices');
 }
 visualizerEditor = visualizerEditor.replace(visualizerAddChoices,
-  "byLabel(ITEM_TYPES.filter(type => type !== 'lyrics' && type !== 'video').map(type =>");
+  "byLabel(ITEM_TYPES.filter(type => !['lyrics', 'video', 'playback-control', 'seek-bar', 'track-info'].includes(type)).map(type =>");
 const visualizerChannels = `            const channels = [['', '1–2'], ['L', 'L'], ['R', 'R'], ...Array.from({ length: 7 }, (_, i) => [\`\${i * 2 + 3}\${i * 2 + 4}\`, \`\${i * 2 + 3}–\${i * 2 + 4}\`]), ...Array.from({ length: 16 }, (_, i) => [\`\${i + 1}\`, \`\${i + 1}\`])];
             this.field(properties, this.t('visualizer.channel', 'Channel'), 'select', item.channel || '', value => { item.channel = value || null; this.changed(); }, { values: channels });`;
 if (visualizerEditor.split(visualizerChannels).length - 1 !== 1) {
@@ -550,6 +582,69 @@ if (history.split(historyWorkletUpdate).length - 1 !== 1) {
 history = history.replace(historyWorkletUpdate, '');
 await writeFile(historyPath, history, 'utf8');
 
+const itemBuilderPath = path.join(output, 'js', 'ui', 'pipeline', 'pipeline-item-builder.js');
+let itemBuilder = await readText(itemBuilderPath);
+const saveUIState = `    saveUIState() {
+        this.pipelineManager?.historyManager?.saveState();`;
+if (itemBuilder.split(saveUIState).length !== 2) {
+  throw new Error('Unable to locate effect UI state persistence');
+}
+itemBuilder = itemBuilder.replace(saveUIState, `    saveUIState() {
+        this.audioManager.persistPluginUIState();
+        this.pipelineManager?.historyManager?.saveState();`);
+await writeFile(itemBuilderPath, itemBuilder, 'utf8');
+
+const sectionHandlerPath = path.join(output, 'js', 'ui', 'pipeline', 'pipeline-section-handler.js');
+let sectionHandler = await readText(sectionHandlerPath);
+const sectionUIState = `        this.updateAllTooltips();
+        this.pipelineManager?.historyManager?.saveState();
+        this.pipelineCore.updateURL();`;
+if (sectionHandler.split(sectionUIState).length !== 2) {
+  throw new Error('Unable to locate section UI state persistence');
+}
+sectionHandler = sectionHandler.replace(sectionUIState, `        this.updateAllTooltips();
+        this.pipelineCore.itemBuilder.saveUIState();`);
+await writeFile(sectionHandlerPath, sectionHandler, 'utf8');
+
+// Only Web MIDI is available in the VST WebView. Drop the inactive Android
+// integration before it pulls the excluded music player into the module graph.
+const midiManagerPath = path.join(output, 'js', 'midi', 'midi-controller-manager.js');
+let midiManager = await readText(midiManagerPath);
+for (const [original, replacement] of [
+  ["import { isAndroidHost, getAndroidBridge } from '../android/bridge.js';\n", ''],
+  ["import { requestAndroidMidiAccess, prepareAndroidMidiConfiguration, subscribeAndroidMidiActions } from '../android/midi.js';\n", ''],
+  ['    if (isAndroidHost(this.window)) this.unsubscribeNativeActions = subscribeAndroidMidiActions(this.window);\n', ''],
+  ['isAndroidHost(this.window) ? [] : this.store.mappings', 'this.store.mappings'],
+  ["isAndroidHost(this.window) || typeof this.navigator?.requestMIDIAccess === 'function'", "typeof this.navigator?.requestMIDIAccess === 'function'"],
+  [`    if (isAndroidHost(this.window)) {
+      await this.syncNativeConfiguration();
+      if (this.disposed) return;
+    }
+`, ''],
+  [`  syncNativeConfiguration() {
+    const config = prepareAndroidMidiConfiguration(this.store, this.adapter, this.learnActive);
+    const pending = (this.nativeConfigPromise || Promise.resolve()).catch(() => {}).then(() =>
+      getAndroidBridge().request('midi.configure', config));
+    this.nativeConfigPromise = pending;
+    return pending;
+  }
+
+`, ''],
+  [`request = isAndroidHost(this.window) ? requestAndroidMidiAccess()
+        : Promise.resolve(this.navigator.requestMIDIAccess({ sysex: false }));`,
+    'request = Promise.resolve(this.navigator.requestMIDIAccess({ sysex: false }));'],
+  ['    const wasLearning = this.learnActive;\n', ''],
+  [`    if (wasLearning && !this.disposed && isAndroidHost(this.window)) {
+      void this.syncNativeConfiguration().catch(error => console.error('Android MIDI learn cleanup failed:', error));
+    }
+`, '']
+]) {
+  if (!midiManager.includes(original)) throw new Error('Unable to adapt Android MIDI integration');
+  midiManager = midiManager.replaceAll(original, replacement);
+}
+await writeFile(midiManagerPath, midiManager, 'utf8');
+await rm(path.join(output, 'js', 'android', 'midi.js'), { force: true });
+
 // Controller targets share a pure player-speed utility even when no player is packaged.
 await cp(path.join(source, 'js', 'ui', 'audio-player', 'playback-speed.js'),
          path.join(output, 'js', 'midi', 'playback-speed.js'));
@@ -605,6 +700,13 @@ await writeFile(pipelineManagerPath, pipelineManager, 'utf8');
 
 const uiManagerPath = path.join(output, 'js', 'ui-manager.js');
 let uiManager = await readText(uiManagerPath);
+const networkMusicInitializer = '            void this.initializeNetworkMusic();\n';
+const networkMusicMethod = /    async initializeNetworkMusic\(\) \{[\s\S]*?\n    \}\n/;
+if (uiManager.split(networkMusicInitializer).length !== 2 || !networkMusicMethod.test(uiManager)) {
+  throw new Error('Unable to locate the excluded network music initialization');
+}
+uiManager = uiManager.replace(networkMusicInitializer, '').replace(networkMusicMethod, '');
+await rm(path.join(output, 'js', 'network-music'), { recursive: true, force: true });
 const browserImport = "import { BrowserView } from './browser/browser-view.js';\n";
 const browserProvider = /    showBrowserView\(\) \{[\s\S]*?\n    \}\n(?=\n    updateViewSwitchButtons)/;
 if (uiManager.split(browserImport).length !== 2 || !browserProvider.test(uiManager)) {
@@ -929,6 +1031,24 @@ await writeFile(browserAudioManagerPath, browserAudioManager, 'utf8');
 
 const configIntegrationPath = path.join(output, 'js', 'electron', 'configIntegration.js');
 let configIntegration = await readText(configIntegrationPath);
+const networkSettingsImport = "import { NetworkMusicSettings } from '../network-music/settings-view.js';\n";
+const networkSettingsConstruction = `  const networkSettings = isElectron ? new NetworkMusicSettings({
+    root: document.getElementById('config-panel-network'), api: networkMusicAPI, remoteSettings: remoteControlSettings, translate: t
+  }) : null;
+  await networkSettings?.mount();`;
+const networkSettingsRefresh = 'await Promise.all([refreshOpenHomeStatus(), refreshAirPlayStatus(), refreshLibrarySharing()]);';
+const browserRulesImport = "import { validateRules } from '../browser/url-rules.js';\n";
+const browserRulesSave = /  document.getElementById\('browser-rules-save'\)\?\.addEventListener\('click', async \(\) => \{[\s\S]*?\n  \}\);\n/;
+if (configIntegration.split(networkSettingsImport).length !== 2 ||
+    configIntegration.split(networkSettingsConstruction).length !== 2 ||
+    configIntegration.split(networkSettingsRefresh).length !== 2 ||
+    configIntegration.split(browserRulesImport).length !== 2 || !browserRulesSave.test(configIntegration)) {
+  throw new Error('Unable to locate excluded network/browser settings dependencies');
+}
+configIntegration = configIntegration.replace(networkSettingsImport, '')
+  .replace(networkSettingsConstruction, '  const networkSettings = null;')
+  .replace(networkSettingsRefresh, 'await Promise.all([refreshOpenHomeStatus(), refreshAirPlayStatus()]);')
+  .replace(browserRulesImport, '').replace(browserRulesSave, '');
 const libraryConfigImport = `import {
   MUSIC_LIBRARY_STARTUP_VIEWS,
   normalizeMusicLibraryStartupView
@@ -951,7 +1071,7 @@ configIntegration = configIntegration.replace(configCategories,
 configIntegration = configIntegration.replace(configPanels,
   '${Object.keys(categoryPanels).map(category => `\n          <div class="config-category-panel" id="config-panel-${category}" hidden>');
 const browserStartup = /            \$\{isElectron \? `<div class="radio-container">\n              <input type="radio" name="startup-view" id="startup-view-browser"[\s\S]*?\n            <\/div>` : ''\}\n/;
-const browserCategory = /      browser: `[\s\S]*?`,\n(?=      remoteControl:)/;
+const browserCategory = /      browser: `[\s\S]*?`,\n(?=      network:)/;
 const startupChoices = "const startupViews = isElectron ? ['effects', 'library', 'visualizer', 'browser'] : ['effects', 'library', 'visualizer'];";
 if (!browserStartup.test(configIntegration) || !browserCategory.test(configIntegration) ||
     !configIntegration.includes(startupChoices)) {

@@ -136,11 +136,11 @@ void testOutputAnalyzers() {
       {0xf0000002u, "SpectrogramPlugin", "R", {-96, 10, 0}, 0x3e6e0819u, 1},
       {0xf0000003u, "OscilloscopePlugin", "1", {.01f, 0, 0, 0, .0001f, 0, 0}, effetune::generated::OscilloscopePluginParams::kHash, 1},
       {0xf0000004u, "StereoMeterPlugin", "", {.1f}, 0xb0de3212u, 1},
-      {0xf0000005u, "NoteSpectrogramPlugin", "", packedFixture(effetune::generated::NoteSpectrogramPluginParams{60, 72, 1}), effetune::generated::NoteSpectrogramPluginParams::kHash, 1},
+      {0xf0000005u, "NoteSpectrogramPlugin", "", packedFixture(effetune::generated::NoteSpectrogramPluginParams{60, 72, 1, 1}), effetune::generated::NoteSpectrogramPluginParams::kHash, 1},
       {0xf0000006u, "ChromaSpiralPlugin", "", {}, 0x811c9dc5u, 1},
       {0xf0000007u, "PhaseSelectEqPlugin", "", std::vector<float>(effetune::generated::PhaseSelectEqPluginParams::kFloatCount), effetune::generated::PhaseSelectEqPluginParams::kHash, 1},
       {0xf0000008u, "AnalogMeterPlugin", "", packedFixture(effetune::generated::AnalogMeterPluginParams{0, .3f, 5, 1.5f, 0, .3f, 0}), effetune::generated::AnalogMeterPluginParams::kHash, 1},
-      {0xf0000009u, "RhythmAnalyzerPlugin", "", {40, 240, 0}, effetune::generated::RhythmAnalyzerPluginParams::kHash, 1}};
+      {0xf0000009u, "RhythmAnalyzerPlugin", "", packedFixture(effetune::generated::RhythmAnalyzerPluginParams{40, 240, 0, 1}), effetune::generated::RhythmAnalyzerPluginParams::kHash, 1}};
   expect(analyzers.setSources(sources, &error), "all Visualizer analyzers configure");
   std::array<std::array<float, 1024>, 8> audio;
   std::array<float *, 8> pointers{};
@@ -150,6 +150,7 @@ void testOutputAnalyzers() {
   }
   std::vector<std::uint8_t> packet(OutputAnalyzers::kTelemetryBytes);
   std::unordered_set<std::uint32_t> seen;
+  bool seenNotes = false, seenChords = false;
   for (int block = 0; block < 100; ++block) {
     { effetune::allocation_guard::Scope guard;
       analyzers.process(pointers.data(), 8, 1024, 48000); }
@@ -167,18 +168,28 @@ void testOutputAnalyzers() {
       const auto payload = static_cast<std::uint32_t>(packet[offset + 12]) |
                            (static_cast<std::uint32_t>(packet[offset + 13]) << 8);
       if (tap == sources[5].tapId && packet[offset] == 24) {
+        seenNotes = true;
         expect(packet[offset + 2] == 6 && payload == 9192,
                "Note/Guitar source forwards the current revision-rich note packet");
         expect(u32(packet.data() + offset + 36) == 5,
                "note telemetry retains five fine pitch divisions");
       }
-      if (tap == sources[9].tapId)
-        expect(packet[offset] == 28 && packet[offset + 2] == 4 && payload == 1496,
-               "rhythm telemetry forwards current beat and preview layout");
+      if (tap == sources[5].tapId && packet[offset] == 32) {
+        seenChords = true;
+        expect(packet[offset + 2] == 1 && payload == 32,
+               "enabled chord/key telemetry retains its layout and reserved note tap ID");
+      }
+      if (tap == sources[9].tapId) {
+        expect(packet[offset] == 28 && packet[offset + 2] == 5 && payload == 2024,
+               "rhythm telemetry forwards current beat, preview, and drum layout");
+        expect(u32(packet.data() + offset + 16 + 1496) == 1,
+               "rhythm telemetry preserves the selected drum display mode");
+      }
       offset += (16u + payload + 3u) & ~3u;
     }
   }
   expect(seen.size() == sources.size(), "every analyzer emits its reserved tap ID");
+  expect(seenNotes && seenChords, "note and chord/key telemetry share the reserved output tap");
   for (std::size_t channel = 0; channel < audio.size(); ++channel)
     for (const auto value : audio[channel])
       expect(value == static_cast<float>(channel + 1) * .05f, "analyzers never modify host output");
@@ -930,10 +941,10 @@ void testNoteAnalysisSharing() {
     return result;
   };
   std::vector<RuntimePlugin> plugins{
-      runtime(1, "NoteSpectrogramPlugin", packedFixture(effetune::generated::NoteSpectrogramPluginParams{28, 91, 1})),
+      runtime(1, "NoteSpectrogramPlugin", packedFixture(effetune::generated::NoteSpectrogramPluginParams{28, 91, 1, 0})),
       runtime(2, "SFZNotePlayerPlugin", packedFixture(sfzDefaults())),
-      runtime(3, "VolumePlugin", {0}), runtime(4, "NoteSpectrogramPlugin", packedFixture(effetune::generated::NoteSpectrogramPluginParams{29, 91, 1})),
-      runtime(5, "RhythmAnalyzerPlugin", {60, 180, 0}), runtime(6, "LevelMeterPlugin", {})};
+      runtime(3, "VolumePlugin", {0}), runtime(4, "NoteSpectrogramPlugin", packedFixture(effetune::generated::NoteSpectrogramPluginParams{29, 91, 1, 0})),
+      runtime(5, "RhythmAnalyzerPlugin", packedFixture(effetune::generated::RhythmAnalyzerPluginParams{60, 180, 0, 0})), runtime(6, "LevelMeterPlugin", {})};
   const PluginState note{1, "Note Spectrogram", true}, sfz{2, "SFZ Note Player", true};
   PipelineState pipeline;
   pipeline.plugins = {note, sfz};
@@ -1004,7 +1015,8 @@ void testNoteAnalysisSharing() {
     EngineHost::ProcessBatch batch;
     expect(engine->beginProcessBatch(batch) &&
            batch.resolveParameterTarget(5, plugins[4].paramsHash, rhythm), "resolve rhythm automation");
-    const std::array<float, 3> clickOn{60, 180, 1}, clickOff{60, 180, 0};
+    const auto clickOn = packedFixture(effetune::generated::RhythmAnalyzerPluginParams{60, 180, 1, 0});
+    const auto clickOff = packedFixture(effetune::generated::RhythmAnalyzerPluginParams{60, 180, 0, 0});
     bool ok;
     { effetune::allocation_guard::Scope guard;
       ok = batch.stageParameters(rhythm, clickOn) && batch.processChunk(channels, 2, 128, time, false); }
@@ -1016,8 +1028,8 @@ void testNoteAnalysisSharing() {
     time += 128.0 / 48000.0;
   }
   route({note, sfz}, 1);
-  const auto changedRange = packedFixture(effetune::generated::NoteSpectrogramPluginParams{29, 91, 1});
-  const auto restoredRange = packedFixture(effetune::generated::NoteSpectrogramPluginParams{28, 91, 1});
+  const auto changedRange = packedFixture(effetune::generated::NoteSpectrogramPluginParams{29, 91, 1, 0});
+  const auto restoredRange = packedFixture(effetune::generated::NoteSpectrogramPluginParams{28, 91, 1, 0});
   expect(engine->updateParameters(1, changedRange, plugins[0].paramsHash), "update source MIDI range");
   render(0);
   auto commands = std::make_unique<AudioCommandQueue>();

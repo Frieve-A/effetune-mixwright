@@ -42,7 +42,11 @@ function normalizePlugin(plugin, owner) {
     type: plugin.type,
     name: plugin.name || logical?.name || logical?.constructor?.name || plugin.type,
     enabled: plugin.enabled !== false,
-    parameters: plugin.parameters || {},
+    parameters: {
+      ...plugin.parameters,
+      _uiCollapsed: (logical?._uiCollapsed ?? plugin.parameters?._uiCollapsed) === true,
+      _uiLocked: (logical?._uiLocked ?? plugin.parameters?._uiLocked) === true
+    },
     inputBus: plugin.inputBus ?? 0,
     outputBus: plugin.outputBus ?? 0,
     channel
@@ -1276,6 +1280,14 @@ export class AudioManager extends BrowserAudioManager {
       payload.name = plugin.name || payload.name || plugin.constructor.name;
       return normalizePlugin(payload, logicalOwner);
     });
+  }
+
+  persistPluginUIState() {
+    // One gesture can expand or collapse several effects. Publish their logical
+    // state through the parameter route without rebuilding the DSP topology.
+    for (const plugin of this.serializePipeline(this.getCurrentPipeline())) {
+      void this.nativePort.postMessage({ type: 'updatePlugin', plugin });
+    }
   }
 
   synchronizeHistoryState() {

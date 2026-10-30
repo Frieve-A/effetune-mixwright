@@ -54,7 +54,73 @@ test('shared history snapshots and restoration retain native logical plugin IDs'
   }
 });
 
+test('effect panel gestures save native state and retain lock/collapse across A/B copies and undo', async () => {
+  const { PipelineItemBuilder } = await assetModule('js/ui/pipeline/pipeline-item-builder.js');
+  const { PipelineSectionHandler } = await assetModule('js/ui/pipeline/pipeline-section-handler.js');
+  const { HistoryManager } = await assetModule('js/ui/pipeline/history-manager.js');
+  const { AudioManager } = await assetModule('js/audio-manager.js');
+  const { getSerializablePluginStateShort } = await assetModule('js/utils/serialization-utils.js');
+  const previous = { window: globalThis.window, document: globalThis.document };
+  Object.assign(globalThis, { window: {}, document: { querySelector: () => null } });
+  try {
+    const pluginManager = { nextPluginId: 1, createPlugin(name) {
+      return { id: this.nextPluginId++, name, enabled: true, value: 2,
+        getParameters() { return { value: this.value }; },
+        setEnabled(value) { this.enabled = value; },
+        setParameters(parameters) { this.value = parameters.value; } };
+    } };
+    const published = [], restored = [];
+    const audioManager = { pipelineA: [pluginManager.createPlugin('Gain')], pipelineB: [], currentPipeline: 'A', workletNode: {},
+      getCurrentPipeline() { return this.currentPipeline === 'B' ? this.pipelineB : this.pipelineA; },
+      dispatchEvent() {}, setMasterBypass() {}, _configureWasmAssetTargetResolver() {},
+      persistPluginUIState() { published.push(this.getCurrentPipeline().map(getSerializablePluginStateShort)); },
+      synchronizeHistoryState() { restored.push(this.getCurrentPipeline().map(getSerializablePluginStateShort)); }
+    };
+    const pipelineManager = { audioManager, pluginManager, expandedPlugins: new Set(), core: {
+      getSerializablePluginState: getSerializablePluginStateShort,
+      updatePipelineUI() {}, updateAllPluginDisplayState() {}, updateURL() {}
+    } };
+    audioManager.pipelineManager = pipelineManager;
+    const history = pipelineManager.historyManager = new HistoryManager(pipelineManager);
+    const builder = Object.create(PipelineItemBuilder.prototype);
+    Object.assign(builder, { audioManager, pipelineCore: { ...pipelineManager.core, pipelineManager } });
+    history.saveState();
+    const plugin = audioManager.pipelineA[0];
+    plugin._uiLocked = true;
+    plugin._uiCollapsed = true;
+    builder.saveUIState();
+    assert.equal(published[0][0]._uiLocked, true);
+    assert.equal(published[0][0]._uiCollapsed, true);
+    audioManager.pipelineB = AudioManager.prototype._copyPipeline.call(audioManager, audioManager.pipelineA);
+    assert.equal(audioManager.pipelineB[0]._uiLocked, true);
+    assert.equal(audioManager.pipelineB[0]._uiCollapsed, true);
+    history.undo();
+    assert.equal(audioManager.pipelineA[0]._uiLocked, false);
+    assert.equal(audioManager.pipelineA[0]._uiCollapsed, false);
+    history.redo();
+    assert.equal(audioManager.pipelineA[0]._uiLocked, true);
+    assert.equal(audioManager.pipelineA[0]._uiCollapsed, true);
+    assert.equal(restored.length, 2, 'undo and redo both publish through native history synchronization');
+    const section = Object.assign(Object.create(PipelineSectionHandler.prototype), {
+      audioManager, pipelineCore: { itemBuilder: builder },
+      findSectionRange: () => ({ startIndex: 0, endIndex: audioManager.pipelineA.length }),
+      updateAllTooltips() {}
+    });
+    audioManager.pipeline = audioManager.pipelineA;
+    for (const expand of [false, true]) {
+      section.expandCollapseSection(audioManager.pipeline[0], expand);
+      assert.equal(audioManager.pipeline[0]._uiCollapsed, !expand);
+      assert.equal(published.at(-1)[0]._uiCollapsed === true, !expand,
+        'section menu expansion publishes the same native state as individual panels');
+    }
+    assert.equal(published.length, 3);
+  } finally { Object.assign(globalThis, previous); }
+});
+
 test('bundled controller module graph exposes VST app choices and steps presets', async () => {
+  const { MidiControllerManager } = await assetModule('js/midi/midi-controller-manager.js');
+  assert.equal(MidiControllerManager.prototype.isSupported.call({ navigator: { requestMIDIAccess() {} } }), true);
+  assert.equal(MidiControllerManager.prototype.isSupported.call({ navigator: {} }), false);
   const { APP_TARGETS, getAppTarget } = await assetModule('js/midi/app-targets.js');
   const { MidiMappingDialog } = await assetModule('js/midi/midi-mapping-dialog.js');
   const dialog = new MidiMappingDialog({ manager: {}, windowRef: {
@@ -93,7 +159,7 @@ test('bundled Visualizer module graph retains viewport menu clamping', async () 
   } finally { globalThis.window = previousWindow; }
 });
 
-test('Visualizer add-item choices omit Lyrics and Video while retaining Counter', async () => {
+test('Visualizer add-item choices omit player items while preserving imported item types', async () => {
   const { VisualizerEditor } = await assetModule('js/visualizer/visualizer-editor.js');
   const { ITEM_TYPES, createDefaultLayout } = await assetModule('js/visualizer/visualizer-model.js');
   const previousDocument = globalThis.document;
@@ -121,7 +187,9 @@ test('Visualizer add-item choices omit Lyrics and Video while retaining Counter'
     assert.ok(ITEM_TYPES.includes('lyrics'), 'Lyrics remains a supported saved item type');
     assert.ok(ITEM_TYPES.includes('video'), 'Video remains a supported saved item type');
     assert.ok(choices.includes('counter'));
-    assert.deepEqual(choices.toSorted(), ITEM_TYPES.filter(type => !['lyrics', 'video'].includes(type)).toSorted());
+    const excluded = ['lyrics', 'video', 'playback-control', 'seek-bar', 'track-info'];
+    for (const type of excluded) assert.ok(ITEM_TYPES.includes(type));
+    assert.deepEqual(choices.toSorted(), ITEM_TYPES.filter(type => !excluded.includes(type)).toSorted());
   } finally { globalThis.document = previousDocument; }
 });
 
@@ -208,7 +276,7 @@ test('Visualizer Counter follows project transport and cannot reset on click or 
   assert.equal(VisualizerView.prototype.videoFrame.call(view), null);
 });
 
-test('excluded desktop entries leave ordinary A/B availability and imported Video data intact', async () => {
+test('excluded desktop entries leave ordinary A/B availability and imported player items intact', async () => {
   const { UIManager } = await assetModule('js/ui-manager.js');
   const html = await assetText('effetune.html');
   assert.ok(!html.includes('id="doubleBlindTestButton"'));
@@ -227,9 +295,11 @@ test('excluded desktop entries leave ordinary A/B availability and imported Vide
   const { createDefaultLayout, createItem, normalizeLayout, snapshotLayout, encodeLayoutShare, decodeLayoutShare } =
     await assetModule('js/visualizer/visualizer-model.js');
   const layout = createDefaultLayout();
-  const video = createItem('video', 'imported-video');
-  layout.items.push(video);
-  assert.deepEqual(normalizeLayout(layout).items.find(item => item.id === video.id), video);
+  for (const type of ['video', 'playback-control', 'seek-bar', 'track-info']) {
+    const item = createItem(type, `imported-${type}`);
+    layout.items.push(item);
+    assert.deepEqual(normalizeLayout(layout).items.find(candidate => candidate.id === item.id), item);
+  }
   assert.deepEqual(decodeLayoutShare(encodeLayoutShare(layout)), snapshotLayout(layout));
 });
 
@@ -240,7 +310,7 @@ test('categorized settings select supported UI panels and retain category select
   const categories = ['general', 'startup', 'display', 'controllers'];
   assert.ok(source.includes(`const categories = ${JSON.stringify(categories).replaceAll('"', "'").replaceAll(',', ', ')};`));
   assert.ok(source.includes('id="config-panel-${category}" hidden>'));
-  const unsupported = ['powerSaving', 'offlineOutput', 'remoteControl'];
+  const unsupported = ['powerSaving', 'offlineOutput', 'network'];
   const nodes = Object.fromEntries([...categories, ...unsupported].flatMap(category => {
     const panel = new Element('div');
     panel.hidden = true;
@@ -325,12 +395,20 @@ test('Visualizer startup preference opens once without changing host pipeline st
     console: { error: (...args) => diagnostics.push(args) }
   });
   for (const startupView of ['effects', 'visualizer', 'library', undefined]) {
-    const app = new App();
-    let opened = 0;
-    app.startupConfig = { startupView };
-    app.uiManager = { async showVisualizerView() { opened++; } };
-    await Promise.all([app.applyStartupViewPreference(), app.applyStartupViewPreference()]);
-    assert.equal(opened, startupView === 'visualizer' ? 1 : 0);
+    for (const visualizerStartupExpanded of [true, false, undefined]) {
+      for (const showSucceeded of [true, false]) {
+        const app = new App();
+        let opened = 0;
+        const expanded = [];
+        app.startupConfig = { startupView, visualizerStartupExpanded };
+        app.uiManager = { async showVisualizerView() { opened++; return showSucceeded; },
+          visualizerView: { setExpanded: value => expanded.push(value) } };
+        await Promise.all([app.applyStartupViewPreference(), app.applyStartupViewPreference()]);
+        assert.equal(opened, startupView === 'visualizer' ? 1 : 0);
+        const shouldExpand = startupView === 'visualizer' && visualizerStartupExpanded === true && showSucceeded;
+        assert.deepEqual(expanded, shouldExpand ? [true] : []);
+      }
+    }
   }
   const app = new App();
   const errors = [];
@@ -394,6 +472,7 @@ test('startup navigation waits for native readiness and settles before revealing
       const sources = new VisualizerSources(audioManager);
       assert.equal(sources.getStatus(), disabled ? 'disabled' : 'unavailable');
       const context = { window, document, console, MIC_DENIED_PREFIX: 'Audio Error: Microphone',
+        isAndroidHost: () => false,
         displayAppVersion: async () => {}, waitForStylesheets: async () => {},
         requestAnimationFrame: callback => queueMicrotask(callback) };
       vm.runInNewContext(`this.App = class { ${['initialize', 'applyStartupViewPreference',

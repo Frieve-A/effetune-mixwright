@@ -12,6 +12,7 @@ import { TelemetryHub } from '../../external/effetune/js/audio/telemetry-hub.js'
 import {
   getPluginExecutionCapabilities
 } from '../../external/effetune/js/audio/plugin-execution-capabilities.js';
+import { applySerializedState } from '../../external/effetune/js/utils/serialization-utils.js';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const source = await readFile(path.join(projectRoot, 'ui-shim', 'vst-audio-manager.js'), 'utf8');
@@ -626,7 +627,7 @@ test('native payload carries upstream execution capabilities without persisting 
     ['mono', 'stereo-pair']);
   assert.equal(Object.hasOwn(normalized, 'executionSupported'), false,
     'contextual admission remains native and transient');
-  assert.deepEqual({ ...normalized.parameters }, { amount: 0.75 });
+  assert.deepEqual({ ...normalized.parameters }, { amount: 0.75, _uiCollapsed: false, _uiLocked: false });
   assert.deepEqual(Array.from(normalized.wasmParams), [0.75],
     'admission never destroys the logical or packed state');
 
@@ -643,6 +644,53 @@ test('native payload carries upstream execution capabilities without persisting 
   assert.deepEqual(Array.from(compatibilityPayload.executionCapabilities.supportedSampleRates),
     [44100, 48000, 88200, 96000, 176400, 192000],
     'legacy declarations remain sourced from the upstream compatibility table');
+});
+
+test('effect panel state reaches native updates and history images for both A/B pipelines', async () => {
+  const { context, hostCalls, port } = createNativePort();
+  const start = source.indexOf('  serializePipeline(');
+  const end = source.indexOf('\n  synchronizeNativeAssetMembership()', start);
+  vm.runInNewContext(`this.Manager = class {${source.slice(start, end)}\n};`, context);
+  const createPlugin = id => ({ id, name: 'DC Offset', type: 'DCOffsetPlugin', enabled: true,
+    _uiLocked: true, _uiCollapsed: true, parameters: { of: .25 },
+    getParameters() { return this.parameters; },
+    setEnabled(value) { this.enabled = value; },
+    setParameters(parameters) { this.parameters = parameters; },
+    getWorkletPluginData(parameters) { return { id: this.id, type: this.type, enabled: this.enabled, parameters }; }
+  });
+  const a = createPlugin(17), b = createPlugin(42);
+  const manager = Object.assign(new context.Manager(), port.owner, { nativePort: port,
+    pipelineA: [a], pipelineB: [b], seedRestoredAutomationBaseline() {} });
+  port.owner = manager;
+  try {
+    for (const [pipeline, plugin] of [['A', a], ['B', b]]) {
+      manager.currentPipeline = pipeline;
+      for (const locked of [true, false]) {
+        plugin._uiLocked = locked;
+        plugin._uiCollapsed = locked;
+        manager.persistPluginUIState();
+        port.flushPluginUpdates();
+        const update = hostCalls.at(-1);
+        assert.equal(update.type, 'pipeline/updatePlugin', 'panel gestures never rebuild the pipeline');
+        assert.equal(update.payload.pipeline, pipeline);
+        assert.deepEqual(Array.from(update.payload.automationEdits), [], 'panel state creates no DSP automation gesture');
+        const restored = createPlugin(plugin.id);
+        applySerializedState(restored, update.payload.plugin);
+        assert.equal(restored._uiLocked, locked, 'native state image restores lock and explicitly clears it');
+        assert.equal(restored._uiCollapsed, locked, 'native state image restores collapse and explicitly clears it');
+        assert.deepEqual({ ...restored.parameters }, { of: .25 }, 'UI fields never enter effect parameters');
+      }
+    }
+    a._uiLocked = true;
+    b._uiCollapsed = true;
+    await manager.synchronizeHistoryState();
+    const restore = hostCalls.at(-1);
+    assert.equal(restore.type, 'pipeline/restoreHistory');
+    assert.equal(restore.payload.pipelineA[0].parameters._uiLocked, true);
+    assert.equal(restore.payload.pipelineA[0].parameters._uiCollapsed, false);
+    assert.equal(restore.payload.pipelineB[0].parameters._uiLocked, false);
+    assert.equal(restore.payload.pipelineB[0].parameters._uiCollapsed, true);
+  } finally { port.close(); }
 });
 
 test('native pipeline images resolve parameters at the current output width', () => {

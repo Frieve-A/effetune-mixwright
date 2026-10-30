@@ -243,7 +243,9 @@ if (!history.includes('id: plugin.id') ||
   throw new Error('Undo/redo history IDs or single native synchronization contract is missing');
 }
 if (!app.includes("if (this.startupConfig?.startupView === 'visualizer')") ||
-    !app.includes('await this.uiManager?.showVisualizerView?.();') ||
+    !app.includes('await this.uiManager?.showVisualizerView?.()') ||
+    !app.includes('this.startupConfig.visualizerStartupExpanded === true') ||
+    !app.includes('this.uiManager.visualizerView.setExpanded(true);') ||
     app.includes('applyInitialStartupViewClass(config, windowRef)') ||
     app.includes('this.uiManager?.showLibraryView?.(') ||
     uiManager.includes('this.toggleLibraryView();') ||
@@ -390,8 +392,23 @@ if (visualizerView.includes('ui/audio-player/') || visualizerView.includes('this
     !visualizerView.includes('this.uiManager.audioManager.getHostTransport()') ||
     !visualizerView.includes("source: 'vst-host-project'") ||
     !visualizerView.includes('trackIndex: 0, external: false') ||
-    !visualizerEditor.includes("type !== 'lyrics' && type !== 'video'")) {
+    !visualizerEditor.includes("!['lyrics', 'video', 'playback-control', 'seek-bar', 'track-info'].includes(type)")) {
   throw new Error('Visualizer does not use native project transport or still exposes excluded Video');
+}
+if (uiManager.includes('initializeNetworkMusic') || uiManager.includes('network-music/')) {
+  throw new Error('Excluded network music initialization remains reachable');
+}
+const midiManager = await readFile(path.join(assets, 'js', 'midi', 'midi-controller-manager.js'), 'utf8');
+if (midiManager.includes('android/') || !midiManager.includes('this.navigator.requestMIDIAccess({ sysex: false })')) {
+  throw new Error('Controller access must retain Web MIDI without the Android integration');
+}
+const itemBuilder = await readFile(path.join(assets, 'js', 'ui', 'pipeline', 'pipeline-item-builder.js'), 'utf8');
+const sectionHandler = await readFile(path.join(assets, 'js', 'ui', 'pipeline', 'pipeline-section-handler.js'), 'utf8');
+if (!itemBuilder.includes('this.audioManager.persistPluginUIState();') ||
+    !sectionHandler.includes('this.pipelineCore.itemBuilder.saveUIState();') ||
+    !audioAdapter.includes('_uiCollapsed: (logical?._uiCollapsed ?? plugin.parameters?._uiCollapsed) === true') ||
+    !audioAdapter.includes('_uiLocked: (logical?._uiLocked ?? plugin.parameters?._uiLocked) === true')) {
+  throw new Error('Effect UI state must be published to the native logical pipeline');
 }
 if (pipelineManager.includes("from './pipeline/file-processor.js'") ||
     pipelineManager.includes('new FileProcessor(') ||
@@ -829,10 +846,13 @@ for (const excluded of [
   'js/vendor/jszip-3.10.1.min.js',
   'css/effetune-mobile.css',
   'css/pipeline-analyzer.css',
+  'css/effetune-network-music.css',
   'js/vendor/jsmediatags-3.9.5.min.js',
   'js/vendor/music-metadata-browser.mjs',
   'js/ui/double-blind-test/double-blind-test.js',
   'js/browser',
+  'js/network-music',
+  'js/android/midi.js',
   'js/pipeline-analyzer',
   'js/library/library-manager-v2.js',
   'js/ui/library',
