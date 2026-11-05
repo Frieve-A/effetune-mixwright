@@ -20,6 +20,7 @@ static_assert(AudioCommand::kMaxPackedFloats * sizeof(float) <=
 
 constexpr std::size_t kMaximumExternalUrlBytes = 4096;
 constexpr std::size_t kMaximumAssetChunkBase64Bytes = 256u * 1024u;
+constexpr std::int64_t kMaximumSafeInteger = 9007199254740991ll;
 
 [[nodiscard]] bool isAllowedExternalUrl(const std::string_view url) {
   if (url.empty() || url.size() > kMaximumExternalUrlBytes ||
@@ -66,11 +67,18 @@ void setError(std::string *destination, std::string value) {
 
 [[nodiscard]] bool decodeAssetIdentity(const ValueView payload, RoutedUiMessage &message,
                                        std::string *error, const bool requireRevision) {
-  const auto pluginId = payload["pluginId"].getWithDefault<std::int64_t>(0);
-  const auto slot = payload["slot"].getWithDefault<std::int64_t>(-1);
-  const auto revision = payload["operationRevision"].getWithDefault<std::int64_t>(0);
-  if (pluginId <= 0 || pluginId > std::numeric_limits<std::uint32_t>::max() || slot < 0 ||
-      slot > std::numeric_limits<std::uint32_t>::max() || (requireRevision && revision <= 0)) {
+  const auto pluginIdValue = payload["pluginId"];
+  const auto slotValue = payload["slot"];
+  const auto revisionValue = payload["operationRevision"];
+  const auto pluginId = pluginIdValue.getWithDefault<std::int64_t>(0);
+  const auto slot = slotValue.getWithDefault<std::int64_t>(-1);
+  const auto revision = revisionValue.getWithDefault<std::int64_t>(0);
+  if (!pluginIdValue.isInt() || !slotValue.isInt() ||
+      pluginId <= 0 || pluginId > std::numeric_limits<std::uint32_t>::max() || slot < 0 ||
+      slot > std::numeric_limits<std::uint32_t>::max() ||
+      (!revisionValue.isVoid() && (!revisionValue.isInt() ||
+                                  revision < 0 || revision > kMaximumSafeInteger)) ||
+      (requireRevision && revision == 0)) {
     setError(error, "DSP asset message has an invalid target");
     return false;
   }
@@ -97,6 +105,8 @@ void setError(std::string *destination, std::string value) {
       payload["processingChannels"].getWithDefault<std::int64_t>(0);
   const auto footprintBytes = payload["footprintBytes"].getWithDefault<std::int64_t>(0);
   const auto byteSize = payload["byteSize"].getWithDefault<std::int64_t>(0);
+  const auto generation = payload["streamGeneration"];
+  const auto streamGeneration = generation.getWithDefault<std::int64_t>(0);
   const auto validHeadBlock =
       headBlock == 0 || headBlock == 128 || headBlock == 256 || headBlock == 512 ||
       headBlock == 1024;
@@ -107,7 +117,9 @@ void setError(std::string *destination, std::string value) {
       pathCount > 16 || inputCount < 0 || inputCount > 16 || processingChannels < 1 ||
       processingChannels > EngineHost::kMaxChannels || byteSize < 1 ||
       byteSize > EngineHost::kMaximumAssetTransportBytes || footprintBytes < byteSize ||
-      footprintBytes > EngineHost::kMaximumAssetTransportBytes) {
+      footprintBytes > EngineHost::kMaximumAssetTransportBytes ||
+      (!generation.isVoid() && (!generation.isInt() || streamGeneration < 1 ||
+                                streamGeneration > kMaximumSafeInteger))) {
     setError(error, "DSP asset metadata is invalid or exceeds the plug-in capacity");
     return false;
   }
@@ -121,7 +133,90 @@ void setError(std::string *destination, std::string value) {
   message.asset.inputCount = static_cast<std::uint32_t>(inputCount);
   message.asset.processingChannels = static_cast<std::uint32_t>(processingChannels);
   message.asset.footprintBytes = static_cast<std::uint32_t>(footprintBytes);
+  message.asset.streamGeneration = static_cast<std::uint64_t>(streamGeneration);
   message.assetByteSize = static_cast<std::size_t>(byteSize);
+  return true;
+}
+
+[[nodiscard]] std::int64_t integerField(const ValueView payload, const char *name) {
+  const auto field = payload[name];
+  return field.isInt() ? field.getWithDefault<std::int64_t>(-1) : -1;
+}
+
+[[nodiscard]] bool decodeAssetPage(const ValueView payload, RoutedUiMessage &message,
+                                   std::string *error) {
+  if (!decodeAssetIdentity(payload, message, error, true)) return false;
+  const auto generation = integerField(payload, "generation");
+  const auto sample = integerField(payload, "sample");
+  const auto index = integerField(payload, "page");
+  const auto frames = integerField(payload, "frames");
+  const auto channels = integerField(payload, "channels");
+  const auto flags = integerField(payload, "flags");
+  if (message.asset.slot != 0 || generation <= 0 || generation > kMaximumSafeInteger ||
+      sample < 0 || sample > std::numeric_limits<std::uint32_t>::max() ||
+      index < 0 || index >= EngineHost::kMaxSamplePages ||
+      frames < 1 || frames > EngineHost::kSamplePageFrames ||
+      channels < 1 || channels > 2 || flags != 1) {
+    setError(error, "Instrument sample page is invalid");
+    return false;
+  }
+  message.assetByteSize = static_cast<std::size_t>(frames * channels) * sizeof(float);
+  message.content = payload["bytes"].getWithDefault<std::string>({});
+  if (message.content.size() != ((message.assetByteSize + 2u) / 3u) * 4u) {
+    setError(error, "Instrument sample page size is invalid");
+    return false;
+  }
+  message.asset.streamGeneration = static_cast<std::uint64_t>(generation);
+  message.assetPage.index = static_cast<std::uint64_t>(index);
+  message.assetPage.sample = static_cast<std::uint32_t>(sample);
+  message.assetPage.frames = static_cast<std::uint32_t>(frames);
+  message.assetPage.channels = static_cast<std::uint32_t>(channels);
+  message.assetPage.flags = static_cast<std::uint32_t>(flags);
+  return true;
+}
+
+[[nodiscard]] bool decodeSoundFontControl(const ValueView payload, AudioCommand &command) {
+  const auto id = integerField(payload, "pluginId");
+  if (id <= 0 || id > std::numeric_limits<std::uint32_t>::max()) return false;
+  command.type = AudioCommandType::soundFontMidiControl;
+  command.logicalId = static_cast<std::uint32_t>(id);
+  auto &control = command.soundFontControl;
+  const auto kind = payload["kind"].getWithDefault<std::string>({});
+  if (kind == "metering") {
+    const auto enabled = payload["enabled"];
+    if (!enabled.isBool()) return false;
+    control.kind = SoundFontControlKind::metering;
+    control.value = enabled.getWithDefault<bool>(false) ? 1u : 0u;
+    return true;
+  }
+  const auto channel = integerField(payload, "channel");
+  if (channel < 0 || channel >= 16) return false;
+  control.channel = static_cast<std::uint32_t>(channel);
+  if (kind == "mix") {
+    const auto action = integerField(payload, "action");
+    if (action < 0 || action > ET_MIDI_CHANNEL_SOLO) return false;
+    control.kind = SoundFontControlKind::mix;
+    control.value = static_cast<std::uint32_t>(action);
+    return true;
+  }
+  const auto messages = payload["messages"];
+  if (kind != "channel" || !messages.isArray() || messages.size() == 0 ||
+      messages.size() > control.messages.size()) return false;
+  control.kind = SoundFontControlKind::channel;
+  control.messageCount = messages.size();
+  for (std::uint32_t index = 0; index < messages.size(); ++index) {
+    const auto item = messages[index];
+    const auto packed = item.getWithDefault<std::int64_t>(-1);
+    if (!item.isInt() || packed < 0 || packed > 0x7fffff) return false;
+    const auto value = static_cast<std::uint32_t>(packed);
+    if ((value & 0xff808000u) != 0 || (value & 0x0fu) != control.channel) return false;
+    const auto status = value & 0xf0u;
+    const auto cc = (value >> 8u) & 0x7fu;
+    if (status != 0xc0u && (status != 0xb0u ||
+        (cc != 0 && cc != 32 && cc != 7 && cc != 10 && cc != 11 && cc != 91 && cc != 93)))
+      return false;
+    control.messages[index] = value;
+  }
   return true;
 }
 
@@ -450,6 +545,7 @@ bool MessageRouter::decode(const std::string_view json, RoutedUiMessage &message
     } else if (type == "host/getInfo") {
       decoded.action = UiAction::hostInfo;
       decoded.startupHandshake = payload["startup"].getWithDefault<bool>(false);
+      decoded.includeMidiTelemetry = payload["midiTelemetry"].getWithDefault<bool>(false);
     } else if (type == "audio/frequencyPreview") {
       decoded.action = UiAction::frequencyPreview;
       decoded.previewSound = payload["sound"].getWithDefault<std::string>("") == "bandpassNoise"
@@ -562,6 +658,12 @@ bool MessageRouter::decode(const std::string_view json, RoutedUiMessage &message
         return false;
       }
       decoded.assetOffset = static_cast<std::size_t>(offset);
+    } else if (type == "pipeline/assetPage") {
+      decoded.action = UiAction::appendPluginAssetPage;
+      if (!decodeAssetPage(payload, decoded, error)) return false;
+    } else if (type == "pipeline/assetCancel") {
+      decoded.action = UiAction::cancelPluginAsset;
+      if (!decodeAssetIdentity(payload, decoded, error, true)) return false;
     } else if (type == "pipeline/assetCommit") {
       decoded.action = UiAction::commitPluginAsset;
       if (!decodeAssetIdentity(payload, decoded, error, true)) {
@@ -575,6 +677,12 @@ bool MessageRouter::decode(const std::string_view json, RoutedUiMessage &message
     } else if (type == "pipeline/assetState") {
       decoded.action = UiAction::readPluginAssetState;
       if (!decodeAssetIdentity(payload, decoded, error, false)) {
+        return false;
+      }
+    } else if (type == "soundFont/control") {
+      decoded.action = UiAction::soundFontMidiControl;
+      if (!decodeSoundFontControl(payload, decoded.audioCommand)) {
+        setError(error, "SoundFont mixer control is invalid");
         return false;
       }
     } else if (type == "pipeline/masterBypass") {

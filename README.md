@@ -2,6 +2,29 @@
 
 EffeTune Mixwright brings EffeTune's C++ DSP engine and desktop interface to the VST® 3 format. Windows x64 is the primary target, with macOS arm64 and x86_64 as secondary targets. The plug-in handles one to eight audio channels and supports five-bus processing pipelines, a WebView interface, A/B state management, telemetry, and 1×, 2×, 4×, and 8× oversampling.
 
+- **Download:** [GitHub Releases](https://github.com/Frieve-A/effetune-mixwright/releases)
+- **Upstream:** [EffeTune](https://github.com/Frieve-A/effetune)
+
+## SoundFont Instrument
+
+Insert **EffeTune Mixwright Instrument** on a DAW instrument track. New instances
+start with just SoundFont Player. Choose an SF2, SF3, or SFZ instrument in the
+player, then send MIDI from a track or keyboard. Mixwright prepares the required
+samples within its instrument memory budget so playback can continue with the
+editor closed, including during a DAW render. If an instrument exceeds the
+budget, choose a smaller one. The plug-in saves a reference to the original
+instrument files; keep them in place when reopening a project.
+
+The existing **EffeTune Mixwright** audio effect retains its plug-in identity
+and audio inputs. It can also receive MIDI when the host routes MIDI to effects.
+
+Live DAW MIDI can drive the Visualizer's Notes, Drums, Guitar, MIDI Mixer, and
+MIDI Event List. When the host supplies tempo and musical position, the
+Visualizer's Rhythm Analyzer can use that beat grid. The DAW project stores
+each SoundFont Player channel's program and its current volume, pan, expression,
+reverb and chorus, including changes received over MIDI. Mixwright restores
+these values after the instrument loads. Mute and solo are session controls.
+
 ## Requirements
 
 - Git (Windows users must run `git config --global core.longpaths true`)
@@ -100,20 +123,24 @@ positions to the host output clock, applying additional audio output delay and
 reporting that applied delay to the host are still required. Visualizer analyzer
 sources have their own analysis settings.
 
-SFZ Note Player reads instruments and samples directly from their original files.
-Open **SFZ Library…**, choose **Import files…** for selected instruments or
+SoundFont Player and SoundFont Note Player read instruments and samples from
+their original files. Older projects that reference SFZ Note Player still load
+the same effect under its new name. Open **SoundFont Library…**, choose
+**Import files…** for selected instruments or
 **Import folder…** to register a folder, then **Load** an instrument. Search,
 filename/recent-import sorting, metadata badges, and bulk deletion are available.
 ARIA `.bank.xml` definitions alongside the instruments are used during preparation.
 File and folder references persist locally; the source files must
 remain available, and moving or deleting them makes the instrument unavailable
 until you import it again. **Delete** removes the local library reference and
-leaves the source files in place. Projects store local SFZ identifiers, so choose
-the instrument again when opening a project on another machine. The configured limit applies to each bank's preparation and
-decoded sample data, with a native SFZ asset budget of 1 GiB. Impulse-response
+leaves the source files in place. Projects store local instrument references, so
+choose the instrument again when opening a project on another machine. The
+configured limit applies to each bank's preparation and decoded sample data,
+with a native sample asset budget of 1 GiB. SF3 decoding also requires Vorbis
+support in the host WebView. Impulse-response
 assets retain their separate 32 MiB per-asset and 128 MiB total budgets.
 
-When an active Notes analyzer and SFZ Note Player read the same input with matching
+When an active Notes analyzer and SoundFont Note Player read the same input with matching
 note ranges, Mixwright reuses their note analysis where routing and timing allow it.
 Changing the input, note range or an intervening audio effect restores independent
 SFZ analysis.

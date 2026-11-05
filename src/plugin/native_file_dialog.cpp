@@ -176,7 +176,7 @@ std::vector<std::filesystem::path> chooseSfzFiles() {
   (void)dialog->GetOptions(&options);
   (void)dialog->SetOptions(options | FOS_ALLOWMULTISELECT | FOS_FORCEFILESYSTEM |
                          FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST);
-  const COMDLG_FILTERSPEC filter[]{ {L"SFZ instruments", L"*.sfz"} };
+  const COMDLG_FILTERSPEC filter[]{ {L"SoundFont and SFZ instruments", L"*.sf2;*.sf3;*.sfz"} };
   (void)dialog->SetFileTypes(1, filter);
   IShellItemArray *items = nullptr;
   if (dialog->Show(nullptr) == S_OK && SUCCEEDED(dialog->GetResults(&items))) {
@@ -220,7 +220,8 @@ std::vector<std::filesystem::path> chooseSfzFiles() {
   }
 #endif
   if (std::any_of(paths.begin(), paths.end(), [](const auto &path) {
-        return !hasExchangeExtension(path, ".sfz");
+        return !hasExchangeExtension(path, ".sfz") && !hasExchangeExtension(path, ".sf2") &&
+               !hasExchangeExtension(path, ".sf3");
       })) paths.clear();
   return paths;
 }

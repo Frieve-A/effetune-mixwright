@@ -224,7 +224,9 @@ test('existing Lyrics layouts survive normalization, sharing and same-name user 
   const lyrics = original.items.filter(item => item.type === 'lyrics');
   assert.ok(lyrics.length > 0);
   const normalized = normalizeLayout(original);
-  assert.deepEqual(normalized.items.filter(item => item.type === 'lyrics'), lyrics);
+  assert.deepEqual(normalized.items.filter(item => item.type === 'lyrics'), lyrics.map(item => ({
+    ...item, params: { lyricsPart: '', lyricsVerse: '', ...item.params }
+  })));
   const snapshot = snapshotLayout(original);
   assert.deepEqual(decodeLayoutShare(encodeLayoutShare(original)), snapshot);
   const saved = new Map();
@@ -719,6 +721,67 @@ test('SFZ reads return exact Uint8Array data across bounded native chunks and cl
     { readId: sfzReadId, offset: 393216, length: 6784 }
   ]);
   assert.equal(calls.at(-1).type, 'sfz/closeRead');
+});
+
+test('SoundFont metadata skips audio probing and range reads stay tied to the opened source revision', async () => {
+  const revision = 'c'.repeat(64);
+  const bytes = Uint8Array.from({ length: 400000 }, (_, index) => index % 256);
+  const request = { id: sfzRequest.id, relativePath: 'bank.sf2' };
+  const calls = [];
+  const context = await bootstrap(sfzFileHost(bytes, calls, ({ type, payload }) => {
+    if (type !== 'sfz/openRead') return undefined;
+    if (payload.revision && payload.revision !== revision) return { ok: false, code: 'source-changed' };
+    return { ok: true, data: { readId: sfzReadId, size: bytes.length, revision } };
+  }));
+  const bridge = context.window.electronAPI.sfzLibraryV1;
+  const stat = await bridge.statRelative(request);
+  assert.deepEqual({ ...stat.data }, { size: bytes.length, revision });
+  assert.deepEqual(calls.map(call => call.type), ['sfz/openRead', 'sfz/closeRead']);
+  calls.length = 0;
+  const range = await bridge.readRelativeRange({ ...request, offset: 3, length: bytes.length - 3, revision });
+  assert.equal(range.data.revision, revision);
+  assert.deepEqual(range.data.bytes, bytes.subarray(3));
+  assert.equal(calls[0].payload.revision, revision);
+  assert.deepEqual(calls.filter(call => call.type === 'sfz/readChunk').map(call => call.payload.offset), [3, 196611, 393219]);
+  assert.equal(calls.at(-1).type, 'sfz/closeRead');
+  calls.length = 0;
+  const stale = await bridge.readRelativeRange({ ...request, offset: 0, length: 4, revision: 'f'.repeat(64) });
+  assert.equal(stale.code, 'source-changed');
+  assert.deepEqual(calls.map(call => call.type), ['sfz/openRead']);
+});
+
+test('the generated SFZ bank reserves full pages for uneven PCM16 and floating-point samples', async () => {
+  const { parseSfz } = await assetModule('js/sfz/parser.js');
+  const { prepareStreamedSfzBank } = await assetModule('js/sfz/streamed-bank.js');
+  const { attachSfzSampleStreamWorker } = await assetModule('js/sfz/sample-stream-worker.js');
+  const { SFZ_SAMPLE_PAGE_FRAMES } = await assetModule('js/sfz/sample-stream.js');
+  const makeWaveReader = (name, frames) => {
+    const bytes = new Uint8Array(44 + frames * 2);
+    const view = new DataView(bytes.buffer);
+    const ascii = (offset, text) => bytes.set(new TextEncoder().encode(text), offset);
+    ascii(0, 'RIFF'); view.setUint32(4, bytes.length - 8, true); ascii(8, 'WAVE');
+    ascii(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true); view.setUint32(24, 48000, true); view.setUint32(28, 96000, true);
+    view.setUint16(32, 2, true); view.setUint16(34, 16, true); ascii(36, 'data');
+    view.setUint32(40, frames * 2, true);
+    return { size: bytes.length, revision: name, async readRange(offset, length) { return bytes.slice(offset, offset + length); } };
+  };
+  const readers = new Map([['long.wav', makeWaveReader('long', 17 * SFZ_SAMPLE_PAGE_FRAMES)],
+    ['short.wav', makeWaveReader('short', 1)]]);
+  const parsed = await parseSfz({ selectedPath: 'mixed.sfz', hasSample: name => readers.has(name),
+    readText: async () => '<region> sample=long.wav load_mode=1 key=60 <region> sample=short.wav load_mode=0 key=61' });
+  const workerFactory = () => {
+    const worker = { postMessage: data => queueMicrotask(() => endpoint.onmessage({ data })), terminate() {} };
+    const endpoint = { postMessage: data => queueMicrotask(() => worker.onmessage({ data })) };
+    attachSfzSampleStreamWorker(endpoint);
+    return worker;
+  };
+  const { descriptor } = await prepareStreamedSfzBank({ id: 'a'.repeat(24), parsed, maxBytes: 32 * 1024 * 1024,
+    createSampleReader: name => readers.get(name) }, { workerFactory, persistentCache: null });
+  const header = new Uint32Array(descriptor.payload, 32);
+  assert.equal(header[1], 10, 'both storage formats use the native mixed-layout bank');
+  assert.ok(header[16] >= 17, 'the packed cache admits the complete long sample');
+  assert.ok(header[14] - header[16] >= 1, 'the floating cache admits the complete short sample');
 });
 
 test('SFZ reads preserve missing and size-limit results and bound malformed/native failures', async () => {

@@ -13,6 +13,11 @@ import {
   getPluginExecutionCapabilities
 } from '../../external/effetune/js/audio/plugin-execution-capabilities.js';
 import { applySerializedState } from '../../external/effetune/js/utils/serialization-utils.js';
+import { SFZ_STORAGE_TABLE_VERSION, SFZ_STREAM_TABLE_VERSION, SF2_TABLE_VERSION } from '../../external/effetune/js/sfz/asset.js';
+import { SFZ_SAMPLE_PAGE_FRAMES } from '../../external/effetune/js/sfz/sample-stream.js';
+import { getSfzMaxBytes } from '../../external/effetune/js/sfz/limits.js';
+import { MidiInputState } from '../../external/effetune/js/midi/smf-timeline.js';
+import { getMidiEventList } from '../../external/effetune/js/midi/event-list.js';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const source = await readFile(path.join(projectRoot, 'ui-shim', 'vst-audio-manager.js'), 'utf8');
@@ -119,6 +124,11 @@ function createNativePort() {
     DataView,
     document: createEventTarget(),
     Float32Array,
+    SFZ_STORAGE_TABLE_VERSION,
+    SFZ_STREAM_TABLE_VERSION,
+    SF2_TABLE_VERSION,
+    SFZ_SAMPLE_PAGE_FRAMES,
+    getSfzMaxBytes,
     getPluginExecutionCapabilities,
     performance,
     queueMicrotask,
@@ -173,6 +183,77 @@ function spectrumFrame(mode = 'after', id = 7, amplitude = .5) {
     outputBuffer: encode(amplitude), ...(mode === 'compare' ? { inputBuffer: encode(amplitude * 2) } : {}),
     bufferPosition: 0, sampleRate: 48000 };
 }
+
+test('the host MIDI presentation exposes held notes, event rows and the DAW beat across loss', () => {
+  const start = source.indexOf('  applyNativeMidiInput(');
+  const end = source.indexOf('  hasSfzSampleStreaming()', start);
+  const context = { MidiInputState, getMidiEventList };
+  vm.runInNewContext(`this.Manager = class { ${source.slice(start, end)} };`, context);
+  const manager = new context.Manager();
+  manager.getCurrentPipeline = () => [];
+  manager.hostTransport = { tempoBpm: 120, ppqPosition: 8, playing: true };
+  manager.applyNativeMidiInput({ midiGeneration: 1, midiPosition: 4, midiEvents: [[3.9, 0x643c90]] });
+  const playing = manager.getLiveMidiPresentation();
+  assert.equal(playing.live.channels[0].notes[0].pitch, 60);
+  assert.equal(playing.eventRows[0].type, 'Note On');
+  assert.equal(playing.eventRows[0].position, '3.900');
+  assert.equal(playing.beatAt(3.9).quarter, 7.8);
+  manager.hostTransport = { tempoBpm: 120, ppqPosition: 8, playing: false };
+  manager.applyNativeMidiInput({ midiGeneration: 2, midiPosition: 4.1, midiEvents: [], midiDroppedEvents: 1 });
+  const stopped = manager.getLiveMidiPresentation();
+  assert.equal(stopped.live.channels[0].notes.length, 0);
+  assert.equal(stopped.eventRows.length, 0);
+  assert.equal(stopped.paused, true);
+  assert.equal(stopped.beatAt(4.2).quarter, 8);
+});
+
+test('streamed instruments pin every sample page before commit and cancel rejected transfers', async () => {
+  const { context, hostCalls, node, port } = createNativePort();
+  const { owner } = port;
+  owner.nativeNode = node;
+  let closed = 0;
+  const descriptor = {
+    footprintBytes: 100000,
+    async sampleProviderFactory({ generation, publish }) {
+      return {
+        samples: [{ sample: 0, frames: SFZ_SAMPLE_PAGE_FRAMES + 1, channels: 1 }],
+        async requestPages(requests) {
+          for (const { sample, pageIndex, resident } of requests) {
+            assert.equal(resident, true);
+            const frames = pageIndex ? 1 : SFZ_SAMPLE_PAGE_FRAMES;
+            await publish({ generation, sample, pageIndex, frames, channels: 1, pcm: new Float32Array(frames) });
+          }
+        },
+        close() { ++closed; }
+      };
+    }
+  };
+  const plugin = { id: 7, getWasmAssetOperationRevision: () => 5, getWasmAssetRevisionDescriptor: () => descriptor };
+  owner.pipelineA = [plugin];
+  const payload = new ArrayBuffer(104);
+  const header = new DataView(payload);
+  header.setUint32(0, 0x31415445, true);
+  header.setUint32(32, 0x53465a, true);
+  header.setUint32(36, SF2_TABLE_VERSION, true);
+  header.setUint32(88, 2, true);
+  const message = { pluginId: plugin.id, slot: 0, operationRevision: 5, payload };
+  await port.setPluginAsset(message, plugin);
+  assert.deepEqual(hostCalls.map(call => call.type), ['pipeline/assetBegin', 'pipeline/assetChunk',
+    'pipeline/assetPage', 'pipeline/assetPage', 'pipeline/assetCommit']);
+  assert.deepEqual(hostCalls.filter(call => call.type === 'pipeline/assetPage').map(({ payload }) =>
+    [payload.generation, payload.page, payload.flags, Buffer.from(payload.bytes, 'base64').length]),
+  [[1, 0, 1, SFZ_SAMPLE_PAGE_FRAMES * 4], [1, 1, 1, 4]]);
+  assert.equal(closed, 1);
+  hostCalls.length = 0;
+  context.window.__effetuneHostCall = async (type, payload) => {
+    hostCalls.push({ type, payload });
+    if (type === 'pipeline/assetPage') throw new Error('Native staging rejected the sample');
+    return { ok: true };
+  };
+  await assert.rejects(port.setPluginAsset(message, plugin), /staging rejected/);
+  assert.equal(hostCalls.at(-1).type, 'pipeline/assetCancel');
+  assert.equal(closed, 2);
+});
 
 function installSpectrumPolling({ context, port }) {
   const start = source.indexOf('  async pollNativeTelemetryOnce()');
@@ -908,6 +989,7 @@ test('native Tube fault snapshots use the real upstream validator and HUD across
     const events = [];
     Object.assign(port.owner, { nativeNode: node, pipelineA: [plugin], pipelineB: [],
       _dspRuntimeEventsByNode: new WeakMap(), _getPrimaryWorkletNode: () => node,
+      _handleSfzRuntimeMessage: () => false,
       _isActiveDspWorklet: candidate => candidate === node,
       handleWorkletMessage: context.RuntimeManager.prototype.handleWorkletMessage,
       applyNativeRuntimeEvents: context.RuntimeManager.prototype.applyNativeRuntimeEvents,
@@ -989,6 +1071,7 @@ test('native Adaptive Prediction faults use upstream validation and reject stale
   Object.assign(manager, { nativeNode: node, pipelineA: [plugin], pipelineB: [], currentPipeline: 'A',
     getCurrentPipeline() { return this.currentPipeline === 'A' ? this.pipelineA : this.pipelineB; },
     _dspRuntimeEventsByNode: new WeakMap(), _getPrimaryWorkletNode: () => node,
+    _handleSfzRuntimeMessage: () => false,
     _isActiveDspWorklet: candidate => candidate === node,
     dispatchEvent: (type, data) => events.push({ type, data }) });
   const fault = { type: 'adaptivePredictionFault', pluginId: 7,
@@ -4054,4 +4137,43 @@ test('startup membership lets a recreated IR Reverb reach ready', async () => {
     'pipeline/assetCommit'
   ]);
   context.plugin.cleanup();
+});
+
+test('restoring a SoundFont selection stages its bank without creating an editor panel', async () => {
+  const { context, hostCalls, node, port } = createNativePort();
+  const sf = 'a'.repeat(24);
+  const sfz = await readFile(path.join(projectRoot, 'external/effetune/plugins/sfz-instrument.js'), 'utf8');
+  const soundFont = await readFile(path.join(projectRoot, 'external/effetune/plugins/others/soundfont_player.js'), 'utf8');
+  const payload = new ArrayBuffer(104);
+  const header = new DataView(payload);
+  header.setUint32(0, 0x31415445, true);
+  header.setUint32(32, 0x53465a, true);
+  header.setUint32(36, SF2_TABLE_VERSION, true);
+  header.setUint32(88, 2, true);
+  context.window.sfzLibraryService = {
+    async prepare(id) {
+      assert.equal(id, sf);
+      return { format: 'sf2', name: 'Test bank', descriptor: { payload, footprintBytes: 4096,
+        async sampleProviderFactory({ publish }) {
+          return { samples: [{ sample: 0, frames: 1, channels: 1 }], close() {},
+            requestPages: () => publish({ sample: 0, pageIndex: 0, frames: 1, channels: 1, pcm: new Float32Array([0.5]) }) };
+        }
+      } };
+    }
+  };
+  vm.runInNewContext(`${pluginBaseSource}\n${sfz}\n${soundFont}\nthis.plugin = new SoundFontPlayerPlugin();`, context);
+  const { plugin } = context;
+  plugin.id = 23;
+  port.owner.nativeNode = node;
+  port.owner.pipelineA = [plugin];
+  plugin.setSerializedParameters({ id: 23, en: true, sf });
+  plugin.setWasmAssetTargetResolver(() => [node]);
+  await plugin._pending;
+  await new Promise(resolve => setImmediate(resolve));
+  await Promise.all(port.assetOperations.values());
+  assert.deepEqual(hostCalls.map(call => call.type).filter(type => type.startsWith('pipeline/asset')), ['pipeline/assetBegin', 'pipeline/assetChunk',
+    'pipeline/assetPage', 'pipeline/assetCommit']);
+  assert.equal(plugin._wasmAssetStates.get(0) & 255, 3);
+  port.close();
+  plugin.cleanup();
 });

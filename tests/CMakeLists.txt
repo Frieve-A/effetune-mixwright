@@ -130,6 +130,7 @@ if(WIN32 AND TARGET effetune_plugin)
 
   add_executable(effetune_plugin_processing_lifecycle_tests
     unit/plugin_processing_lifecycle_tests.cpp
+    ${vst3sdk_SOURCE_DIR}/public.sdk/source/vst/hosting/eventlist.cpp
     ${vst3sdk_SOURCE_DIR}/public.sdk/source/vst/hosting/parameterchanges.cpp
     ${vst3sdk_SOURCE_DIR}/public.sdk/source/vst/vstsinglecomponenteffect.cpp
     ${PROJECT_SOURCE_DIR}/src/plugin/automation_parameters.cpp

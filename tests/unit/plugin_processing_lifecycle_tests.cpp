@@ -11,6 +11,7 @@
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
 #include "pluginterfaces/vst/ivsteditcontroller.h"
 #include "pluginterfaces/vst/ivstprocesscontext.h"
+#include "public.sdk/source/vst/hosting/eventlist.h"
 #include "public.sdk/source/vst/hosting/parameterchanges.h"
 #include "public.sdk/source/vst/utility/memoryibstream.h"
 
@@ -52,6 +53,11 @@ namespace effetune::vst::plugin {
 
 class PluginProcessorTestAccess {
 public:
+  [[nodiscard]] static auto soundFontMixerState(const EffeTuneProcessor &processor,
+                                                 const std::uint32_t id) {
+    return processor.engine_.soundFontMixerState(id);
+  }
+
   [[nodiscard]] static bool previewMeasurementPaused(const EffeTuneProcessor &processor) {
     return processor.engine_.frequencyPreviewActive_;
   }
@@ -1393,7 +1399,7 @@ void testFrequencyPreviewReachesPipelineAndStopsWithEditor() {
   const auto closedResources = PluginProcessorTestAccess::editorResourceGenerations(*processor);
   expect(closedResources.first == liveResources.first + 1 &&
              closedResources.second == liveResources.second + 1,
-         "the accepted editor removal cancels its SFZ reads and backup operation");
+         "the accepted editor removal cancels its instrument chooser and backup operation");
   send("1000");
   process();
   (void)processor->handleUiMessage(R"({"type":"host/getInfo","payload":{"startup":true}})");
@@ -7269,23 +7275,33 @@ void testSfzReplacementKeepsWetProcessing() {
   auto processSetup = setup(48000, 64);
   expect(processor->setupProcessing(processSetup) == kResultOk, "prepare bank processor");
   const auto request = [&](const std::string &json) { return choc::json::parse(processor->handleUiMessage(json)); };
-  const auto sfz = std::string(R"({"id":55,"type":"SFZNotePlayerPlugin","name":"SFZ","enabled":false,"parameters":{},"wasmParams":[0.5,-30,3,28,91,32,0,100,0,0,1,1,1,0,18,0,0,-1,100,0],"wasmParamsHash":)") +
+  const auto sfz = std::string(R"({"id":55,"type":"SFZNotePlayerPlugin","name":"SFZ","enabled":false,"parameters":{},"wasmParams":[0.5,-30,3,28,91,32,0,100,0,0,1,1,1,0,18,0,0,-1,100,0,0],"wasmParamsHash":)") +
       std::to_string(effetune::generated::SFZNotePlayerPluginParams::kHash) + "}";
   expect(request(std::string(R"({"type":"pipeline/rebuild","payload":{"plugins":[{"id":1,"type":"VolumePlugin","name":"Volume","enabled":true,"parameters":{"vl":-6},"wasmParams":[-6],"wasmParamsHash":1719233191},)") + sfz + "]}}")["ok"].getBool(),
          "install gain path and loadable instrument");
   std::vector<float> words(8u + kHeader + kStride + 16u, .25f);
   auto *bytes = reinterpret_cast<std::uint8_t *>(words.data());
-  std::fill_n(bytes, 32u, std::uint8_t{0});
+  std::fill_n(bytes, (8u + kHeader) * sizeof(float), std::uint8_t{0});
   const auto write = [&](std::size_t offset, std::uint32_t value) { std::memcpy(bytes + offset, &value, 4); };
   write(0, 0x31415445u); write(4, 1); write(8, static_cast<std::uint32_t>(words.size()) - 8u); write(12, 1);
-  const std::array<std::uint32_t, 8> header{kMagic, kVersion, 1, kStride, kHeader + kStride,
-      static_cast<std::uint32_t>(words.size() - 8u), 1, 0};
+  const std::array<std::uint32_t, kHeader> header{kMagic, kVersion, 1, kStride, kHeader + kStride,
+      static_cast<std::uint32_t>(words.size() - 8u), 1, 0, kHeader + kStride, 0, 0, 0};
   for (std::size_t i = 0; i < header.size(); ++i) write(32u + 4u * i, header[i]);
   std::array<float, kStride> region{};
   region[Frames] = 16; region[Channels] = 1; region[Rate] = 48000;
   region[HighKey] = 127; region[LowVelocity] = 1; region[HighVelocity] = 127; region[HighRandom] = 1;
   region[SequenceLength] = region[SequencePosition] = 1; region[KeyCenter] = 60;
   region[KeyTrack] = 100; region[End] = region[LoopEnd] = 15; region[Sustain] = 100;
+  region[LowChannel] = 1; region[HighChannel] = 16;
+  region[LowBend] = -8192; region[HighBend] = 8191;
+  region[HighChannelAftertouch] = region[HighPolyAftertouch] = region[HighProgram] = 127;
+  for (auto field = static_cast<unsigned>(SwitchLow); field <= SwitchDefault; ++field)
+    region[field] = -1;
+  region[BendUp] = 200; region[BendDown] = -200;
+  region[LoopCount] = -1;
+  region[Cutoff] = 20000;
+  region[AmpKeyCenter] = 60;
+  region[EQ1Bandwidth] = region[EQ2Bandwidth] = region[EQ3Bandwidth] = 1;
   for (std::uint32_t field = 0; field < kStride; ++field) {
     if (isIndexField(field)) write((8u + kHeader + field) * 4u, static_cast<std::uint32_t>(region[field]));
     else words[8u + kHeader + field] = region[field];
@@ -7372,7 +7388,7 @@ void testSfzReferencesSurviveAbAndState() {
   const auto plugin = [&](int id, const std::string &reference) {
     return std::string(R"({"id":)") + std::to_string(id) +
         R"(,"type":"SFZNotePlayerPlugin","name":"SFZ Note Player","enabled":true,"parameters":{"sf":")" + reference +
-        R"("},"wasmParams":[0.5,-30,3,28,91,32,0,100,0,0,1,1,1,0,18,0,0,-1,100,0],"wasmParamsHash":)" +
+        R"("},"wasmParams":[0.5,-30,3,28,91,32,0,100,0,0,1,1,1,0,18,0,0,-1,100,0,0],"wasmParamsHash":)" +
         std::to_string(effetune::generated::SFZNotePlayerPluginParams::kHash) + "}";
   };
   for (const auto pipeline : {"A", "B", "A"}) {
@@ -7413,7 +7429,7 @@ void testSfzAndIrTransferAdmissionBudgets() {
   };
   const auto sfz = [&](int id) {
     return std::string(R"({"id":)") + std::to_string(id) +
-        R"(,"type":"SFZNotePlayerPlugin","name":"SFZ","enabled":true,"parameters":{},"wasmParams":[0.5,-30,3,28,91,32,0,100,0,0,1,1,1,0,18,0,0,-1,100,0],"wasmParamsHash":)" +
+        R"(,"type":"SFZNotePlayerPlugin","name":"SFZ","enabled":true,"parameters":{},"wasmParams":[0.5,-30,3,28,91,32,0,100,0,0,1,1,1,0,18,0,0,-1,100,0,0],"wasmParamsHash":)" +
         std::to_string(effetune::generated::SFZNotePlayerPluginParams::kHash) + "}";
   };
   const auto ir = [&](int id) {
@@ -7440,6 +7456,16 @@ void testSfzAndIrTransferAdmissionBudgets() {
   expect(!begin(61, 36), "IR pending reservations obey unchanged 128 MiB aggregate");
   expect(request(R"({"type":"pipeline/assetClear","payload":{"pluginId":55,"slot":0}})")["ok"].getBool() &&
          begin(56, 1024u * mib), "clearing a pending bank frees its SFZ allowance");
+  expect(request(R"({"type":"pipeline/assetClear","payload":{"pluginId":56,"slot":0}})")["ok"].getBool(),
+         "release the full-size admission fixture");
+  expect(request(R"({"type":"pipeline/assetBegin","payload":{"pluginId":55,"slot":0,"formatTag":1,"channels":1,"frames":1,"topology":0,"headBlock":128,"rateDivider":1,"pathCount":0,"inputCount":0,"processingChannels":1,"byteSize":36,"footprintBytes":36,"operationRevision":2,"streamGeneration":1}})")["ok"].getBool(),
+         "begin a separate resident PCM transfer");
+  const std::vector<std::uint8_t> page(64u, 0u);
+  expect(request(std::string(R"({"type":"pipeline/assetPage","payload":{"pluginId":55,"slot":0,"operationRevision":2,"generation":1,"sample":0,"page":0,"frames":16,"channels":1,"flags":1,"bytes":")") +
+      choc::base64::encodeToString(page) + R"("}})")["ok"].getBool(),
+      "retained float PCM can exceed the native cache footprint when the combined budget fits");
+  expect(request(R"({"type":"pipeline/assetCancel","payload":{"pluginId":55,"slot":0,"operationRevision":2}})")["ok"].getBool(),
+         "cancel the reservation without a partial install");
   expect(processor->terminate() == kResultOk, "terminate SFZ admission");
 }
 
@@ -11776,13 +11802,149 @@ void testHostProjectTransportSnapshot() {
          "terminate host transport fixture");
 }
 
+#if !defined(EFFETUNE_AUTOMATION_HOST_GATE_FIXTURE)
+void testSoundFontMixerProjectState() {
+  auto processor = std::make_unique<EffeTuneProcessor>(true);
+  expect(processor->initialize(nullptr) == kResultOk, "initialize SoundFont state test");
+  auto processing = setup(48000, 64);
+  expect(processor->setupProcessing(processing) == kResultOk, "prepare SoundFont state test");
+
+  auto channels = choc::value::createEmptyArray();
+  for (std::uint32_t channel = 0; channel < 16; ++channel) {
+    auto row = choc::value::createEmptyArray();
+    for (const auto value : {3, 0, 12, 87, 51, 115, 23, 9, channel == 9 ? 128 : 1})
+      row.addArrayElement(value);
+    channels.addArrayElement(std::move(row));
+  }
+  auto extras = choc::value::createObject({});
+  extras.addMember("type", "SoundFontPlayerPlugin");
+  extras.addMember("soundFontMixerV1", channels);
+  effetune::vst::PluginStateDocument project;
+  project.pipelineA.plugins.push_back({1u, "SoundFont Player"});
+  project.pipelineA.plugins.front().extraJson = choc::json::toString(extras);
+  const auto load = [&] {
+    const auto json = effetune::vst::StateCodec::encode(project);
+    ResizableMemoryIBStream stream;
+    expect(stream.write(const_cast<char *>(json.data()), static_cast<int32>(json.size()), nullptr) == kResultOk,
+           "write SoundFont state fixture");
+    stream.rewind();
+    expect(processor->setState(&stream) == kResultOk, "load SoundFont project state");
+    (void)processor->handleUiMessage(R"({"type":"host/getInfo","payload":{"startup":true}})");
+    const auto result = choc::json::parse(processor->handleUiMessage(
+        R"({"type":"pipeline/rebuild","payload":{"pipeline":"A","plugins":[)"
+        R"({"id":1,"name":"SoundFont Player","type":"SoundFontPlayerPlugin","enabled":true,)"
+        R"("parameters":{},"wasmParams":[0,64,0,1],"wasmParamsHash":2219444632}]}})"));
+    expect(result["ok"].getBool(), "accept headless SoundFont replacement");
+  };
+  load();
+  const auto restored = PluginProcessorTestAccess::soundFontMixerState(*processor, 1);
+  expect(restored && restored->channels[0].program == 12 && restored->channels[0].volume == 87 &&
+             restored->channels[0].bankMsb == 3 && restored->channels[0].selectedBank == 1 &&
+             restored->channels[9].selectedBank == 128,
+         "project restoration installs the saved mixer before a bank is loaded");
+  ResizableMemoryIBStream saved;
+  expect(processor->getState(&saved) == kResultOk, "save mixer while awaiting the bank");
+  const auto savedJson = choc::json::parse(std::string_view(
+      static_cast<const char *>(saved.getData()), saved.getCursor()));
+  expect(savedJson["pipelineA"][0]["soundFontMixerV1"][0][3].getWithDefault<int>(-1) == 87,
+         "saved host state retains the mixer while awaiting the bank");
+
+  extras.setMember("soundFontMixerV1", choc::value::createEmptyArray());
+  project.pipelineA.plugins.front().extraJson = choc::json::toString(extras);
+  load();
+  expect(!PluginProcessorTestAccess::soundFontMixerState(*processor, 1),
+         "a malformed mixer does not install or inherit the previous project's settings");
+  expect(processor->terminate() == kResultOk, "terminate SoundFont state test");
+}
+
+void testInstrumentBusAndDefaultPipeline() {
+  auto processor = std::make_unique<EffeTuneProcessor>(true);
+  expect(processor->initialize(nullptr) == kResultOk, "initialize SoundFont instrument");
+  BusInfo midi{};
+  expect(processor->getBusCount(kAudio, kInput) == 0 &&
+             processor->getBusCount(kAudio, kOutput) == 1 &&
+             processor->getBusInfo(kEvent, kInput, 0, midi) == kResultOk &&
+             midi.channelCount == 16,
+         "instrument declares MIDI input and audio output without audio input");
+  ParamID sustain{}, pitch{}, program{}, bank{}, breath{};
+  expect(processor->getMidiControllerAssignment(0, 0, 64, sustain) == kResultOk &&
+             processor->getMidiControllerAssignment(0, 15, 129, pitch) == kResultOk &&
+             processor->getMidiControllerAssignment(0, 0, 130, program) == kResultOk &&
+             processor->getMidiControllerAssignment(0, 0, 0, bank) == kResultOk &&
+             processor->getMidiControllerAssignment(0, 2, 2, breath) == kResultOk &&
+             sustain != pitch &&
+             processor->getMidiControllerAssignment(0, 16, 64, pitch) == kResultFalse,
+         "VST MIDI mappings preserve channel and controller");
+  ResizableMemoryIBStream saved;
+  expect(processor->getState(&saved) == kResultOk, "save default instrument state");
+  effetune::vst::PluginStateDocument state;
+  expect(effetune::vst::StateCodec::decode(
+             {static_cast<const char *>(saved.getData()), saved.getCursor()}, state) &&
+             state.pipelineA.plugins.size() == 1 &&
+             state.pipelineA.plugins.front().name == "SoundFont Player" &&
+             state.pipelineA.plugins.front().channel == "A",
+         "the instrument starts with only SoundFont Player");
+  SpeakerArrangement outputs[] = {SpeakerArr::kStereo};
+  expect(processor->setBusArrangements(nullptr, 0, outputs, 1) == kResultTrue,
+         "host can negotiate a stereo output alone");
+  auto processSetup = setup(48000, 64);
+  expect(processor->setupProcessing(processSetup) == kResultOk &&
+             processor->setActive(true) == kResultOk, "activate output-only processing");
+  gate_ordering::AudioRig rig(0);
+  rig.data.numInputs = 0;
+  rig.data.inputs = nullptr;
+  for (int32 channel = 0; channel < rig.data.outputs[0].numChannels; ++channel)
+    std::fill_n(rig.data.outputs[0].channelBuffers32[channel], rig.data.numSamples, 1.0f);
+  EventList events(1);
+  Event note{};
+  note.type = Event::kNoteOnEvent;
+  note.sampleOffset = 17;
+  note.noteOn.pitch = 60;
+  note.noteOn.velocity = 1.0f;
+  note.noteOn.noteId = 9;
+  expect(events.addEvent(note) == kResultOk, "queue a host note");
+  rig.data.inputEvents = &events;
+  ParameterChanges controls(3);
+  int32 index = 0;
+  controls.addParameterData(breath, index)->addPoint(1, 19.0 / 127.0, index);
+  controls.addParameterData(program, index)->addPoint(17, 5.0 / 127.0, index);
+  controls.addParameterData(bank, index)->addPoint(17, 3.0 / 127.0, index);
+  rig.data.inputParameterChanges = &controls;
+  ProcessContext context{};
+  context.state = ProcessContext::kPlaying | ProcessContext::kTempoValid |
+                  ProcessContext::kProjectTimeMusicValid | ProcessContext::kTimeSigValid;
+  context.sampleRate = 48000.0;
+  context.tempo = 120.0;
+  context.projectTimeMusic = 4.0;
+  context.timeSigNumerator = 3;
+  context.timeSigDenominator = 4;
+  rig.data.processContext = &context;
+  tresult result;
+  { effetune::allocation_guard::Scope guard; result = processor->process(rig.data); }
+  expect(result == kResultOk && rig.data.outputs[0].silenceFlags == 3,
+         "an unloaded instrument initializes the audio buffers without allocating");
+  const auto telemetry = choc::json::parse(processor->handleUiMessage(R"({"type":"telemetry/read"})"));
+  const auto midiEvents = telemetry["midiEvents"];
+  const auto hostTransport = telemetry["hostTransport"];
+  expect(midiEvents.size() == 4 && midiEvents[0][1].getInt64() == 0x1302b2 &&
+             midiEvents[1][1].getInt64() == 0x0300b0 && midiEvents[2][1].getInt64() == 0x0005c0 &&
+             midiEvents[3][1].getInt64() == 0x7f3c90 &&
+             std::abs(midiEvents[3][0].getFloat64() - 17.0 / 48000.0) < 1e-9 &&
+             std::abs(hostTransport["ppqPosition"].getFloat64() - (4.0 + 128.0 / 48000.0)) < 1e-9 &&
+             hostTransport["timeSignatureNumerator"].getInt64() == 3,
+         "Visualizer MIDI captures bank, program and note order, timing and host tempo without a loaded bank");
+  expect(processor->setActive(false) == kResultOk && processor->terminate() == kResultOk,
+         "terminate SoundFont instrument");
+}
+#endif
+
 void testSfzEventDetectionRefreshesHostLatency() {
   auto processor = std::make_unique<EffeTuneProcessor>();
   expect(processor->initialize(nullptr) == kResultOk, "initialize SFZ detection latency fixture");
   auto processSetup = setup(48000, 64);
   expect(processor->setupProcessing(processSetup) == kResultOk, "prepare SFZ detection latency fixture");
   using Params = effetune::generated::SFZNotePlayerPluginParams;
-  Params params{.5f, -30, 3, 28, 91, 32, 0, 100, 0, 0, 1, 1, 1, 0, 18, 0, 0, -1, 100, 0};
+  Params params{.5f, -30, 3, 28, 91, 32, 0, 100, 0, 0, 1, 1, 1, 0, 18, 0, 0, -1, 100, 0, 0};
   const auto packed = [&] {
     return std::span<const float>(reinterpret_cast<const float *>(&params), Params::kFloatCount);
   };
@@ -11791,7 +11953,7 @@ void testSfzEventDetectionRefreshesHostLatency() {
   const auto installed = choc::json::parse(processor->handleUiMessage(
       std::string{R"({"type":"pipeline/rebuild","payload":{"plugins":[{"id":55,"type":"SFZNotePlayerPlugin","name":"SFZ Note Player","enabled":true,"parameters":{},"wasmParams":)"} +
       choc::json::toString(values) + R"(,"wasmParamsHash":)" + std::to_string(Params::kHash) + "}]}}"));
-  expect(installed["ok"].getBool(), "the imported twenty-field SFZ layout is accepted");
+  expect(installed["ok"].getBool(), "the imported SFZ layout is accepted");
   expect(processor->setActive(true) == kResultOk, "activate SFZ detection latency fixture");
   gate_ordering::AudioRig rig(0);
   const auto render = [&] {
@@ -11828,6 +11990,10 @@ int main() {
 #endif
     testProcessingSurvivesHostReconfiguration();
     testHostProjectTransportSnapshot();
+#if !defined(EFFETUNE_AUTOMATION_HOST_GATE_FIXTURE)
+    testSoundFontMixerProjectState();
+    testInstrumentBusAndDefaultPipeline();
+#endif
     testSfzEventDetectionRefreshesHostLatency();
     testContextualExecutionAdmissionSurvivesEngineContextChanges();
     testConcurrentHostContextChangeWinsPluginUpdateAdmission();

@@ -200,15 +200,16 @@
   const sfzCall = async (operation, payload = {}) => {
     const response = await window.vst_hostMessage(JSON.stringify({ type: `sfz/${operation}`, payload }));
     if (response?.ok !== true) {
-      throw { code: response?.code === 'too-large' ? 'too-large' : 'storage-failed' };
+      throw { code: sfzReadErrorCode(response?.code) };
     }
     return response.data;
   };
+  const sfzReadErrorCode = code => ['too-large', 'source-changed'].includes(code) ? code : 'storage-failed';
   const sfzResponse = async action => {
     try {
       return { ok: true, data: await action() };
     } catch (error) {
-      return { ok: false, code: error?.code === 'too-large' ? 'too-large' : 'storage-failed' };
+      return { ok: false, code: sfzReadErrorCode(error?.code) };
     }
   };
   const readSfzFile = async (request, action) => {
@@ -239,7 +240,7 @@
         if (binary.length !== length) throw { code: 'storage-failed' };
         return Uint8Array.from(binary, character => character.charCodeAt(0));
       };
-      return await action(size, readRange);
+      return await action(size, readRange, opened.revision);
     } finally {
       await sfzCall('closeRead', { readId });
     }
@@ -265,9 +266,23 @@
       return bytes;
     })),
     statRelative: request => sfzResponse(() => withSfzRead({ ...request, maxBytes: sfzMaximumBytes },
-      async (size, readRange) => {
+      async (size, readRange, revision) => {
+        if (/\.sf[23]$/i.test(request.relativePath)) return { size, revision };
         const { readSfzAudioHeader } = await import('./js/sfz/bank.js');
-        return { size, ...await readSfzAudioHeader(readRange, size) };
+        return { size, revision, ...await readSfzAudioHeader(readRange, size) };
+      })),
+    readRelativeRange: ({ id, relativePath, offset, length, revision }) => sfzResponse(() =>
+      withSfzRead({ id, relativePath, revision, maxBytes: sfzMaximumBytes }, async (size, readRange, currentRevision) => {
+        if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(length) || offset < 0 ||
+            length < 1 || length > 1024 * 1024 || offset > size - length) {
+          throw { code: 'storage-failed' };
+        }
+        if (currentRevision !== revision) throw { code: 'source-changed' };
+        const bytes = new Uint8Array(length);
+        for (let read = 0; read < length; read += sfzChunkBytes) {
+          bytes.set(await readRange(offset + read, Math.min(sfzChunkBytes, length - read)), read);
+        }
+        return { bytes, revision: currentRevision };
       }))
   });
 

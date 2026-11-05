@@ -84,6 +84,9 @@ const requiredFiles = [
   'plugins/plugins.txt',
   'plugins/lofi/vinyl_simulator.css',
   'plugins/lofi/vinyl_simulator.js',
+  'plugins/sfz-instrument.js',
+  'plugins/others/soundfont_player.js',
+  'js/sf2/source.js',
   'presets/presets.txt',
   'features/measurement/dataStorage.js',
   'features/measurement/measurement-model.js',
@@ -399,7 +402,7 @@ if (uiManager.includes('initializeNetworkMusic') || uiManager.includes('network-
   throw new Error('Excluded network music initialization remains reachable');
 }
 const midiManager = await readFile(path.join(assets, 'js', 'midi', 'midi-controller-manager.js'), 'utf8');
-if (midiManager.includes('android/') || !midiManager.includes('this.navigator.requestMIDIAccess({ sysex: false })')) {
+if (midiManager.includes('android/') || !midiManager.includes('this.navigator.requestMIDIAccess({ sysex })')) {
   throw new Error('Controller access must retain Web MIDI without the Android integration');
 }
 const itemBuilder = await readFile(path.join(assets, 'js', 'ui', 'pipeline', 'pipeline-item-builder.js'), 'utf8');
@@ -858,6 +861,9 @@ for (const excluded of [
   'js/ui/library',
   'js/ui/audio-player',
   'js/ui/audio-player.js',
+  'js/audio/dsd',
+  'js/audio/midi-offline.js',
+  'js/midi/score-file.js',
   'js/ui/pipeline/file-processor.js',
   'js/audio/offline-processor.js'
 ]) {

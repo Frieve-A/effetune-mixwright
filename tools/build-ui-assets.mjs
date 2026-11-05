@@ -369,25 +369,14 @@ await writeFile(routingDialogPath, routingDialog, 'utf8');
 
 const visualizerViewPath = path.join(output, 'js', 'visualizer', 'visualizer-view.js');
 let visualizerView = await readText(visualizerViewPath);
-const playerMetadata = `    metadata() {
-        const player = this.uiManager.audioPlayer;
-        // OpenHome can retain the player and its last track after the UI closes.
-        if (!player?.ui?.container) return null;
-        const snapshot = player?.stateManager?.getStateSnapshot();
-        if (!snapshot?.currentTrack && !snapshot?.liveInputActive) return null;
-        const metadata = player.mediaSessionManager?.buildMetadata(snapshot);
-        if (!metadata) return null;
-        const information = snapshot.liveInputActive ? snapshot.liveInputInformation
-            : getTrackInformation(snapshot.currentTrack, metadata);
-        return { ...metadata, 'track-info': formatTrackInformation(information,
-            (key, fallback) => this.t(key, fallback), snapshot.liveInputActive ? 'AirPlay' : '') };
-    }`;
-if (visualizerView.split(playerMetadata).length - 1 !== 1) {
+const playerMetadata = /    metadata\(\) \{[\s\S]*?\n    \}(?=\n    lyrics\()/;
+const playerLyrics = /    lyrics\(\) \{[\s\S]*?\n    \}(?=\n    playbackTarget\()/;
+if (!playerMetadata.test(visualizerView) || !playerLyrics.test(visualizerView)) {
   throw new Error('Unable to locate the Visualizer metadata provider');
 }
 visualizerView = visualizerView.replace(playerMetadata, `    metadata() {
         return this.uiManager.audioManager.getNowPlayingMetadata();
-    }`);
+    }`).replace(playerLyrics, '    lyrics() { return null; }');
 // The native host owns project transport. Neither the excluded player nor an
 // editor-local wall clock can represent stopped playback, seeks, or loops.
 const counterProvider = /    counters\(now = performance\.now\(\)\) \{[\s\S]*?\n    \}\n(?=    resetCounter)/;
@@ -408,6 +397,7 @@ for (const integration of [
   "import { SynchronizedVideo } from '../ui/audio-player/synchronized-video.js';\n",
   "import { formatTrackInformation, getTrackInformation } from '../ui/audio-player/track-information.js';\n",
   "import { hasPlaybackRegionDescriptor } from '../ui/audio-player/playback-region.js';\n",
+  "import { getMidiLyricsData } from '../midi/lyrics-timeline.js';\n",
   '        this.video = new SynchronizedVideo();\n',
   "        this.video.setEnabled(this.layout.items.some(item => item.type === 'video'));\n",
   '        this.video.setActive(!!this.feed?.visible);\n',
@@ -418,7 +408,44 @@ for (const integration of [
   }
   visualizerView = visualizerView.replace(integration, '');
 }
+const visualizerMidiProvider = /        this\.sources = new VisualizerSources\(uiManager\.audioManager,\n[\s\S]*?\n(?=        this\.currentPresetName)/;
+if (!visualizerMidiProvider.test(visualizerView)) throw new Error('Unable to locate the Visualizer MIDI source');
+visualizerView = visualizerView.replace(visualizerMidiProvider, `        this.sources = new VisualizerSources(uiManager.audioManager,
+            () => uiManager.audioManager.getLiveMidiPresentation?.() ?? null);
+`);
 await writeFile(visualizerViewPath, visualizerView, 'utf8');
+
+const visualizerMidiPath = path.join(output, 'js', 'visualizer', 'visualizer-midi.js');
+let visualizerMidi = await readText(visualizerMidiPath);
+const liveMidiBeat = '                beat: null, chord: inferMidiChord(notes) };';
+const liveMidiClock = '                position: presentation.position, playing: true, paused: false, speed: 1,';
+if (visualizerMidi.split(liveMidiBeat).length !== 2 || visualizerMidi.split(liveMidiClock).length !== 2) {
+  throw new Error('Unable to locate the Visualizer live MIDI clock');
+}
+visualizerMidi = visualizerMidi.replace(liveMidiClock, `                position: presentation.position, playing: presentation.playing, paused: presentation.paused, speed: 1,`)
+  .replace(liveMidiBeat, `                beat: presentation.beat, beatAt: presentation.beatAt, chord: inferMidiChord(notes) };`);
+await writeFile(visualizerMidiPath, visualizerMidi, 'utf8');
+
+const visualizerSourcesPath = path.join(output, 'js', 'visualizer', 'visualizer-sources.js');
+const visualizerSources = await readText(visualizerSourcesPath);
+const eventListProvider = /    getMidiEventList\(\) \{[\s\S]*?\n    \}(?=\n\n    _syncMidiMixerMetering)/;
+if (!eventListProvider.test(visualizerSources)) throw new Error('Unable to locate the Visualizer MIDI event list source');
+await writeFile(visualizerSourcesPath, visualizerSources.replace(eventListProvider, `    getMidiEventList() {
+        const presentation = this.getMidiPresentation();
+        return presentation?.eventRows ? { live: true, rows: presentation.eventRows,
+            position: presentation.eventRows.at(-1)?.seconds ?? 0 } : null;
+    }`).replace("import { getMidiEventList } from '../midi/event-list.js';\n", ''), 'utf8');
+
+const midiEventListPath = path.join(output, 'js', 'visualizer', 'visualizer-midi-event-list.js');
+const midiEventList = await readText(midiEventListPath);
+const eventListPosition = 'cell(row.position, 1, y, position.flatMap((text, index) => [';
+const eventListHeading = 'COLUMNS.forEach((label, column) => cell(label, column, headerHeight / 2));';
+if (!midiEventList.includes(eventListPosition) || !midiEventList.includes(eventListHeading)) {
+  throw new Error('Unable to locate the Visualizer MIDI event list position display');
+}
+await writeFile(midiEventListPath, midiEventList
+  .replace(eventListPosition, 'cell(row.position, 1, y, data?.live ? null : position.flatMap((text, index) => [')
+  .replace(eventListHeading, `COLUMNS.forEach((label, column) => cell(data?.live && column === 1 ? 'Time (s)' : label, column, headerHeight / 2));`), 'utf8');
 
 const visualizerRendererPath = path.join(output, 'js', 'visualizer', 'visualizer-renderer.js');
 let visualizerRenderer = await readText(visualizerRendererPath);
@@ -448,12 +475,17 @@ await writeFile(tourPath, tour, 'utf8');
 
 const eventHandlerPath = path.join(output, 'js', 'ui', 'pipeline', 'ui-event-handler.js');
 let eventHandler = await readText(eventHandlerPath);
-const lyricsAttachmentImport = "import { attachLyricsFiles } from '../audio-player/lyrics-file-links.js';\n";
-const lyricsAttachmentCall = "                            attachLyricsFiles(musicFiles, files.filter(file => /\\.lrc$/i.test(file.name || '')));\n";
-if (eventHandler.split(lyricsAttachmentImport).length !== 2 || eventHandler.split(lyricsAttachmentCall).length !== 2) {
+const musicAttachmentsImport = "import { attachLyricsFiles, attachArtworkFiles } from '../audio-player/lyrics-file-links.js';\n";
+const musicExtensions = /^import \{ SUPPORTED_AUDIO_EXTENSIONS \} from '\.\.\/\.\.\/library\/constants\.js';\n\nconst PLAYBACK_AUDIO_EXTENSIONS[\s\S]*?\n\}(?=\n\nfunction isPlaylistFile)/m;
+const musicFiles = /                    \/\/ Check for music files\n                    const musicFiles = files\.filter\(isSupportedPlaybackAudioFile\);\n/;
+const musicDrop = /                    \/\/ Process music files \(if any and no preset files\)\n[\s\S]*?\n                    \}(?=\s*return false;)/;
+if (eventHandler.split(musicAttachmentsImport).length !== 2 || !musicDrop.test(eventHandler) ||
+    !musicExtensions.test(eventHandler) || !musicFiles.test(eventHandler)) {
   throw new Error('Unable to locate the excluded music lyrics attachment workflow');
 }
-eventHandler = eventHandler.replace(lyricsAttachmentImport, '').replace(lyricsAttachmentCall, '');
+eventHandler = eventHandler.replace(musicAttachmentsImport, '').replace(musicDrop, '')
+  .replace(musicExtensions, 'const PLAYLIST_EXTENSION_PATTERN = /\\.(m3u8?|pls|xspf)$/i;')
+  .replace(musicFiles, '');
 await writeFile(eventHandlerPath, eventHandler, 'utf8');
 
 const visualizerEditorPath = path.join(output, 'js', 'visualizer', 'visualizer-editor.js');
@@ -464,15 +496,15 @@ if (visualizerEditor.split(visualizerAddChoices).length - 1 !== 1) {
 }
 visualizerEditor = visualizerEditor.replace(visualizerAddChoices,
   "byLabel(ITEM_TYPES.filter(type => !['lyrics', 'video', 'playback-control', 'seek-bar', 'track-info'].includes(type)).map(type =>");
-const visualizerChannels = `            const channels = [['', '1–2'], ['L', 'L'], ['R', 'R'], ...Array.from({ length: 7 }, (_, i) => [\`\${i * 2 + 3}\${i * 2 + 4}\`, \`\${i * 2 + 3}–\${i * 2 + 4}\`]), ...Array.from({ length: 16 }, (_, i) => [\`\${i + 1}\`, \`\${i + 1}\`])];
-            this.field(properties, this.t('visualizer.channel', 'Channel'), 'select', item.channel || '', value => { item.channel = value || null; this.changed(); }, { values: channels });`;
-if (visualizerEditor.split(visualizerChannels).length - 1 !== 1) {
+const visualizerChannels = /^            const channels = \[.*?\];\n(?=[\s\S]*?this\.field\(properties, this\.t\('visualizer\.channel')/gm;
+if ([...visualizerEditor.matchAll(visualizerChannels)].length !== 1) {
   throw new Error('Unable to locate Visualizer channel choices');
 }
 visualizerEditor = visualizerEditor.replace(visualizerChannels, `            const channels = [['', '1–2'], ['L', 'L'], ['R', 'R'], ...Array.from({ length: 3 }, (_, i) => [\`\${i * 2 + 3}\${i * 2 + 4}\`, \`\${i * 2 + 3}–\${i * 2 + 4}\`]), ...Array.from({ length: 8 }, (_, i) => [\`\${i + 1}\`, \`\${i + 1}\`])];
             const unavailableChannel = item.channel && !channels.some(([value]) => value === item.channel);
             if (unavailableChannel) channels.push([item.channel, \`Unavailable in this plug-in (\${item.channel})\`]);
-            const channelSelect = this.field(properties, this.t('visualizer.channel', 'Channel'), 'select', item.channel || '', value => { item.channel = value || null; this.changed(); }, { values: channels });
+`).replace("            this.field(properties, this.t('visualizer.channel', 'Channel'),", `            const channelSelect = this.field(properties, this.t('visualizer.channel', 'Channel'),`)
+  .replace('{ values: channels, disabled: midiMode });', `{ values: channels, disabled: midiMode });
             if (unavailableChannel) {
                 for (const option of channelSelect.options) option.disabled = option.value === item.channel;
             }`);
@@ -544,6 +576,24 @@ tiltEq = tiltEq.replace(tiltEqPivotRefresh, `            const pivotFrequencyHel
                 pivotHzInput.value = Math.round(Math.exp(this.f0));
             }`);
 await writeFile(tiltEqPath, tiltEq, 'utf8');
+
+const pluginManagerPath = path.join(output, 'js', 'plugin-manager.js');
+let pluginManager = await readText(pluginManagerPath);
+const pluginManagerClass = 'export class PluginManager {';
+const pluginAvailability = '    isPluginAvailable(name) {\n';
+const pluginLookup = '        const PluginClass = this.pluginClasses[name];';
+if ([pluginManagerClass, pluginAvailability, pluginLookup].some(anchor => pluginManager.split(anchor).length !== 2)) {
+  throw new Error('Unable to locate plug-in availability and creation for the SoundFont Note Player alias');
+}
+pluginManager = pluginManager.replace(pluginManagerClass, `// Existing states and presets can refer to the instrument by its old name or stable DSP type.
+function resolvePluginName(name) {
+    return name === 'SFZ Note Player' || name === 'SFZNotePlayerPlugin' ? 'SoundFont Note Player' : name;
+}
+
+${pluginManagerClass}`)
+  .replace(pluginAvailability, `${pluginAvailability}        name = resolvePluginName(name);\n`)
+  .replace(pluginLookup, '        const PluginClass = this.pluginClasses[resolvePluginName(name)];');
+await writeFile(pluginManagerPath, pluginManager, 'utf8');
 
 const historyPath = path.join(output, 'js', 'ui', 'pipeline', 'history-manager.js');
 let history = await readText(historyPath);
@@ -631,8 +681,8 @@ for (const [original, replacement] of [
 
 `, ''],
   [`request = isAndroidHost(this.window) ? requestAndroidMidiAccess()
-        : Promise.resolve(this.navigator.requestMIDIAccess({ sysex: false }));`,
-    'request = Promise.resolve(this.navigator.requestMIDIAccess({ sysex: false }));'],
+        : Promise.resolve(this.navigator.requestMIDIAccess({ sysex }));`,
+    'request = Promise.resolve(this.navigator.requestMIDIAccess({ sysex }));'],
   ['    const wasLearning = this.learnActive;\n', ''],
   [`    if (wasLearning && !this.disposed && isAndroidHost(this.window)) {
       void this.syncNativeConfiguration().catch(error => console.error('Android MIDI learn cleanup failed:', error));
@@ -779,7 +829,9 @@ uiManager = uiManager.replace(urlReflectionGate, `        // The VST WebView has
         // would only re-encode the whole pipeline on every parameter change.
         this.urlReflectionEnabled = false;`);
 for (const excludedImport of [
-  `import { attachLyricsFiles } from './ui/audio-player/lyrics-file-links.js';\n`,
+  `import { attachLyricsFiles, attachArtworkFiles } from './ui/audio-player/lyrics-file-links.js';\n`,
+  `import { getDsdPlaybackErrorKey } from './ui/audio-player/dsd-source.js';\n`,
+  `import { SCORE_EXTENSIONS } from './midi/score-file.js';\n`,
   `import { PipelineAnalyzerController } from './pipeline-analyzer/controller.js';\n`,
   `import { PipelineAnalyzerUI } from './pipeline-analyzer/ui.js';\n`,
   `import { AudioPlayer } from './ui/audio-player.js';\n`,
@@ -861,6 +913,12 @@ const webPlaybackSelectionMethod = /    async openWebPlaybackSelection\(files, g
 if (!webPlaybackSelectionMethod.test(uiManager)) {
   throw new Error('Unable to locate current web playback selection method');
 }
+const webMusicPickerConstants = /^const WEB_MUSIC_FILE_ACCEPT = [\s\S]*?^\}\];\n/m;
+const webMusicPicker = /    initOpenMusicButton\(\) \{[\s\S]*?(?=    async openWebPlaybackSelection\()/;
+if (!webMusicPickerConstants.test(uiManager) || !webMusicPicker.test(uiManager)) {
+  throw new Error('Unable to locate the excluded music file picker');
+}
+uiManager = uiManager.replace(webMusicPickerConstants, '').replace(webMusicPicker, '');
 uiManager = uiManager.replace(webPlaybackSelectionMethod,
   `    async openWebPlaybackSelection() { return false; }
 
@@ -1092,7 +1150,7 @@ await writeFile(clipboardPath, clipboard, 'utf8');
 
 const columnsPath = path.join(output, 'js', 'ui', 'pipeline', 'pipeline-column-manager.js');
 let columns = await readText(columnsPath);
-const saveColumns = `            localStorage.setItem('pipelineColumns', columns);`;
+const saveColumns = `            getSettingsStorage().setItem('pipelineColumns', columns);`;
 if (!columns.includes(saveColumns)) {
   throw new Error('Unable to locate column preference persistence');
 }
@@ -1115,4 +1173,39 @@ await rm(path.join(output, 'js', 'ui', 'audio-player.js'), { force: true });
 await rm(path.join(output, 'js', 'pipeline-analyzer'), { recursive: true, force: true });
 await rm(path.join(output, 'js', 'ui', 'pipeline', 'file-processor.js'), { force: true });
 await rm(path.join(output, 'js', 'audio', 'offline-processor.js'), { force: true });
+await rm(path.join(output, 'js', 'audio', 'dsd'), { recursive: true, force: true });
+// Keep the live MIDI state and sampler helpers, without the standalone score player.
+for (const file of [
+  'android/player-context.js', 'audio/midi-offline.js', 'midi/musicxml-parser.js',
+  'midi/score-file.js', 'midi/score-worker.js', 'midi/smf-parser.js', 'midi/smf-worker.js'
+]) {
+  await rm(path.join(output, 'js', file), { force: true });
+}
+const streamedBankPath = path.join(output, 'js', 'sfz', 'streamed-bank.js');
+let streamedBank = await readText(streamedBankPath);
+const residentRanges = `    const ranges = storage ? sfzResidentRanges(parsed.regions, samples, storage.mandatory)
+      : new Map(paths.map(path => [path, []]));
+    if (!storage) for (const path of new Set([...oscillators.samples.keys(), ...effectSamplePaths(parsed.effects)]))
+      ranges.get(path)?.push([0, samples.get(path).frames]);`;
+const buildStreamedBank = `  const build = async (context, budget = maxBytes, estimate = estimateEffectBytes, previous = null) => {`;
+const requiredPages = `    const required = [];
+    for (const [sample, path] of paths.entries()) for (const [first, end] of ranges.get(path))
+      for (let pageIndex = Math.floor(first / 4096); pageIndex <= Math.floor((end - 1) / 4096); pageIndex++)
+        required.push(Object.freeze({ sample, pageIndex }));
+    const minimum = storage ? maximumPlan.minimumSlots : required.length + 1;`;
+const providerPreload = '        await provider.preload(required);';
+for (const pattern of [residentRanges, buildStreamedBank, requiredPages, providerPreload]) {
+  if (streamedBank.split(pattern).length !== 2) throw new Error('Unable to configure a fully resident native instrument');
+}
+streamedBank = streamedBank.replace(residentRanges, `    const ranges = storage ? sfzResidentRanges(parsed.regions, samples, new Set(paths))
+      : new Map(paths.map(path => [path, [[0, samples.get(path).frames]]]));`)
+  .replace(buildStreamedBank, `  // The native host retains decoded PCM for topology and audio-configuration changes.
+  const replayBytes = factory.samples.reduce((total, sample) => total + sample.frames * sample.channels * 4, 0);
+${buildStreamedBank}
+    budget -= replayBytes;
+    if (budget < 1) throw sfzError('too-large', 'The instrument exceeds the SoundFont memory limit.');`)
+  .replace(requiredPages, `    const required = factory.samples.reduce((count, sample) => count + Math.ceil(sample.frames / 4096), 0);
+    const minimum = storage ? maximumPlan.minimumSlots : required + 1;`)
+  .replace(providerPreload, '        // Mixwright uploads all resident pages in bounded batches before native commit.');
+await writeFile(streamedBankPath, streamedBank, 'utf8');
 await writeFile(path.join(output, '.stamp'), `${productName} WebView assets\n`, 'utf8');

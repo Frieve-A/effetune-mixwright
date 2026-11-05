@@ -24,9 +24,12 @@ enum class UiAction {
   endAutomationGesture,
   beginPluginAsset,
   appendPluginAsset,
+  appendPluginAssetPage,
+  cancelPluginAsset,
   commitPluginAsset,
   clearPluginAsset,
   readPluginAssetState,
+  soundFontMidiControl,
   setMasterBypass,
   setOversampling,
   readTelemetry,
@@ -91,6 +94,8 @@ struct RoutedUiMessage {
   // of every entry and nothing else: touch boundaries name no value.
   std::vector<RoutedAutomationEdit> automationEdits;
   RuntimeAsset asset;
+  RuntimeSamplePage assetPage;
+  AudioCommand audioCommand;
   std::uint64_t operationRevision = 0;
   std::uint64_t nowPlayingRevision = 0;
   std::size_t assetByteSize = 0;
@@ -101,6 +106,7 @@ struct RoutedUiMessage {
   // nothing about which context asked. Defaults to false, which is what an
   // older UI that omits the field always meant.
   bool startupHandshake = false;
+  bool includeMidiTelemetry = false;
   bool pipelineBInitialized = false;
   bool masterBypass = false;
   std::uint32_t pluginId = 0;

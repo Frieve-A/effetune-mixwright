@@ -195,6 +195,33 @@ void testSelectedFilesAndLegacyMetadata(const fs::path &directory) {
     expect(!call(library, "list")["ok"].getBool(), "registry rejects escaping bank references");
   }
 }
+void testSoundFontReadRevision(const fs::path &directory) {
+  const auto root = directory / "soundfonts";
+  write(root / "first.SF2", "SoundFont fixture");
+  write(root / "second.sf3", "compressed SoundFont fixture");
+  write(root / "private.txt", "not selected");
+  SfzLibrary library(directory / "soundfont-registry/references.json");
+  const auto selected = selectFolder(library, root);
+  expect(selected.size() == 2, "folder selection recognizes SF2 and SF3");
+  const auto id = selected[0]["id"].get<std::string>();
+  auto selectedFile = request(id, "first.SF2");
+  const auto opened = call(library, "openRead", selectedFile);
+  expect(opened["ok"].getBool() && opened["data"]["revision"].getString().size() == 64,
+         "SoundFont open publishes a file revision");
+  selectedFile.addMember("revision", opened["data"]["revision"]);
+  library.closeReads();
+  const auto versioned = call(library, "openRead", selectedFile);
+  expect(versioned["ok"].getBool() &&
+         call(library, "readChunk", readRequest(versioned["data"]["readId"].getString(), 0, 9))["ok"].getBool(),
+         "a matching revision permits a bounded sample read");
+  write(root / "first.SF2", "replacement SoundFont data");
+  expect(call(library, "readChunk", readRequest(versioned["data"]["readId"].getString(), 0, 9))
+             ["code"].getString() == "source-changed" &&
+         call(library, "openRead", selectedFile)["code"].getString() == "source-changed",
+         "an edit invalidates open and subsequent reads using the old revision");
+  expect(!call(library, "openRead", request(id, "private.txt"))["ok"].getBool(),
+         "a SoundFont reference cannot read a different file in the same folder");
+}
 void testConcurrent(const fs::path &directory) {
   const auto registry = directory / "concurrent/sfz-references.json";
   const auto a = directory / "a", b = directory / "b";
@@ -356,7 +383,7 @@ int main(int argc, char **argv) {
       std::chrono::steady_clock::now().time_since_epoch().count()));
   try {
     fs::create_directories(directory); directory = fs::canonical(directory);
-    testLibrary(directory); testSelectedFilesAndLegacyMetadata(directory); testConcurrent(directory);
+    testLibrary(directory); testSelectedFilesAndLegacyMetadata(directory); testSoundFontReadRevision(directory); testConcurrent(directory);
     testConcurrentProcesses(directory, fs::canonical(fs::absolute(argv[0])));
     fs::remove_all(directory);
     std::cout << "SFZ direct-reference tests passed\n"; return 0;

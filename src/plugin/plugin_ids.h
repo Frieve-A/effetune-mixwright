@@ -14,6 +14,7 @@ inline const Steinberg::FUID kProcessorId(0xA74D1C62, 0x39E84751, 0xB6126D8F,
 inline const Steinberg::FUID kProcessorId(0x72A0F755, 0xE18B4F5E, 0xA1D2F16B,
                                          0x25BB0419);
 #endif
+inline const Steinberg::FUID kInstrumentId(0x1A75A128, 0xA8554E32, 0xB076E6B2, 0x47120F66);
 inline constexpr Steinberg::Vst::ParamID kBypassParameterId = 0;
 inline constexpr Steinberg::Vst::ParamID kFirstAutomationParameterId = 0x00010000u;
 inline constexpr Steinberg::Vst::ParamID kLastAutomationParameterId =

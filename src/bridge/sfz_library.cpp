@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <cinttypes>
 #include <map>
 #include <mutex>
 #include <stdexcept>
@@ -37,6 +38,7 @@ constexpr std::size_t registryLimit = 1024u * 1024u;
 constexpr std::size_t entryLimit = 10000;
 
 struct TooLarge : std::runtime_error { TooLarge() : std::runtime_error("SFZ size limit exceeded") {} };
+struct SourceChanged : std::runtime_error { SourceChanged() : std::runtime_error("Instrument source changed") {} };
 void require(bool condition, const char *detail) {
   if (!condition) throw std::runtime_error(detail);
 }
@@ -70,11 +72,15 @@ bool within(const fs::path &root, const fs::path &file) {
     if (f == file.end() || !samePath(*r, *f)) return false;
   return f != file.end();
 }
-bool isSfz(const fs::path &path) {
+std::string instrumentExtension(const fs::path &path) {
   auto extension = utf8(path.extension());
   std::transform(extension.begin(), extension.end(), extension.begin(),
                  [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-  return extension == ".sfz";
+  return extension;
+}
+bool isInstrument(const fs::path &path) {
+  const auto extension = instrumentExtension(path);
+  return extension == ".sfz" || extension == ".sf2" || extension == ".sf3";
 }
 bool isBankXml(const fs::path &path) {
   auto name = utf8(path.filename());
@@ -188,7 +194,7 @@ std::vector<Entry> load(const fs::path &path) {
                 fromUtf8(item["path"].get<std::string>()), fromUtf8(item["root"].get<std::string>()), {}, {}};
     require(validId(entry.id) && entry.path.is_absolute() && entry.root.is_absolute() &&
             entry.path == entry.path.lexically_normal() && entry.root == entry.root.lexically_normal() &&
-            within(entry.root, entry.path) && isSfz(entry.path) &&
+            within(entry.root, entry.path) && isInstrument(entry.path) &&
             utf8(entry.path).find('\0') == std::string::npos &&
             utf8(entry.root).find('\0') == std::string::npos, "Invalid SFZ reference");
     const auto banks = item["bankPaths"];
@@ -268,6 +274,43 @@ struct ReadFile {
   ~ReadFile() { if (handle >= 0) ::close(handle); }
 #endif
   std::uint64_t size = 0;
+  std::string expectedRevision;
+
+  std::string revision() const {
+    std::uint64_t device = 0, identity = 0, modified = 0, bytes = 0;
+#if defined(_WIN32)
+    BY_HANDLE_FILE_INFORMATION info{};
+    require(GetFileInformationByHandle(handle, &info), "Instrument source lookup failed");
+    device = info.dwVolumeSerialNumber;
+    identity = (static_cast<std::uint64_t>(info.nFileIndexHigh) << 32u) | info.nFileIndexLow;
+    modified = (static_cast<std::uint64_t>(info.ftLastWriteTime.dwHighDateTime) << 32u) |
+               info.ftLastWriteTime.dwLowDateTime;
+    bytes = (static_cast<std::uint64_t>(info.nFileSizeHigh) << 32u) | info.nFileSizeLow;
+#else
+    struct stat info{};
+    require(!fstat(handle, &info) && info.st_size >= 0, "Instrument source lookup failed");
+    device = static_cast<std::uint64_t>(info.st_dev);
+    identity = static_cast<std::uint64_t>(info.st_ino);
+#if defined(__APPLE__)
+    const auto timestamp = info.st_mtimespec;
+#else
+    const auto timestamp = info.st_mtim;
+#endif
+    modified = static_cast<std::uint64_t>(timestamp.tv_sec) * 1000000000u +
+               static_cast<std::uint64_t>(timestamp.tv_nsec);
+    bytes = static_cast<std::uint64_t>(info.st_size);
+#endif
+    std::array<char, 65> encoded{};
+    std::snprintf(encoded.data(), encoded.size(),
+                  "%016" PRIx64 "%016" PRIx64 "%016" PRIx64 "%016" PRIx64,
+                  device, identity, modified, bytes);
+    return encoded.data();
+  }
+
+  void verifyRevision() const {
+    if (!expectedRevision.empty() && revision() != expectedRevision) throw SourceChanged{};
+  }
+
   bool open(const fs::path &path, const fs::path &root) {
 #if defined(_WIN32)
     handle = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE |
@@ -311,6 +354,7 @@ struct ReadFile {
     return true;
   }
   std::string read(std::uint64_t offset, std::size_t length) {
+    verifyRevision();
     std::vector<char> bytes(length);
     std::size_t done = 0;
 #if defined(_WIN32)
@@ -329,6 +373,7 @@ struct ReadFile {
 #endif
       done += static_cast<std::size_t>(count);
     }
+    verifyRevision();
     return choc::base64::encodeToString(bytes);
   }
 };
@@ -376,7 +421,7 @@ struct SfzLibrary::Impl {
       std::vector<fs::path> files;
       if (filesMode) for (const auto &selected : selectedFiles) {
         const auto path = fs::canonical(selected);
-        require(within(root, path) && fs::is_regular_file(path) && isSfz(path), "Invalid SFZ selected file");
+        require(within(root, path) && fs::is_regular_file(path) && isInstrument(path), "Invalid SFZ selected file");
         files.push_back(path);
       }
       std::vector<fs::path> bankPaths;
@@ -396,7 +441,7 @@ struct SfzLibrary::Impl {
           if (bankPaths.size() >= entryLimit) throw TooLarge();
           bankPaths.push_back(path.lexically_relative(root));
         }
-        if (!filesMode && it->is_regular_file() && isSfz(path)) {
+        if (!filesMode && it->is_regular_file() && isInstrument(path)) {
           if (files.size() >= entryLimit) throw TooLarge();
           files.push_back(path);
         }
@@ -454,13 +499,24 @@ struct SfzLibrary::Impl {
     const auto path = fs::canonical(root / relativePath, error);
     if (missing(error)) return {};
     require(!error && within(root, path), "SFZ dependency escaped its folder");
+    if (instrumentExtension(found->path) != ".sfz") {
+      require(samePath(path, found->path), "SoundFont reads must address the registered file");
+    }
     require(reads.size() < 16, "Too many SFZ read sessions");
     auto file = std::make_unique<ReadFile>();
     if (!file->open(path, root)) return {};
     if (file->size > limit) throw TooLarge();
+    const auto revision = file->revision();
+    const auto requestedRevision = payload["revision"];
+    if (!requestedRevision.isVoid()) {
+      require(requestedRevision.isString(), "Invalid instrument source revision");
+      if (requestedRevision.getString() != revision) throw SourceChanged{};
+      file->expectedRevision = revision;
+    }
     auto result = choc::value::createObject({});
     const auto readId = randomId(); result.addMember("readId", readId);
     result.addMember("size", static_cast<std::int64_t>(file->size));
+    result.addMember("revision", revision);
     reads.emplace(readId, std::move(file)); return result;
   }
 };
@@ -483,7 +539,8 @@ std::string SfzLibrary::request(std::string_view operation, std::string_view pay
     std::fprintf(stderr, "SFZ file reference diagnostic: %.*s: %s\n",
                  static_cast<int>(operation.size()), operation.data(), error.what());
     result.addMember("ok", false);
-    result.addMember("code", dynamic_cast<const TooLarge *>(&error) ? "too-large" : "storage-failed");
+    result.addMember("code", dynamic_cast<const TooLarge *>(&error) ? "too-large" :
+                             dynamic_cast<const SourceChanged *>(&error) ? "source-changed" : "storage-failed");
   }
   return choc::json::toString(result);
 }

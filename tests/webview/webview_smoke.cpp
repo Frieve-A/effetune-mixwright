@@ -1739,9 +1739,11 @@ int main(const int argc, char **argv) {
                 const bridge = window.electronAPI?.sfzLibraryV1;
                 if (bridge?.apiVersion !== 1) throw new Error('Native SFZ capability unavailable');
                 plugin = window.pluginManager.createPlugin('SFZ Note Player');
+                if (plugin.constructor.name !== 'SFZNotePlayerPlugin' || plugin.name !== 'SoundFont Note Player')
+                  throw new Error('Legacy SFZ Note Player name did not resolve to the current instrument');
                 const ui = plugin.createUI();
                 const buttons = [...ui.querySelectorAll('button')].map(button => button.textContent);
-                if (!buttons.includes('SFZ Library…'))
+                if (!buttons.includes('SoundFont Library…'))
                   throw new Error('SFZ library control unavailable');
                 stage = 'SFZ browser folder selection';
                 service = await plugin._getLibraryService();

@@ -11,6 +11,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -42,6 +43,15 @@ struct RuntimePlugin {
   bool contextuallyBypassed = false;
 };
 
+struct RuntimeSamplePage {
+  std::uint64_t index = 0;
+  std::uint32_t sample = 0;
+  std::uint32_t frames = 0;
+  std::uint32_t channels = 0;
+  std::uint32_t flags = 0;
+  std::vector<float> pcm;
+};
+
 struct RuntimeAsset {
   std::uint32_t logicalId = 0;
   std::uint32_t slot = 0;
@@ -56,6 +66,25 @@ struct RuntimeAsset {
   std::uint32_t processingChannels = 0;
   std::uint32_t footprintBytes = 0;
   std::vector<std::uint8_t> payload;
+  std::uint64_t streamGeneration = 0;
+  std::vector<RuntimeSamplePage> initialPages;
+};
+
+struct SoundFontMixerChannel {
+  std::uint8_t bankMsb = 0;
+  std::uint8_t bankLsb = 0;
+  std::uint8_t program = 0;
+  std::uint8_t volume = 100;
+  std::uint8_t pan = 64;
+  std::uint8_t expression = 127;
+  std::uint8_t reverb = 0;
+  std::uint8_t chorus = 0;
+  std::uint8_t selectedBank = 0;
+};
+
+struct SoundFontMixerState {
+  std::array<SoundFontMixerChannel, 16> channels{};
+  SoundFontMixerState() noexcept { channels[9].selectedBank = 128; }
 };
 
 class EngineHost {
@@ -68,6 +97,11 @@ public:
   static constexpr std::uint32_t kSfzAssetBudgetBytes = 1024u * 1024u * 1024u;
   // Transport permits the largest supported bank; target admission uses the kernel.
   static constexpr std::uint32_t kMaximumAssetTransportBytes = kSfzAssetBudgetBytes;
+  static constexpr std::uint32_t kMaxMidiEvents = 4096u;
+  static constexpr std::uint32_t kMaxSamplePages = 32768u;
+  static constexpr std::uint32_t kSamplePageFrames = 4096u;
+  [[nodiscard]] static std::uint32_t samplePlayerProcessingChannels(
+      std::int8_t channelSpec, std::uint32_t channels) noexcept;
   struct AssetLimits {
     std::uint32_t capacity = 0;
     std::uint32_t budget = 0;
@@ -96,6 +130,8 @@ public:
     parameterTargetUnavailable,
     parameterStageRejected,
     invalidProcessChunk,
+    midiEventsRejected,
+    sampleAssetUnavailable,
     engineProcessRejected
   };
 
@@ -152,7 +188,9 @@ public:
                                     std::uint32_t channelCount,
                                     std::uint32_t frameCount,
                                     double timeSeconds,
-                                    bool masterBypass) noexcept;
+                                    bool masterBypass,
+                                    std::span<const et_midi_event> midiEvents = {},
+                                    const et_host_transport *transport = nullptr) noexcept;
     [[nodiscard]] bool finish(bool refreshLatency = false) noexcept;
     [[nodiscard]] bool active() const noexcept { return host_ != nullptr; }
     [[nodiscard]] bool failed() const noexcept { return failed_; }
@@ -216,12 +254,19 @@ public:
       RuntimeAsset asset, bool clear, std::string *error = nullptr, std::uint64_t requestRevision = 0);
   [[nodiscard]] bool captureAssetUpdate(PreparedAssetUpdate &update) noexcept;
   [[nodiscard]] static bool prepareAssetUpdate(PreparedAssetUpdate &update) noexcept;
-  [[nodiscard]] bool applyAssetUpdate(PreparedAssetUpdate &update) noexcept;
+  // Paged banks need the upstream kernel's trial reservation after exchange.
+  // Only an exclusive control-side engine owner can allow that activation.
+  [[nodiscard]] bool applyAssetUpdate(PreparedAssetUpdate &update,
+                                      bool allowPagedActivation = false) noexcept;
   void finishAssetUpdate(PreparedAssetUpdate &update);
   [[nodiscard]] bool clearAsset(std::uint32_t logicalId, std::uint32_t slot);
   [[nodiscard]] std::uint32_t assetState(std::uint32_t logicalId,
                                          std::uint32_t slot) const;
   void retainAssets(std::span<const std::uint32_t> logicalIds);
+  [[nodiscard]] std::optional<SoundFontMixerState> soundFontMixerState(
+      std::uint32_t logicalId) const;
+  // A complete project replacement owns the engine while installing its state.
+  void replaceSoundFontMixerStates(const std::map<std::uint32_t, SoundFontMixerState> &states);
 
   [[nodiscard]] bool tryProcessBlock(float *const *channels, std::uint32_t channelCount,
                                      std::uint32_t frameCount, double timeSeconds,
@@ -278,6 +323,7 @@ private:
     std::uint32_t instanceEpoch = 0;
     std::atomic<std::uint64_t> state{0};
   };
+  struct SoundFontMixerProjection;
   struct InstanceEntry {
     et_instance instance = 0;
     std::uint32_t paramsHash = 0;
@@ -287,6 +333,11 @@ private:
     std::vector<float> measurementParameters;
     std::unique_ptr<CircuitFaultProjection> circuitFault;
     std::uint32_t assetBudget = kAggregateAssetBudgetBytes;
+    std::uint32_t samplePlayerChannels = 0;
+    bool sampleAssetUnavailable = false;
+    bool soundFont = false;
+    bool midiRendering = false;
+    SoundFontMixerProjection *soundFontMixer = nullptr;
     AnalysisRole analysisRole = AnalysisRole::other;
     float minimumMidi = 0.0f;
     float maximumMidi = 0.0f;
@@ -299,7 +350,7 @@ private:
   [[nodiscard]] bool stageFloatsUnlocked(InstanceEntry &entry,
                                         std::span<const float> packed,
                                         std::uint32_t paramsHash) noexcept;
-  void clearInstancesUnlocked() noexcept;
+  void clearInstancesUnlocked(std::span<const std::uint32_t> retain = {}) noexcept;
   [[nodiscard]] bool applyCommandUnlocked(const AudioCommand &command,
                                           bool *pipelinePlanDirty = nullptr) noexcept;
   void storeActiveDescriptorUnlocked(const std::uint8_t *descriptor,
@@ -310,8 +361,17 @@ private:
                                               std::span<const float> packed,
                                               std::uint32_t paramsHash,
                                               std::span<const std::uint8_t> parameterBytes) noexcept;
-  [[nodiscard]] bool stageAssetUnlocked(const RuntimeAsset &asset,
+  [[nodiscard]] bool stageAssetUnlocked(RuntimeAsset &asset,
                                         std::string *error = nullptr);
+  [[nodiscard]] bool descriptorPreservesSamplePlayerWidths(const std::uint8_t *descriptor) const noexcept;
+  [[nodiscard]] std::uint32_t remainingAssetBudgetUnlocked(std::uint64_t key,
+                                                          std::uint32_t budget) const noexcept;
+  void resetSoundFontInputUnlocked(InstanceEntry &entry) noexcept;
+  void restoreSoundFontMixerUnlocked(InstanceEntry &entry) noexcept;
+  void updateSoundFontMixerTelemetryUnlocked(std::span<const std::uint8_t> bytes) noexcept;
+  void stageMidiUnlocked(std::span<const et_midi_event> events, std::uint32_t channels,
+                         bool masterBypass) noexcept;
+  [[nodiscard]] bool applySoundFontControlUnlocked(const AudioCommand &command) noexcept;
   // Republishes the asset-state projection and reports whether any asset is
   // still staged or preparing. Safe on the audio thread: it reads the kernel
   // state the block just advanced and stores it into atomics that already
@@ -336,6 +396,7 @@ private:
   std::uint32_t maxProcessFrames_ = 0;
   bool prepared_ = false;
   bool frequencyPreviewActive_ = false;
+  bool hasSoundFont_ = false;
   std::array<std::uint8_t, AudioCommand::kMaxDescriptorBytes> activeDescriptor_{};
   std::uint32_t activeDescriptorByteCount_ = 0;
   std::array<InstanceEntry *, kMaxPipelineNodes> analysisNodes_{};
@@ -359,6 +420,8 @@ private:
   std::unordered_map<et_instance, std::uint32_t> spectrumInstanceIds_;
   SpectrumCapture spectrumCapture_;
   std::unordered_map<std::uint64_t, AssetEntry> assets_;
+  std::map<std::uint32_t, std::unique_ptr<SoundFontMixerProjection>> soundFontMixers_;
+  std::unordered_map<std::uint32_t, InstanceEntry *> soundFontMixerTaps_;
   bool assetPreparationLatencyPolling_ = false;
   struct TelemetryStorage;
   std::unique_ptr<TelemetryStorage> telemetry_;

@@ -22,6 +22,7 @@
 #include "plugin/plugin_ids.h"
 
 #include "pluginterfaces/vst/ivstautomationstate.h"
+#include "pluginterfaces/vst/ivstmidicontrollers.h"
 
 #include <array>
 #include <atomic>
@@ -32,6 +33,7 @@
 #include <functional>
 #endif
 #include <memory>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -51,12 +53,14 @@ namespace effetune::vst::plugin {
 class PluginProcessorTestAccess;
 
 class EffeTuneProcessor final : public Steinberg::Vst::SingleComponentEffect,
-                                public Steinberg::Vst::IAutomationState {
+                                public Steinberg::Vst::IAutomationState,
+                                public Steinberg::Vst::IMidiMapping {
 public:
-  EffeTuneProcessor();
+  explicit EffeTuneProcessor(bool instrument = false);
   ~EffeTuneProcessor() override;
 
   static Steinberg::FUnknown *createInstance(void *context);
+  static Steinberg::FUnknown *createInstrument(void *context);
 
   Steinberg::tresult PLUGIN_API initialize(Steinberg::FUnknown *context) SMTG_OVERRIDE;
   Steinberg::tresult PLUGIN_API terminate() SMTG_OVERRIDE;
@@ -74,6 +78,9 @@ public:
   Steinberg::uint32 PLUGIN_API getLatencySamples() SMTG_OVERRIDE;
   Steinberg::IPlugView *PLUGIN_API createView(Steinberg::FIDString name) SMTG_OVERRIDE;
   Steinberg::tresult PLUGIN_API setAutomationState(Steinberg::int32 state) SMTG_OVERRIDE;
+  Steinberg::tresult PLUGIN_API getMidiControllerAssignment(
+      Steinberg::int32 busIndex, Steinberg::int16 channel,
+      Steinberg::Vst::CtrlNumber controller, Steinberg::Vst::ParamID &id) SMTG_OVERRIDE;
   // Observation-only pass-throughs for the opt-in automation trace.
   Steinberg::tresult PLUGIN_API getParameterInfo(
       Steinberg::int32 index, Steinberg::Vst::ParameterInfo &info) SMTG_OVERRIDE;
@@ -111,6 +118,7 @@ public:
   REFCOUNT_METHODS(SingleComponentEffect)
   Steinberg::tresult PLUGIN_API queryInterface(const Steinberg::TUID iid,
                                                void **obj) SMTG_OVERRIDE {
+    QUERY_INTERFACE(iid, obj, Steinberg::Vst::IMidiMapping::iid, Steinberg::Vst::IMidiMapping)
     QUERY_INTERFACE(iid, obj, Steinberg::Vst::IAutomationState::iid,
                     Steinberg::Vst::IAutomationState)
     QUERY_INTERFACE(iid, obj, Steinberg::Vst::IConnectionPoint::iid,
@@ -170,7 +178,12 @@ private:
 
   void appendNowPlayingSnapshot(choc::value::Value &result,
                                 std::uint64_t knownRevision);
-  void publishHostTransport(const Steinberg::Vst::ProcessContext *context) noexcept;
+  void publishHostTransport(const Steinberg::Vst::ProcessContext *context,
+                            Steinberg::int32 frames) noexcept;
+  void publishMidiTelemetry(std::span<const et_midi_event> events,
+                            const Steinberg::Vst::ProcessData &data, bool rebase,
+                            std::uint64_t dropped) noexcept;
+  void appendMidiTelemetry(choc::value::Value &result);
   void appendHostTransport(choc::value::Value &result) const;
 
   [[nodiscard]] bool configureDsp(std::string *error = nullptr,
@@ -519,6 +532,8 @@ private:
     std::uint64_t stateEpoch = 0;
     std::uint64_t requestRevision = 0;
     std::size_t receivedBytes = 0;
+    std::size_t receivedPageBytes = 0;
+    std::uint64_t pageGeneration = 0;
   };
 
   struct ControlServiceTimer;
@@ -554,6 +569,30 @@ private:
   PresetStore presetStore_;
   ConfigStore configStore_;
   SfzLibrary sfzLibrary_{configStore_.path().parent_path() / "sfz-references.json"};
+  const bool instrument_;
+  static constexpr Steinberg::Vst::ParamID kFirstMidiParameterId = 0x20000u;
+  // MIDI CC 0-127 plus VST's contiguous channel pressure, bend and program numbers.
+  static constexpr Steinberg::Vst::ParamID kMidiControllersPerChannel =
+      Steinberg::Vst::kCtrlProgramChange + 1u;
+  static constexpr auto kMidiParameterCount = 16u * kMidiControllersPerChannel;
+  static Steinberg::uint32 midiControlMessage(Steinberg::Vst::ParamID id,
+                                              Steinberg::Vst::ParamValue value) noexcept;
+  std::array<et_midi_event, 4096> midiEvents_{};
+  std::array<std::uint32_t, kMidiParameterCount> flushedMidiControls_{};
+  bool pendingMidiFlush_ = false;
+  struct HostMidiTelemetry {
+    std::uint64_t generation;
+    double seconds;
+    std::uint32_t message;
+  };
+  static constexpr std::size_t kMidiTelemetryCapacity = 4097;
+  SpscQueue<HostMidiTelemetry, kMidiTelemetryCapacity> midiTelemetry_;
+  std::atomic<std::uint64_t> midiGeneration_{0};
+  std::atomic<double> midiPosition_{0.0};
+  std::atomic<std::uint64_t> midiDroppedEvents_{0};
+  std::atomic<bool> midiResetRequested_{false};
+  std::mutex midiTelemetryMutex_;
+  std::optional<HostMidiTelemetry> pendingMidiTelemetry_;
   std::mutex sfzMutex_;
   std::uint64_t sfzGeneration_ = 0;
   PluginStateDocument state_;
@@ -562,6 +601,7 @@ private:
   bool preserveMissingPipelineA_ = false;
   bool preserveMissingPipelineB_ = false;
   bool hasSavedState_ = false;
+  std::map<std::uint32_t, SoundFontMixerState> pendingSoundFontMixerStates_;
   std::vector<RuntimePlugin> runtimePlugins_;
   std::array<bool, kMaxPluginInstances> runtimeParameterDirty_{};
   std::array<bool, kMaxPluginInstances> runtimeFullImageDirty_{};
@@ -683,6 +723,11 @@ private:
   // bounded number of times and never hold up processing.
   std::atomic<std::uint64_t> transportSequence_{0};
   std::atomic<std::int64_t> transportProjectTimeSamples_{0};
+  std::atomic<double> transportTempo_{0.0};
+  std::atomic<double> transportPpq_{0.0};
+  std::atomic<double> transportBarStart_{0.0};
+  std::atomic<Steinberg::int32> transportNumerator_{0};
+  std::atomic<Steinberg::int32> transportDenominator_{0};
   std::atomic<double> transportSampleRate_{0.0};
   std::atomic_bool transportPlaying_{false};
   std::atomic_bool transportAvailable_{false};

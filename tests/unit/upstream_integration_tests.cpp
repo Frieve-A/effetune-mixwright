@@ -14,7 +14,9 @@
 #include "TubeSimulatorPluginParams.h"
 #include "NoteSpectrogramPluginParams.h"
 #include "SFZNotePlayerPluginParams.h"
+#include "SoundFontPlayerPluginParams.h"
 #include "../../external/effetune/dsp/plugins/others/sfz_note_player/bank.h"
+#include "../../external/effetune/dsp/plugins/others/soundfont_player/sf2_fixture.h"
 #include <bit>
 #include "allocation_guard.h"
 #include <choc/memory/choc_Base64.h>
@@ -50,6 +52,15 @@ public:
     return found != host.instances_.end() &&
         found->second.analysisSource == (producer == 0 ? 0 : host.resolveInstance(producer));
   }
+  static void invalidateCachedBank(EngineHost &host, const std::uint32_t logicalId) {
+    host.assets_.at(static_cast<std::uint64_t>(logicalId) << 32u).asset.payload.at(0) = 0;
+  }
+  static std::uint32_t cachedBankChannels(const EngineHost &host, const std::uint32_t logicalId) {
+    return host.assets_.at(static_cast<std::uint64_t>(logicalId) << 32u).asset.processingChannels;
+  }
+  static std::uint32_t midiState(const EngineHost &host, const std::uint32_t logicalId) {
+    return host.engine_->instanceMidiState(host.resolveInstance(logicalId));
+  }
 };
 }
 
@@ -63,7 +74,7 @@ template <typename Params> std::vector<float> packedFixture(const Params &params
 }
 
 effetune::generated::SFZNotePlayerPluginParams sfzDefaults() {
-  return {.5f, -30, 3, 28, 91, 32, 0, 100, 0, 0, 1, 1, 1, 0, 18, 0, 0, -1, 100, 0};
+  return {.5f, -30, 3, 28, 91, 32, 0, 100, 0, 0, 1, 1, 1, 0, 18, 0, 0, -1, 100, 0, -1};
 }
 
 std::uint32_t u32(const std::uint8_t *data) {
@@ -844,11 +855,11 @@ RuntimeAsset sfzTestAsset(std::uint32_t id) {
   constexpr std::uint32_t samples = 1024;
   std::vector<float> words(8u + kHeader + kStride + samples, .25f);
   auto *bytes = reinterpret_cast<std::uint8_t *>(words.data());
-  std::fill_n(bytes, 32u, std::uint8_t{0});
+  std::fill_n(bytes, (8u + kHeader) * sizeof(float), std::uint8_t{0});
   const auto write = [&](std::size_t offset, std::uint32_t value) { std::memcpy(bytes + offset, &value, 4); };
   write(0, 0x31415445u); write(4, 1); write(8, static_cast<std::uint32_t>(words.size()) - 8u); write(12, 1);
-  const std::array<std::uint32_t, 8> header{kMagic, kVersion, 1, kStride, kHeader + kStride,
-      static_cast<std::uint32_t>(words.size() - 8u), 1, 0};
+  const std::array<std::uint32_t, kHeader> header{kMagic, kVersion, 1, kStride, kHeader + kStride,
+      static_cast<std::uint32_t>(words.size() - 8u), 1, 0, kHeader + kStride, 0, 0, 0};
   for (std::size_t i = 0; i < header.size(); ++i) write(32u + 4u * i, header[i]);
   std::array<float, kStride> region{};
   region[Frames] = samples; region[Channels] = 1; region[Rate] = 48000;
@@ -856,18 +867,33 @@ RuntimeAsset sfzTestAsset(std::uint32_t id) {
   region[HighRandom] = 1; region[SequenceLength] = region[SequencePosition] = 1;
   region[KeyCenter] = 60; region[KeyTrack] = 100; region[End] = samples - 1;
   region[LoopMode] = 2; region[LoopEnd] = samples - 1; region[Sustain] = 100; region[Release] = .005f;
+  region[LowChannel] = 1; region[HighChannel] = 16;
+  region[LowBend] = -8192; region[HighBend] = 8191;
+  region[HighChannelAftertouch] = region[HighPolyAftertouch] = region[HighProgram] = 127;
+  for (auto field = static_cast<unsigned>(SwitchLow); field <= SwitchDefault; ++field)
+    region[field] = -1;
+  region[BendUp] = 200; region[BendDown] = -200;
+  region[LoopCount] = -1;
+  region[Cutoff] = 20000;
+  region[AmpKeyCenter] = 60;
+  region[EQ1Bandwidth] = region[EQ2Bandwidth] = region[EQ3Bandwidth] = 1;
   for (std::uint32_t field = 0; field < kStride; ++field)
     words[8u + kHeader + field] = isIndexField(field)
         ? std::bit_cast<float>(static_cast<std::uint32_t>(region[field])) : region[field];
   const auto byteSize = words.size() * sizeof(float);
-  const auto footprint = byteSize + 4u * (131u + 128u);
+  std::uint64_t extra = 0;
+  const auto size = static_cast<std::uint32_t>(byteSize);
+  expect(et_sample_player_preparation_bytes(bytes, size, size, ET_ASSET_F32_MULTICH,
+             48000.0f, 2, 1024, 0.0, &extra, ET_SAMPLE_PLAYER_NOTE) == ET_OK,
+         "query current native SFZ footprint");
   RuntimeAsset asset;
   asset.logicalId = id;
   asset.formatTag = 1;
-  asset.channels = asset.rateDivider = asset.processingChannels = 1;
+  asset.channels = asset.rateDivider = 1;
+  asset.processingChannels = 2;
   asset.frames = static_cast<std::uint32_t>(words.size() - 8u);
   asset.headBlock = 128;
-  asset.footprintBytes = static_cast<std::uint32_t>(footprint);
+  asset.footprintBytes = static_cast<std::uint32_t>(byteSize + extra);
   asset.payload.assign(bytes, bytes + byteSize);
   return asset;
 }
@@ -900,7 +926,7 @@ void testSfzAssetAdmissionAndReplay() {
   MessageRouter router;
   RoutedUiMessage message;
   const auto metadata = std::string(R"({"type":"pipeline/assetBegin","payload":{"pluginId":55,"slot":0,"formatTag":1,"channels":1,"frames":)") +
-      std::to_string(asset.frames) + R"(,"topology":0,"headBlock":128,"rateDivider":1,"pathCount":0,"inputCount":0,"processingChannels":1,"footprintBytes":)" +
+      std::to_string(asset.frames) + R"(,"topology":0,"headBlock":128,"rateDivider":1,"pathCount":0,"inputCount":0,"processingChannels":2,"footprintBytes":)" +
       std::to_string(footprint) + R"(,"byteSize":)" + std::to_string(asset.payload.size()) + R"(,"operationRevision":1}})";
   expect(router.decode(metadata, message, &error), "router admits real SFZ topology-zero metadata");
   message.asset.payload = asset.payload;
@@ -925,6 +951,207 @@ void testSfzAssetAdmissionAndReplay() {
          engine->assetFootprint(limits.budget, {}) == 0, "clear SFZ releases resident allowance");
   expect(engine->rebuild(pipeline, {runtime}, &error) && engine->assetState(55, 0) == ET_ASSET_STATE_NONE,
          "cleared SFZ never reappears on rebuild");
+}
+
+void testSoundFontHostMidiAndReplay() {
+  constexpr std::uint32_t soundFontId = 71;
+  constexpr std::uint32_t frames = 128;
+  auto engine = std::make_unique<EngineHost>();
+  std::string error;
+  expect(engine->prepare(48000, 2, frames, EngineHost::kDefaultTelemetryBytes, &error),
+         "prepare SoundFont host");
+  const effetune::generated::SoundFontPlayerPluginParams params{0, 64, 0, 1};
+  RuntimePlugin player;
+  player.logicalId = soundFontId;
+  player.type = "SoundFontPlayerPlugin";
+  player.paramsHash = params.kHash;
+  player.packedParameters = packedFixture(params);
+  PipelineState pipeline;
+  pipeline.plugins = {PluginState{soundFontId, "SoundFont Player", true}};
+  expect(engine->rebuild(pipeline, {player}, &error), "instantiate native SoundFont");
+
+  RuntimeAsset asset;
+  asset.logicalId = soundFontId;
+  asset.formatTag = ET_ASSET_F32_MULTICH;
+  asset.channels = asset.rateDivider = 1;
+  asset.processingChannels = 2;
+  asset.frames = static_cast<std::uint32_t>((kSf2NativeFixture.size() - 32u) / sizeof(float));
+  asset.footprintBytes = static_cast<std::uint32_t>(kSf2NativeFixture.size());
+  asset.payload.assign(kSf2NativeFixture.begin(), kSf2NativeFixture.end());
+  asset.streamGeneration = 1;
+  expect(!engine->setAsset(asset, &error) && engine->assetState(soundFontId, 0) == ET_ASSET_STATE_NONE,
+         "partial SoundFont cache cannot be installed");
+  RuntimeSamplePage page;
+  page.frames = 64;
+  page.channels = page.flags = 1;
+  page.pcm.assign(page.frames, .25f);
+  asset.initialPages.push_back(std::move(page));
+  expect(engine->setAsset(asset, &error) && engine->assetState(soundFontId, 0) == ET_ASSET_STATE_ACTIVE,
+         "prepare all SoundFont pages before installing the bank");
+
+  std::array<float, frames> left{}, right{};
+  const float *input[]{left.data(), right.data()};
+  float *output[]{left.data(), right.data()};
+  double time = 0.0;
+  double rate = 48000.0;
+  std::uint32_t channels = 2;
+  const auto render = [&](const std::span<const et_midi_event> events = {}) {
+    left.fill(0.0f);
+    right.fill(0.0f);
+    EngineHost::ProcessBatch batch;
+    {
+      effetune::allocation_guard::Scope guard;
+      expect(engine->beginProcessBatch(batch) &&
+             batch.processChunk(input, output, channels, frames, time, false, events) && batch.finish(),
+             "render SoundFont host MIDI without allocations");
+    }
+    time += frames / rate;
+  };
+  const auto sounding = [](const auto samples) {
+    return std::any_of(samples.begin(), samples.end(), [](float value) {
+      return std::abs(value) > .001f;
+    });
+  };
+  constexpr std::uint32_t noteOffset = 31;
+  constexpr std::uint32_t noteNumber = 72;
+  constexpr et_midi_event noteOn{noteOffset, 0x007f0090u | (noteNumber << 8u), 1u, 0u, 0u, 0u};
+  render(std::span(&noteOn, 1));
+  expect(!sounding(std::span(left).first(noteOffset)) && !sounding(std::span(right).first(noteOffset)),
+         "SoundFont stays silent before the host MIDI offset");
+  expect(sounding(std::span(left).subspan(noteOffset)) &&
+         (EngineHostTestAccess::midiState(*engine, soundFontId) & ET_MIDI_STATE_VOICES) != 0u,
+         "SoundFont produces audio and a live voice after the host MIDI offset");
+
+  RuntimePlugin volume;
+  volume.logicalId = 72;
+  volume.type = "VolumePlugin";
+  volume.paramsHash = engine->kernels().at(volume.type).paramsHash;
+  volume.packedParameters = {0.0f};
+  pipeline.plugins.push_back(PluginState{72, "Volume", true});
+  const std::vector<RuntimePlugin> runtimes{player, volume};
+  expect(engine->rebuild(pipeline, runtimes, &error), "add effect beside active SoundFont");
+  render();
+  expect(sounding(std::span(left).first(32)), "unrelated topology edit preserves the held voice");
+
+  pipeline.plugins.front().enabled = false;
+  expect(engine->updateDescriptor(pipeline, &error), "disable SoundFont through descriptor");
+  constexpr et_midi_event noteOff{0u, 0x80u | (noteNumber << 8u), 1u, 0u, 0u, 0u};
+  render(std::span(&noteOff, 1));
+  expect(!sounding(std::span(left)), "disabled instrument produces no audio");
+  pipeline.plugins.front().enabled = true;
+  expect(engine->updateDescriptor(pipeline, &error), "re-enable SoundFont through descriptor");
+  engine->discardTelemetry();
+  // The bank can still emit SF2 effect tails after input keys and sample
+  // voices are released. Mixer frame 35 reports those two states separately.
+  std::array<std::uint8_t, 4096> packet{};
+  bool receivedMixer = false;
+  bool heldNote = false;
+  std::uint32_t voices = 0;
+  const auto read16 = [](const std::uint8_t *bytes) {
+    return static_cast<std::uint32_t>(bytes[0]) | (static_cast<std::uint32_t>(bytes[1]) << 8u);
+  };
+  for (int block = 0; block < 16; ++block) {
+    render();
+    std::uint32_t dropped = 0;
+    const auto bytes = engine->readTelemetry(packet, dropped);
+    for (std::uint32_t offset = 0; offset + 16u <= bytes;) {
+      const auto *header = packet.data() + offset;
+      const auto size = read16(header + 12u);
+      if (size > bytes - offset - 16u) break;
+      if (read16(header) == 35u && read16(header + 2u) == 2u &&
+          u32(header + 4u) == soundFontId && size == 584u) {
+        const auto *mixer = header + 16u;
+        voices = read16(mixer);
+        heldNote = (mixer[8u + 16u + noteNumber / 8u] & (1u << (noteNumber % 8u))) != 0u;
+        receivedMixer = true;
+      }
+      offset += (16u + size + 3u) & ~3u;
+    }
+  }
+  expect(receivedMixer && !heldNote && voices == 0,
+         "omitted node cannot keep notes or sample voices held after re-enable");
+
+  auto staleStereoUpdate = engine->createAssetUpdate(asset, false, &error);
+  expect(staleStereoUpdate && engine->captureAssetUpdate(*staleStereoUpdate) &&
+         EngineHost::prepareAssetUpdate(*staleStereoUpdate), "prepare a stereo bank update");
+  pipeline.plugins.front().channel = "1";
+  AudioCommand widthChange;
+  std::uint64_t revision = 0;
+  expect(engine->makeDescriptorCommand(pipeline, runtimes, widthChange, &error) &&
+         !engine->applyDescriptorCommand(widthChange, revision, &error) &&
+         !engine->updateDescriptor(pipeline, &error),
+         "descriptor-only updates cannot change the instrument's processing width");
+  expect(engine->rebuild(pipeline, runtimes, &error) &&
+         !engine->applyAssetUpdate(*staleStereoUpdate, true) &&
+         EngineHostTestAccess::cachedBankChannels(*engine, soundFontId) == 1 &&
+         engine->assetState(soundFontId, 0) == ET_ASSET_STATE_ACTIVE,
+         "route rebuild prepares the cached mono bank and rejects the stale stereo update");
+  auto newMonoUpdate = engine->createAssetUpdate(asset, false, &error);
+  expect(newMonoUpdate && engine->captureAssetUpdate(*newMonoUpdate) &&
+         EngineHost::prepareAssetUpdate(*newMonoUpdate) &&
+         !engine->applyAssetUpdate(*newMonoUpdate) &&
+         engine->applyAssetUpdate(*newMonoUpdate, true),
+         "incoming bank is prepared against the current native channel width");
+  engine->finishAssetUpdate(*newMonoUpdate);
+  expect(EngineHostTestAccess::cachedBankChannels(*engine, soundFontId) == 1,
+         "renderer metadata cannot replace native mono geometry with stereo");
+  render(std::span(&noteOn, 1));
+  expect(sounding(std::span(left)) && !sounding(std::span(right)),
+         "newly installed mono bank renders only to the selected channel");
+
+  pipeline.plugins.front().channel.reset();
+  channels = 1;
+  rate = 44100.0;
+  expect(engine->prepare(rate, channels, frames, EngineHost::kDefaultTelemetryBytes, &error) &&
+         engine->rebuild(pipeline, runtimes, &error), "rebuild cached SoundFont at mono and new rate");
+  render(std::span(&noteOn, 1));
+  expect(engine->assetState(soundFontId, 0) == ET_ASSET_STATE_ACTIVE &&
+         sounding(std::span(left)), "reconfigured instrument uses the cached pages");
+
+  EngineHostTestAccess::invalidateCachedBank(*engine, soundFontId);
+  expect(engine->prepare(rate, channels, frames, EngineHost::kDefaultTelemetryBytes, &error) &&
+         engine->rebuild(pipeline, runtimes, &error), "invalid cached bank does not strand the pipeline");
+  const auto diagnostic = engine->processFailureDiagnostic();
+  expect(engine->assetState(soundFontId, 0) == ET_ASSET_STATE_ERROR &&
+         diagnostic.error == EngineHost::ProcessError::sampleAssetUnavailable,
+         "failed replay publishes an actionable instrument error");
+  render();
+  expect(engine->assetState(soundFontId, 0) == ET_ASSET_STATE_ERROR &&
+         engine->processFailureDiagnostic().sequence == diagnostic.sequence,
+         "ordinary audio keeps the existing error without publishing it again");
+  asset.processingChannels = 1;
+  expect(engine->setAsset(std::move(asset), &error) &&
+         engine->assetState(soundFontId, 0) == ET_ASSET_STATE_ACTIVE,
+         "reloading a valid instrument clears the replay error");
+
+  const auto cc = [](const std::uint32_t controller, const std::uint32_t value) {
+    return et_midi_event{0u, 0xb0u | (controller << 8u) | (value << 16u), 0u, 0u, 0u, 0u};
+  };
+  for (int block = 0; block < 32; ++block) render();
+  const std::array mixerEdits{
+      cc(0, 1), et_midi_event{0u, 0x02c0u, 0u, 0u, 0u, 0u},
+      cc(0, 0), cc(32, 3), cc(7, 77), cc(10, 55), cc(11, 84), cc(91, 31), cc(93, 9)};
+  render(mixerEdits);
+  for (int block = 0; block < 8; ++block) render();
+  const auto matchesMixer = [](const std::optional<SoundFontMixerState> &state) {
+    if (!state) return false;
+    const auto &row = state->channels[0];
+    return row.selectedBank == 1 && row.program == 2 && row.bankMsb == 0 && row.bankLsb == 3 &&
+           row.volume == 77 && row.pan == 55 && row.expression == 84 &&
+           row.reverb == 31 && row.chorus == 9;
+  };
+  const auto mixer = engine->soundFontMixerState(soundFontId);
+  expect(matchesMixer(mixer), "headless mixer projection survives full UI telemetry delivery");
+  engine->reset();
+  for (int block = 0; block < 8; ++block) render();
+  expect(matchesMixer(engine->soundFontMixerState(soundFontId)),
+         "engine activation reset preserves the displayed mixer");
+  engine->replaceSoundFontMixerStates({{soundFontId, *mixer}});
+  expect(engine->prepare(rate, channels, frames, EngineHost::kDefaultTelemetryBytes, &error) &&
+         engine->rebuild(pipeline, runtimes, &error), "restore saved mixer while recreating the engine");
+  for (int block = 0; block < 8; ++block) render();
+  expect(matchesMixer(engine->soundFontMixerState(soundFontId)),
+         "restored mixer preserves active patch and pending bank independently");
 }
 
 void testNoteAnalysisSharing() {
@@ -960,9 +1187,12 @@ void testNoteAnalysisSharing() {
     expect(ok, "analysis routing updates without allocating or losing a block");
     expect(EngineHostTestAccess::analysisSource(*engine, 2, source), "expected native analysis source");
   };
-  const auto route = [&](std::vector<PluginState> nodes, std::uint32_t source) {
+  const auto route = [&](std::vector<PluginState> nodes, std::uint32_t source,
+                         bool samplerWidthChanges = false) {
     pipeline.plugins = std::move(nodes);
-    expect(engine->updateDescriptor(pipeline, &error), "update analysis descriptor");
+    const auto installed = samplerWidthChanges ? engine->rebuild(pipeline, plugins, &error)
+                                                : engine->updateDescriptor(pipeline, &error);
+    expect(installed, "update analysis descriptor");
     render(source);
   };
   render(1);
@@ -985,13 +1215,13 @@ void testNoteAnalysisSharing() {
   route({note, different}, 0);
   different = sfz;
   different.channel = "1";
-  route({note, different}, 0);
+  route({note, different}, 0, true);
   auto monoNote = note;
   monoNote.channel = "1";
   route({monoNote, different}, 1);
   auto sendNote = note;
   sendNote.outputBus = 1;
-  route({sendNote, sfz}, 1);
+  route({sendNote, sfz}, 1, true);
   sendNote.inputBus = 1;
   sendNote.outputBus = 0;
   different = sfz;
@@ -1257,6 +1487,7 @@ int main() {
     testSpectrumRouter();
     testCircuitFaultPublication();
     testSfzAssetAdmissionAndReplay();
+    testSoundFontHostMidiAndReplay();
     testPreparedSfzAssetsAndPreview();
     testNoteAnalysisSharing();
     testBackupExport();

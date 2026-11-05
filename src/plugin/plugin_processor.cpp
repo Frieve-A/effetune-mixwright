@@ -17,6 +17,8 @@
 #include "base/source/fstring.h"
 #include "pluginterfaces/base/ibstream.h"
 #include "pluginterfaces/base/ustring.h"
+#include "pluginterfaces/vst/ivstevents.h"
+#include "pluginterfaces/vst/ivstmidicontrollers.h"
 #include "pluginterfaces/vst/ivstparameterchanges.h"
 #include "pluginterfaces/vst/vstspeaker.h"
 #include "public.sdk/source/vst/vstaudioprocessoralgo.h"
@@ -35,6 +37,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <tuple>
 #include <utility>
 
 namespace effetune::vst::plugin {
@@ -59,6 +62,66 @@ void traceRestartComponent(IComponentHandler &handler, const int32 flags,
     trace::restart(instance, trace::Event::restartEnd, flags,
                     static_cast<std::int32_t>(result));
   }
+}
+
+// Separate from the persistent pipeline automation slots. MIDI CC mappings
+// are hidden host parameters whose points are delivered with sample offsets.
+[[nodiscard]] ParamValue midiControlDefault(const CtrlNumber controller) noexcept {
+  switch (controller) {
+  case 7: return 100.0 / 127.0;
+  case 10: return 64.0 / 127.0;
+  case 11:
+  case 98:
+  case 99:
+  case 100:
+  case 101: return 1.0;
+  case kPitchBend: return 8192.0 / 16383.0;
+  default: return 0.0;
+  }
+}
+
+[[nodiscard]] bool translateMidiEvent(const Event &event, et_midi_event &result) noexcept {
+  uint32 status = 0;
+  int16 channel = 0;
+  int16 pitch = 0;
+  float value = 0.0f;
+  int32 noteId = -1;
+  switch (event.type) {
+  case Event::kNoteOnEvent:
+    status = 0x90;
+    channel = event.noteOn.channel;
+    pitch = event.noteOn.pitch;
+    value = event.noteOn.velocity;
+    noteId = event.noteOn.noteId;
+    break;
+  case Event::kNoteOffEvent:
+    status = 0x80;
+    channel = event.noteOff.channel;
+    pitch = event.noteOff.pitch;
+    value = event.noteOff.velocity;
+    noteId = event.noteOff.noteId;
+    break;
+  case Event::kPolyPressureEvent:
+    status = 0xa0;
+    channel = event.polyPressure.channel;
+    pitch = event.polyPressure.pitch;
+    value = event.polyPressure.pressure;
+    noteId = event.polyPressure.noteId;
+    break;
+  default:
+    return false;
+  }
+  if (channel < 0 || channel >= 16 || pitch < 0 || pitch >= 128 || !std::isfinite(value)) {
+    return false;
+  }
+  const auto data2 = static_cast<uint32>(std::lround(std::clamp(value, 0.0f, 1.0f) * 127.0f));
+  result = {static_cast<uint32>(event.sampleOffset),
+            status | static_cast<uint32>(channel) | (static_cast<uint32>(pitch) << 8u) | (data2 << 16u),
+            noteId < 0 ? 0u : static_cast<uint32>(noteId) + 1u, 0u, 0u, 0u};
+  return true;
+}
+[[nodiscard]] bool midiEventOrder(const et_midi_event &a, const et_midi_event &b) noexcept {
+  return std::tie(a.offset_frames, a.flags) < std::tie(b.offset_frames, b.flags);
 }
 
 [[nodiscard]] bool hasChannelPointers(const AudioBusBuffers &bus) noexcept {
@@ -338,10 +401,88 @@ displayedAutomationValue(const AutomationTargetDescriptor &target,
   return false;
 }
 
+constexpr auto kSoundFontMixerStateKey = "soundFontMixerV1";
+constexpr std::array kSoundFontMixerFields{
+    &SoundFontMixerChannel::bankMsb, &SoundFontMixerChannel::bankLsb,
+    &SoundFontMixerChannel::program, &SoundFontMixerChannel::volume,
+    &SoundFontMixerChannel::pan, &SoundFontMixerChannel::expression,
+    &SoundFontMixerChannel::reverb, &SoundFontMixerChannel::chorus,
+    &SoundFontMixerChannel::selectedBank};
+
+bool isSoundFontPlayer(const PluginState &plugin, const choc::value::ValueView &extra) {
+  const auto type = extra["type"];
+  return type.isString() ? type.getString() == "SoundFontPlayerPlugin"
+                         : plugin.name == "SoundFont Player";
+}
+
+std::map<std::uint32_t, SoundFontMixerState> decodeSoundFontMixerStates(
+    const PluginStateDocument &document) {
+  std::map<std::uint32_t, SoundFontMixerState> states;
+  for (const auto *pipeline : {&document.pipelineA, &document.pipelineB}) {
+    for (const auto &plugin : pipeline->plugins) {
+      const auto extra = choc::json::parse(plugin.extraJson);
+      const auto channels = extra[kSoundFontMixerStateKey];
+      SoundFontMixerState mixer;
+      if (!isSoundFontPlayer(plugin, extra) || !channels.isArray() ||
+          channels.size() != mixer.channels.size()) continue;
+      bool valid = true;
+      for (std::uint32_t channel = 0; valid && channel < channels.size(); ++channel) {
+        const auto row = channels[channel];
+        valid = row.isArray() && row.size() == kSoundFontMixerFields.size();
+        for (std::uint32_t field = 0; valid && field < row.size(); ++field) {
+          const auto value = row[field];
+          const auto number = value.getWithDefault<std::int64_t>(-1);
+          const auto maximum = field == kSoundFontMixerFields.size() - 1u ? 128 : 127;
+          valid = value.isInt() && number >= 0 && number <= maximum;
+          if (valid)
+            mixer.channels[channel].*kSoundFontMixerFields[field] =
+                static_cast<std::uint8_t>(number);
+        }
+      }
+      if (valid) states.emplace(plugin.id, mixer);
+    }
+  }
+  return states;
+}
+
+void captureSoundFontMixerStates(PluginStateDocument &document, const EngineHost &engine) {
+  for (auto *pipeline : {&document.pipelineA, &document.pipelineB}) {
+    for (auto &plugin : pipeline->plugins) {
+      const auto mixer = engine.soundFontMixerState(plugin.id);
+      if (!mixer) continue;
+      auto extra = choc::json::parse(plugin.extraJson);
+      if (!isSoundFontPlayer(plugin, extra)) continue;
+      auto channels = choc::value::createEmptyArray();
+      for (const auto &channel : mixer->channels) {
+        auto row = choc::value::createEmptyArray();
+        for (const auto field : kSoundFontMixerFields)
+          row.addArrayElement(static_cast<std::int32_t>(channel.*field));
+        channels.addArrayElement(std::move(row));
+      }
+      extra.setMember(kSoundFontMixerStateKey, std::move(channels));
+      plugin.extraJson = choc::json::toString(extra);
+    }
+  }
+}
+
 } // namespace
 
-EffeTuneProcessor::EffeTuneProcessor()
-    : telemetryScratch_(EngineHost::kDefaultTelemetryBytes + OutputAnalyzers::kTelemetryBytes) {
+uint32 EffeTuneProcessor::midiControlMessage(const ParamID id, const ParamValue value) noexcept {
+  const auto index = id - kFirstMidiParameterId;
+  const auto channel = static_cast<uint32>(index / kMidiControllersPerChannel);
+  const auto controller = index % kMidiControllersPerChannel;
+  if (controller == kPitchBend) {
+    const auto bend = static_cast<uint32>(std::lround(value * 16383.0));
+    return 0xe0u | channel | ((bend & 127u) << 8u) | ((bend >> 7u) << 16u);
+  }
+  const auto data = static_cast<uint32>(std::lround(value * 127.0));
+  if (controller == kAfterTouch) return 0xd0u | channel | (data << 8u);
+  if (controller == kCtrlProgramChange) return 0xc0u | channel | (data << 8u);
+  return 0xb0u | channel | (controller << 8u) | (data << 16u);
+}
+
+EffeTuneProcessor::EffeTuneProcessor(const bool instrument)
+    : instrument_(instrument), telemetryScratch_(EngineHost::kDefaultTelemetryBytes + OutputAnalyzers::kTelemetryBytes) {
   state_.appVersion = EFFETUNE_PLUGIN_VERSION_STR;
 #if defined(EFFETUNE_AUTOMATION_HOST_GATE_FIXTURE)
   state_ = automationHostGateFixtureDocument();
@@ -350,6 +491,15 @@ EffeTuneProcessor::EffeTuneProcessor()
   preserveMissingPipelineA_ = true;
   preserveMissingPipelineB_ = true;
 #endif
+  if (instrument_) {
+    PluginState player;
+    player.id = 1u;
+    player.name = "SoundFont Player";
+    player.channel = "A";
+    player.extraJson = R"({"type":"SoundFontPlayerPlugin"})";
+    state_.pipelineA.plugins.push_back(std::move(player));
+    hasSavedState_ = true;
+  }
   std::string config;
   if (configStore_.load(config)) {
     try {
@@ -373,6 +523,11 @@ FUnknown *EffeTuneProcessor::createInstance(void *context) {
   return static_cast<IAudioProcessor *>(new EffeTuneProcessor());
 }
 
+FUnknown *EffeTuneProcessor::createInstrument(void *context) {
+  (void)context;
+  return static_cast<IAudioProcessor *>(new EffeTuneProcessor(true));
+}
+
 tresult PLUGIN_API EffeTuneProcessor::initialize(FUnknown *context) {
   const auto result = SingleComponentEffect::initialize(context);
   if (result != kResultOk) {
@@ -382,8 +537,16 @@ tresult PLUGIN_API EffeTuneProcessor::initialize(FUnknown *context) {
       IProcessContextRequirements::kNeedContinousTimeSamples |
       IProcessContextRequirements::kNeedTransportState |
       IProcessContextRequirements::kNeedProjectTimeMusic |
-      IProcessContextRequirements::kNeedCycleMusic;
-  addAudioInput(STR16("Main Input"), SpeakerArr::kStereo);
+      IProcessContextRequirements::kNeedCycleMusic |
+      IProcessContextRequirements::kNeedTempo |
+      IProcessContextRequirements::kNeedBarPositionMusic |
+      IProcessContextRequirements::kNeedTimeSignature;
+  if (!instrument_) {
+    addAudioInput(STR16("Main Input"), SpeakerArr::kStereo);
+  }
+#if !defined(EFFETUNE_AUTOMATION_HOST_GATE_FIXTURE)
+  addEventInput(STR16("MIDI Input"), 16);
+#endif
   addAudioOutput(STR16("Main Output"), SpeakerArr::kStereo);
   parameters.addParameter(STR16("Bypass"), nullptr, 1, 0,
                           ParameterInfo::kCanAutomate | ParameterInfo::kIsBypass,
@@ -391,6 +554,19 @@ tresult PLUGIN_API EffeTuneProcessor::initialize(FUnknown *context) {
   if (!automationParameters_.registerParameters(parameters)) {
     return kResultFalse;
   }
+#if !defined(EFFETUNE_AUTOMATION_HOST_GATE_FIXTURE)
+  for (ParamID index = 0; index < kMidiParameterCount; ++index) {
+    const auto channel = index / kMidiControllersPerChannel;
+    const auto controller = static_cast<CtrlNumber>(index % kMidiControllersPerChannel);
+    const auto title = "MIDI Ch " + std::to_string(channel + 1u) + " Controller " +
+                       std::to_string(controller);
+    String128 label{};
+    UString(label, 128).fromAscii(title.c_str());
+    parameters.addParameter(label, nullptr, controller == kPitchBend ? 16383 : 127,
+                            midiControlDefault(controller),
+                            ParameterInfo::kIsHidden, kFirstMidiParameterId + index);
+  }
+#endif
   synchronizeAutomationBindings(false);
   // The UI also owns the canonical JS parameter packers. Keep it alive while
   // the editor is closed so project state can rebuild a playable pipeline.
@@ -556,6 +732,7 @@ void EffeTuneProcessor::appendNowPlayingSnapshot(
 
 tresult PLUGIN_API EffeTuneProcessor::setActive(const TBool state) {
   if (!state) {
+    midiResetRequested_.store(true, std::memory_order_relaxed);
     frequencyPreview_.setFrequency(0.0);
     componentActive_.store(false, std::memory_order_release);
     // A suspended component renders nothing and answers no more edits, so a
@@ -2013,6 +2190,12 @@ void EffeTuneProcessor::appendDeferredDiagnostics(choc::value::Value &result) {
         message = "The DSP could not process an audio block; dry audio was used. "
                   "Reduce system load or reopen the project if this continues.";
         break;
+      case EngineHost::ProcessError::sampleAssetUnavailable:
+        message = "The instrument could not be restored. Reload the instrument.";
+        break;
+      case EngineHost::ProcessError::midiEventsRejected:
+        message = "Some MIDI input could not be processed.";
+        break;
       case EngineHost::ProcessError::none:
         break;
       }
@@ -2540,22 +2723,27 @@ tresult PLUGIN_API EffeTuneProcessor::setBusArrangements(SpeakerArrangement *inp
                                                          const int32 numInputs,
                                                          SpeakerArrangement *outputs,
                                                          const int32 numOutputs) {
-  if (inputs == nullptr || outputs == nullptr || numInputs != 1 || numOutputs != 1 ||
-      inputs[0] != outputs[0]) {
+  if (outputs == nullptr || numOutputs != 1 ||
+      (instrument_ ? numInputs != 0
+                   : (inputs == nullptr || numInputs != 1 || inputs[0] != outputs[0]))) {
     return kResultFalse;
   }
-  const auto channelCount = SpeakerArr::getChannelCount(inputs[0]);
+  const auto channelCount = SpeakerArr::getChannelCount(outputs[0]);
   if (channelCount < 1 || channelCount > static_cast<int32>(EngineHost::kMaxChannels)) {
     return kResultFalse;
   }
-  auto *inputBus = FCast<AudioBus>(audioInputs.at(0));
   auto *outputBus = FCast<AudioBus>(audioOutputs.at(0));
-  if (inputBus == nullptr || outputBus == nullptr) {
+  if (outputBus == nullptr) {
     return kResultFalse;
   }
-  inputBus->setArrangement(inputs[0]);
+  if (!instrument_) {
+    auto *inputBus = FCast<AudioBus>(audioInputs.at(0));
+    if (inputBus == nullptr) {
+      return kResultFalse;
+    }
+    inputBus->setArrangement(inputs[0]);
+  }
   outputBus->setArrangement(outputs[0]);
-  inputBus->setName(STR16("Main Input"));
   outputBus->setName(STR16("Main Output"));
   if (maxHostFrames_.load(std::memory_order_acquire) > 0) {
     if (!reconfigureDspPreservingPipeline(
@@ -2566,6 +2754,16 @@ tresult PLUGIN_API EffeTuneProcessor::setBusArrangements(SpeakerArrangement *inp
   } else {
     configuredChannels_.store(channelCount, std::memory_order_release);
   }
+  return kResultTrue;
+}
+
+tresult PLUGIN_API EffeTuneProcessor::getMidiControllerAssignment(
+    const int32 busIndex, const int16 channel, const CtrlNumber controller, ParamID &id) {
+  if (getBusCount(kEvent, kInput) == 0 || busIndex != 0 || channel < 0 || channel >= 16)
+    return kResultFalse;
+  if (controller < 0 || controller > kCtrlProgramChange) return kResultFalse;
+  id = kFirstMidiParameterId + static_cast<ParamID>(channel) * kMidiControllersPerChannel +
+       static_cast<ParamID>(controller);
   return kResultTrue;
 }
 
@@ -2607,13 +2805,29 @@ void EffeTuneProcessor::restoreDryFromScratch(AudioBusBuffers &output, const int
   output.silenceFlags = 0;
 }
 
-void EffeTuneProcessor::publishHostTransport(const ProcessContext *context) noexcept {
+void EffeTuneProcessor::publishHostTransport(const ProcessContext *context, const int32 frames) noexcept {
   transportSequence_.fetch_add(1);
   const auto available = context != nullptr && std::isfinite(context->sampleRate) &&
                          context->sampleRate > 0.0;
   transportProjectTimeSamples_.store(available ? context->projectTimeSamples : 0);
   transportSampleRate_.store(available ? context->sampleRate : 0.0);
   transportPlaying_.store(available && (context->state & ProcessContext::kPlaying) != 0);
+  const auto validTempo = available && (context->state & ProcessContext::kTempoValid) != 0 &&
+                          std::isfinite(context->tempo) && context->tempo > 0.0;
+  const auto validPpq = available && (context->state & ProcessContext::kProjectTimeMusicValid) != 0 &&
+                        std::isfinite(context->projectTimeMusic);
+  const auto invalid = std::numeric_limits<double>::quiet_NaN();
+  transportTempo_.store(validTempo ? context->tempo : invalid);
+  auto ppq = validPpq ? context->projectTimeMusic : invalid;
+  if (validPpq && validTempo && (context->state & ProcessContext::kPlaying) != 0 && frames > 0)
+    ppq += static_cast<double>(frames) * context->tempo / (60.0 * context->sampleRate);
+  transportPpq_.store(ppq);
+  transportBarStart_.store(available && (context->state & ProcessContext::kBarPositionValid) != 0
+                               ? context->barPositionMusic : invalid);
+  const auto validSignature = available && (context->state & ProcessContext::kTimeSigValid) != 0 &&
+                              context->timeSigNumerator > 0 && context->timeSigDenominator > 0;
+  transportNumerator_.store(validSignature ? context->timeSigNumerator : 0);
+  transportDenominator_.store(validSignature ? context->timeSigDenominator : 0);
   transportAvailable_.store(available);
   transportSequence_.fetch_add(1);
 }
@@ -2624,6 +2838,8 @@ void EffeTuneProcessor::appendHostTransport(choc::value::Value &result) const {
   bool captured = false;
   std::int64_t samples = 0;
   double sampleRate = 0.0;
+  double tempo = 0.0, ppq = 0.0, barStart = 0.0;
+  int32 numerator = 0, denominator = 0;
   for (int attempt = 0; attempt < 3; ++attempt) {
     const auto sequence = transportSequence_.load();
     if ((sequence & 1u) != 0) continue;
@@ -2631,6 +2847,11 @@ void EffeTuneProcessor::appendHostTransport(choc::value::Value &result) const {
     sampleRate = transportSampleRate_.load();
     playing = transportPlaying_.load();
     const auto valid = transportAvailable_.load();
+    tempo = transportTempo_.load();
+    ppq = transportPpq_.load();
+    barStart = transportBarStart_.load();
+    numerator = transportNumerator_.load();
+    denominator = transportDenominator_.load();
     if (sequence == transportSequence_.load()) {
       available = valid;
       captured = true;
@@ -2644,11 +2865,75 @@ void EffeTuneProcessor::appendHostTransport(choc::value::Value &result) const {
   transport.addMember("projectTimeSamples", available ? samples : std::int64_t{0});
   transport.addMember("sampleRate", available ? sampleRate : 0.0);
   transport.addMember("playing", available && playing);
+  if (available && std::isfinite(tempo)) transport.addMember("tempoBpm", tempo);
+  if (available && std::isfinite(ppq)) transport.addMember("ppqPosition", ppq);
+  if (available && std::isfinite(barStart)) transport.addMember("barStartPpq", barStart);
+  if (available && numerator > 0 && denominator > 0) {
+    transport.addMember("timeSignatureNumerator", numerator);
+    transport.addMember("timeSignatureDenominator", denominator);
+  }
   result.addMember("hostTransport", std::move(transport));
 }
 
+void EffeTuneProcessor::publishMidiTelemetry(std::span<const et_midi_event> events,
+                                             const ProcessData &data, const bool rebase,
+                                             const std::uint64_t dropped) noexcept {
+  const auto sampleRate = hostSampleRate_.load(std::memory_order_relaxed);
+  if (!std::isfinite(sampleRate) || sampleRate <= 0.0) return;
+  auto generation = midiGeneration_.load(std::memory_order_relaxed);
+  const auto resetRequested = midiResetRequested_.exchange(false, std::memory_order_relaxed);
+  if (rebase || resetRequested || dropped != 0) ++generation;
+  auto lost = dropped;
+  const auto firstFrame = midiPosition_.load(std::memory_order_relaxed);
+  for (const auto &event : events) {
+    const auto time = firstFrame + static_cast<double>(event.offset_frames) / sampleRate;
+    if (!midiTelemetry_.push({generation, time, event.message})) {
+      ++lost;
+    }
+  }
+  if (lost != dropped) ++generation;
+  if (lost != 0) midiDroppedEvents_.fetch_add(lost, std::memory_order_relaxed);
+  const auto end = firstFrame + static_cast<double>(data.numSamples) / sampleRate;
+  midiPosition_.store(end, std::memory_order_release);
+  midiGeneration_.store(generation, std::memory_order_release);
+}
+
+void EffeTuneProcessor::appendMidiTelemetry(choc::value::Value &result) {
+  std::scoped_lock lock(midiTelemetryMutex_);
+  const auto generation = midiGeneration_.load(std::memory_order_acquire);
+  const auto position = midiPosition_.load(std::memory_order_acquire);
+  auto events = choc::value::createEmptyArray();
+  HostMidiTelemetry event{};
+  // Leave a record from a just-published block for the next poll if its
+  // generation has not been committed yet.
+  for (std::size_t index = 0; index < kMidiTelemetryCapacity; ++index) {
+    if (pendingMidiTelemetry_) {
+      event = *pendingMidiTelemetry_;
+      pendingMidiTelemetry_.reset();
+    } else if (!midiTelemetry_.pop(event)) {
+      break;
+    }
+    if (event.generation > generation ||
+        (event.generation == generation && event.seconds >= position)) {
+      pendingMidiTelemetry_ = event;
+      break;
+    }
+    if (event.generation == generation) {
+      auto row = choc::value::createEmptyArray();
+      row.addArrayElement(event.seconds);
+      row.addArrayElement(static_cast<std::int64_t>(event.message));
+      events.addArrayElement(std::move(row));
+    }
+  }
+  result.addMember("midiEvents", std::move(events));
+  result.addMember("midiPosition", position);
+  result.addMember("midiGeneration", static_cast<std::int64_t>(generation));
+  result.addMember("midiDroppedEvents", static_cast<std::int64_t>(
+      midiDroppedEvents_.exchange(0u, std::memory_order_relaxed)));
+}
+
 tresult PLUGIN_API EffeTuneProcessor::process(ProcessData &data) {
-  publishHostTransport(data.processContext);
+  publishHostTransport(data.processContext, data.numSamples);
   // Names this thread for every record emitted below it, including the ones the
   // helpers it calls emit. Two thread-local accesses; see
   // plugin/automation_trace.h.
@@ -2716,8 +3001,21 @@ tresult PLUGIN_API EffeTuneProcessor::process(ProcessData &data) {
   // touch before it ever reaches the processing gate. Nothing below is safe to
   // run against that, and nothing is lost either: the scheduler and the output
   // transition are being reset, so this block has no timeline to carry.
+  const auto clearInstrumentOutput = [&]() noexcept {
+    if (instrument_ && data.symbolicSampleSize == kSample32 && data.numSamples > 0 &&
+        data.numOutputs > 0 && data.outputs != nullptr &&
+        data.outputs[0].numChannels <= static_cast<int32>(EngineHost::kMaxChannels) &&
+        hasChannelPointers(data.outputs[0])) {
+      auto &bus = data.outputs[0];
+      for (int32 channel = 0; channel < bus.numChannels; ++channel) {
+        std::fill_n(bus.channelBuffers32[channel], data.numSamples, 0.0f);
+      }
+      bus.silenceFlags = (uint64{1} << bus.numChannels) - 1u;
+    }
+  };
   if (controlOwnsAudioTimeline_.load(std::memory_order_seq_cst)) {
-    if (data.symbolicSampleSize == kSample32 && data.numSamples > 0 &&
+    clearInstrumentOutput();
+    if (!instrument_ && data.symbolicSampleSize == kSample32 && data.numSamples > 0 &&
         data.numInputs > 0 && data.numOutputs > 0 && data.inputs != nullptr &&
         data.outputs != nullptr && hasChannelPointers(data.inputs[0]) &&
         hasChannelPointers(data.outputs[0])) {
@@ -2739,6 +3037,8 @@ tresult PLUGIN_API EffeTuneProcessor::process(ProcessData &data) {
       automationApplyTables_[publishedAutomationTable_.load(std::memory_order_seq_cst)];
   bool rebase = false;
   const auto absoluteStart = automationBlockStart(data, rebase);
+  const auto flushOnly = data.numSamples <= 0 || (!instrument_ && data.numInputs == 0) ||
+                         data.numOutputs == 0;
   if (tracing) {
     const auto *const context = data.processContext;
     const auto contextState =
@@ -2758,7 +3058,7 @@ tresult PLUGIN_API EffeTuneProcessor::process(ProcessData &data) {
         blockFlags |= trace::kFlagContTimeValid;
       }
     }
-    if (data.numSamples <= 0 || data.numInputs == 0 || data.numOutputs == 0) {
+    if (flushOnly) {
       blockFlags |= trace::kFlagFlushOnly;
     }
     trace::block(traceInstance_,
@@ -2766,15 +3066,53 @@ tresult PLUGIN_API EffeTuneProcessor::process(ProcessData &data) {
                  context != nullptr ? context->continousTimeSamples : 0,
                  contextState, data.numSamples, absoluteStart, blockFlags);
   }
-  const auto flushOnly = data.numSamples <= 0 || data.numInputs == 0 || data.numOutputs == 0;
   automationScheduler_.beginBlock(
       {absoluteStart, data.numSamples > 0 ? static_cast<std::uint32_t>(data.numSamples) : 0u,
        rebase, flushOnly});
   ingestControllerWriteHandoffs();
+  std::size_t midiCount = 0;
+  std::uint64_t midiDropped = 0;
+  if (!flushOnly && data.inputEvents != nullptr) {
+    const auto count = std::max<int32>(data.inputEvents->getEventCount(), 0);
+    const auto limit = std::min(count, static_cast<int32>(midiEvents_.size()));
+    for (int32 index = 0; index < limit; ++index) {
+      Event event{};
+      et_midi_event translated{};
+      if (data.inputEvents->getEvent(index, event) == kResultOk && event.busIndex == 0 &&
+          event.sampleOffset >= 0 && event.sampleOffset < data.numSamples &&
+          translateMidiEvent(event, translated)) {
+        translated.flags = 2u * static_cast<uint32>(midiEvents_.size()) + static_cast<uint32>(index);
+        midiEvents_[midiCount++] = translated;
+      }
+    }
+    midiDropped = static_cast<uint32>(count - limit);
+  }
+  const auto firstControl = midiCount;
+  const auto appendMidiControl = [&](const uint32 offset, const uint32 message) noexcept {
+    // At one offset, bank and other controllers must precede patch selection,
+    // and both must precede a note starting there.
+    const auto programOrder = (message & 0xf0u) == 0xc0u ? midiEvents_.size() : 0u;
+    midiEvents_[midiCount] = {offset, message, 0u,
+                             static_cast<uint32>(programOrder + midiCount - firstControl),
+                             0u, 0u};
+    ++midiCount;
+  };
+  if (!flushOnly && pendingMidiFlush_) {
+    pendingMidiFlush_ = false;
+    for (auto &message : flushedMidiControls_) {
+      if (message == 0) continue;
+      if (midiCount == midiEvents_.size()) {
+        pendingMidiFlush_ = true;
+        break;
+      }
+      appendMidiControl(0u, message);
+      message = 0;
+    }
+  }
   if (data.inputParameterChanges != nullptr) {
     const auto queueCount = std::clamp<int32>(
         data.inputParameterChanges->getParameterCount(), 0,
-        static_cast<int32>(kAutomationSlotCount + 1u));
+        static_cast<int32>(kAutomationSlotCount + 1u + kMidiParameterCount));
     for (int32 queueIndex = 0; queueIndex < queueCount; ++queueIndex) {
       auto *queue = data.inputParameterChanges->getParameterData(queueIndex);
       if (queue == nullptr) {
@@ -2782,6 +3120,32 @@ tresult PLUGIN_API EffeTuneProcessor::process(ProcessData &data) {
       }
       const auto parameterId = queue->getParameterId();
       const auto rawPointCount = std::max<int32>(queue->getPointCount(), 0);
+      if (parameterId >= kFirstMidiParameterId &&
+          parameterId < kFirstMidiParameterId + kMidiParameterCount) {
+        if (flushOnly) {
+          int32 offset = 0;
+          ParamValue value = 0.0;
+          if (rawPointCount > 0 && queue->getPoint(rawPointCount - 1, offset, value) == kResultTrue &&
+              std::isfinite(value)) {
+            flushedMidiControls_[parameterId - kFirstMidiParameterId] =
+                midiControlMessage(parameterId, std::clamp(value, 0.0, 1.0));
+            pendingMidiFlush_ = true;
+          }
+        } else {
+          const auto limit = std::min(rawPointCount, static_cast<int32>(midiEvents_.size() - midiCount));
+          midiDropped += static_cast<uint32>(rawPointCount - limit);
+          for (int32 point = 0; point < limit; ++point) {
+            int32 offset = 0;
+            ParamValue value = 0.0;
+            if (queue->getPoint(point, offset, value) == kResultTrue &&
+                offset >= 0 && offset < data.numSamples && std::isfinite(value)) {
+              appendMidiControl(static_cast<uint32>(offset),
+                                midiControlMessage(parameterId, std::clamp(value, 0.0, 1.0)));
+            }
+          }
+        }
+        continue;
+      }
       // The user's hand is on this control. Skipping the whole queue is what
       // gives the hand precedence: the slot then receives no points and no
       // latest input, so finishIntake() publishes nothing for it and the
@@ -2876,6 +3240,10 @@ tresult PLUGIN_API EffeTuneProcessor::process(ProcessData &data) {
   if (flushOnly) {
     return kResultOk;
   }
+  const auto midiEnd = midiEvents_.begin() + static_cast<std::ptrdiff_t>(midiCount);
+  if (midiCount != firstControl || !std::is_sorted(midiEvents_.begin(), midiEnd, midiEventOrder))
+    std::sort(midiEvents_.begin(), midiEnd, midiEventOrder);
+  publishMidiTelemetry({midiEvents_.data(), midiCount}, data, rebase, midiDropped);
   // The counter answers exactly one question: is the audio callback still
   // rendering, and therefore still staging the parameter images itself? The
   // flushOnly return above is what makes that answer right -- it leaves before
@@ -2887,13 +3255,16 @@ tresult PLUGIN_API EffeTuneProcessor::process(ProcessData &data) {
   // them.
   renderedBlockCount_.fetch_add(1, std::memory_order_release);
   processedHostFrames_ += data.numSamples;
-  if (data.inputs == nullptr || data.outputs == nullptr) {
+  if ((!instrument_ && data.inputs == nullptr) || data.outputs == nullptr) {
     recordProcessTransactionFailure(ProcessTransactionError::invalidBuffer);
     completeAutomationBlock(false);
     return kResultOk;
   }
-  auto &input = data.inputs[0];
   auto &output = data.outputs[0];
+  // The common DSP pipeline needs matching input and output channels. A synth
+  // starts with zero PCM in the host's output buffers, then stages it as usual.
+  clearInstrumentOutput();
+  const auto &input = instrument_ ? output : data.inputs[0];
   const auto maxHostFrames = maxHostFrames_.load(std::memory_order_acquire);
   const auto configuredChannels = configuredChannels_.load(std::memory_order_acquire);
   const auto hostSampleRate = hostSampleRate_.load(std::memory_order_acquire);
@@ -3045,6 +3416,7 @@ tresult PLUGIN_API EffeTuneProcessor::process(ProcessData &data) {
               automationScheduler_.currentBypass() ? 1u : 0u);
   std::array<const float *, EngineHost::kMaxChannels> sliceInput{};
   std::array<float *, EngineHost::kMaxChannels> sliceOutput{};
+  std::size_t nextMidiEvent = 0;
   AutomationSlice slice;
   while (processed && automationScheduler_.nextSlice(slice)) {
     auto sliceBypass = slice.hostOffset == 0
@@ -3124,9 +3496,50 @@ tresult PLUGIN_API EffeTuneProcessor::process(ProcessData &data) {
       sliceOutput[channel] = engineOutputPointers_[channel] + engineOffset;
     }
     const auto time = dspTimeSeconds(absoluteStart, slice.hostOffset, hostSampleRate);
+    const auto firstMidiEvent = nextMidiEvent;
+    while (nextMidiEvent < midiCount &&
+           midiEvents_[nextMidiEvent].offset_frames < slice.hostOffset + slice.hostFrames) {
+      auto &event = midiEvents_[nextMidiEvent++];
+      event.offset_frames = (event.offset_frames - slice.hostOffset) * oversamplingFactor;
+      event.flags = 0;
+    }
+    et_host_transport transport{};
+    if (const auto *context = data.processContext; context != nullptr) {
+      const auto state = context->state;
+      if ((state & ProcessContext::kPlaying) != 0) transport.flags |= ET_HOST_TRANSPORT_PLAYING;
+      if ((state & ProcessContext::kCycleActive) != 0) transport.flags |= ET_HOST_TRANSPORT_LOOPING;
+      if ((state & ProcessContext::kTempoValid) != 0 &&
+          std::isfinite(context->tempo) && context->tempo > 0.0) {
+        transport.flags |= ET_HOST_TRANSPORT_TEMPO_VALID;
+        transport.tempo_bpm = context->tempo;
+      }
+      if ((state & ProcessContext::kProjectTimeMusicValid) != 0 &&
+          std::isfinite(context->projectTimeMusic)) {
+        transport.flags |= ET_HOST_TRANSPORT_POSITION_VALID;
+        transport.ppq_position = context->projectTimeMusic;
+        if ((transport.flags & (ET_HOST_TRANSPORT_PLAYING | ET_HOST_TRANSPORT_TEMPO_VALID)) ==
+            (ET_HOST_TRANSPORT_PLAYING | ET_HOST_TRANSPORT_TEMPO_VALID)) {
+          transport.ppq_position += static_cast<double>(slice.hostOffset) *
+                                    transport.tempo_bpm / (60.0 * hostSampleRate);
+        }
+      }
+      if ((state & ProcessContext::kBarPositionValid) != 0 &&
+          std::isfinite(context->barPositionMusic)) {
+        transport.flags |= ET_HOST_TRANSPORT_BAR_START_VALID;
+        transport.bar_start_ppq = context->barPositionMusic;
+      }
+      if ((state & ProcessContext::kTimeSigValid) != 0 && context->timeSigNumerator > 0 &&
+          context->timeSigDenominator > 0) {
+        transport.flags |= ET_HOST_TRANSPORT_TIME_SIGNATURE_VALID;
+        transport.time_signature_numerator = static_cast<uint32>(context->timeSigNumerator);
+        transport.time_signature_denominator = static_cast<uint32>(context->timeSigDenominator);
+      }
+    }
     processed = batch.processChunk(sliceInput.data(), sliceOutput.data(),
                                     static_cast<std::uint32_t>(input.numChannels),
-                                    sliceEngineFrames, time, sliceBypass);
+                                    sliceEngineFrames, time, sliceBypass,
+                                    {midiEvents_.data() + firstMidiEvent, nextMidiEvent - firstMidiEvent},
+                                    data.processContext != nullptr ? &transport : nullptr);
   }
   const auto batchFinished = batch.finish(refreshLatencyAtBlockEnd);
   capturePendingLatencyUpdate();
@@ -3298,6 +3711,7 @@ bool EffeTuneProcessor::replaceSfzAsset(RuntimeAsset asset, const bool clear,
                                         const std::uint64_t requestRevision, std::string &error) {
   // Caller holds the control resource mutex, keeping topology and the replay
   // cache stable throughout. Audio never acquires it and keeps the old bank.
+  const auto paged = !clear && asset.streamGeneration != 0;
   auto update = engine_.createAssetUpdate(std::move(asset), clear, &error, requestRevision);
   if (!update) return false;
   pendingAssetUpdate_ = update.get();
@@ -3327,7 +3741,13 @@ bool EffeTuneProcessor::replaceSfzAsset(RuntimeAsset asset, const bool clear,
     if (assetPreparationHookForTesting_) assetPreparationHookForTesting_();
 #endif
     assetUpdateSucceeded_ = EngineHost::prepareAssetUpdate(*update);
-    if (assetUpdateSucceeded_) {
+    if (assetUpdateSucceeded_ && paged) {
+      // Upstream allocates render scratch against the live paged bank. The
+      // pages and bank were prepared outside this window; only activation must
+      // run on the exclusive control owner for this explicit instrument load.
+      const EngineMutationWindow engineWindow{*this};
+      assetUpdateSucceeded_ = engine_.applyAssetUpdate(*update, true);
+    } else if (assetUpdateSucceeded_) {
       assetUpdateState_.store(AssetUpdateState::prepared, std::memory_order_release);
       awaitBoundary();
     }
@@ -3336,7 +3756,7 @@ bool EffeTuneProcessor::replaceSfzAsset(RuntimeAsset asset, const bool clear,
   engine_.finishAssetUpdate(*update);
   assetUpdateState_.store(AssetUpdateState::idle, std::memory_order_release);
   pendingAssetUpdate_ = nullptr;
-  if (!succeeded) error = "The instrument could not be loaded. Select another SFZ instrument.";
+  if (!succeeded) error = "The instrument could not be loaded. Select another instrument file.";
   return succeeded;
 }
 
@@ -3761,8 +4181,10 @@ tresult PLUGIN_API EffeTuneProcessor::setState(IBStream *stream) {
   closeOpenHostGestures();
   drainAutomationValues();
   const auto restoredBypass = decoded.masterBypass;
+  auto restoredMixers = decodeSoundFontMixerStates(decoded);
   {
     AutomationResourceLock resources{*this};
+    pendingSoundFontMixerStates_ = std::move(restoredMixers);
     acknowledgePublishedAutomationLocked();
     clearPendingControllerWritesLocked();
     {
@@ -3812,11 +4234,15 @@ tresult PLUGIN_API EffeTuneProcessor::getState(IBStream *stream) {
   drainAutomationValues();
   PluginStateDocument snapshot;
   {
-    std::scoped_lock stateLock(stateMutex_);
-    snapshot = state_;
-  }
-  if (!stateReplacementPending_.load(std::memory_order_acquire)) {
-    snapshot.masterBypass = bypass_.load(std::memory_order_acquire);
+    std::scoped_lock resources(processingResourcesMutex_);
+    {
+      std::scoped_lock stateLock(stateMutex_);
+      snapshot = state_;
+    }
+    if (!stateReplacementPending_.load(std::memory_order_acquire)) {
+      snapshot.masterBypass = bypass_.load(std::memory_order_acquire);
+      captureSoundFontMixerStates(snapshot, engine_);
+    }
   }
   const auto json = StateCodec::encode(snapshot);
   if (json.size() > static_cast<std::size_t>(std::numeric_limits<int32>::max())) {
@@ -3934,7 +4360,12 @@ void EffeTuneProcessor::detachEditor(void *owner) noexcept {
   outputAnalyzers_.stopCapture();
   engine_.spectrumCapture().stopCapture();
   cancelBackupExport();
-  closeSfzReads();
+  {
+    std::scoped_lock lock(sfzMutex_);
+    // The chooser belongs to this editor, but bank preparation belongs to
+    // the page, which keeps running after the editor is detached.
+    ++sfzGeneration_;
+  }
   if (webView != nullptr) {
     webView->detach(owner);
   }
@@ -4065,6 +4496,17 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
                ? bridgeResult(true)
                : bridgeResult(false, "The reset could not be queued. Try again.");
   }
+  if (message.action == UiAction::soundFontMidiControl) {
+    std::scoped_lock resources(processingResourcesMutex_);
+    if (stateReplacementPending_.load(std::memory_order_acquire) ||
+        stateReplacementEpoch_.load(std::memory_order_acquire) != requestStateEpoch ||
+        uiPageGeneration_.load(std::memory_order_acquire) != requestPageGeneration) {
+      return bridgeResult(false, "The pipeline changed. Try the MIDI control again.");
+    }
+    return instanceCommands_.push(message.audioCommand)
+               ? bridgeResult(true)
+               : bridgeResult(false, "The MIDI control could not be queued. Try again.");
+  }
   drainAutomationValues();
 
   const auto pauseBulkRequestBeforeCommitForTesting = [&] {
@@ -4117,6 +4559,7 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     // no page has been touched before its own first call -- so ending it here
     // is unconditional and cannot be missed by a race between the two.
     if (message.startupHandshake) {
+      midiResetRequested_.store(true, std::memory_order_relaxed);
       frequencyPreview_.setFrequency(0.0);
       outputAnalyzers_.stopCapture();
       engine_.spectrumCapture().stopCapture();
@@ -4146,7 +4589,11 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     result.addMember("ok", true);
     result.addMember("sampleRate", context.sampleRate);
     appendHostTransport(result);
+    if (message.includeMidiTelemetry) appendMidiTelemetry(result);
     result.addMember("engineSampleRate", context.engineSampleRate);
+    result.addMember("maxEngineFrames",
+                     static_cast<std::int64_t>(maxHostFrames_.load(std::memory_order_acquire)) *
+                         context.oversamplingFactor);
     result.addMember("nativeSpectrumTap", engine_.spectrumCapture().nativeAnalysisSupported());
     result.addMember("channels", static_cast<std::int64_t>(context.channels));
     result.addMember("oversamplingFactor",
@@ -4255,6 +4702,7 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     result.addMember("bytes", static_cast<std::int64_t>(bytes));
     result.addMember("droppedFrames", static_cast<std::int64_t>(droppedFrames));
     appendHostTransport(result);
+    appendMidiTelemetry(result);
     auto telemetrySources = choc::value::createObject({});
     for (const auto &[tap, source] : pipelineSources) {
       auto identity = choc::value::createObject({});
@@ -4321,6 +4769,9 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     result.addMember("contextGeneration",
                      static_cast<std::int64_t>(context.generation));
     result.addMember("engineSampleRate", context.engineSampleRate);
+    result.addMember("maxEngineFrames",
+                     static_cast<std::int64_t>(maxHostFrames_.load(std::memory_order_acquire)) *
+                         context.oversamplingFactor);
     result.addMember("channels", static_cast<std::int64_t>(context.channels));
     const auto reportedLatency = latencySamples_.load(std::memory_order_acquire);
     const auto processingLatency = processingLatencySamples();
@@ -4356,6 +4807,7 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     transfer.asset = std::move(message.asset);
     transfer.operationRevision = message.operationRevision;
     transfer.stateEpoch = requestStateEpoch;
+    transfer.pageGeneration = requestPageGeneration;
     try {
       std::scoped_lock transferLock(assetTransferMutex_);
       const auto key = assetKey(transfer.asset.logicalId, transfer.asset.slot);
@@ -4368,7 +4820,7 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
       for (const auto &[pendingKey, pending] : pendingAssetTransfers_) {
         if (pendingKey != key && pending.budget == transfer.budget) {
           replacedKeys.push_back(pendingKey);
-          pendingFootprint += pending.asset.footprintBytes;
+          pendingFootprint += pending.asset.footprintBytes + pending.receivedPageBytes;
         }
       }
       pendingFootprint += engine_.assetFootprint(transfer.budget, replacedKeys);
@@ -4401,6 +4853,8 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
         assetKey(message.asset.logicalId, message.asset.slot));
     if (found == pendingAssetTransfers_.end() ||
         found->second.operationRevision != message.operationRevision ||
+        found->second.stateEpoch != requestStateEpoch ||
+        found->second.pageGeneration != requestPageGeneration ||
         found->second.receivedBytes != message.assetOffset ||
         decoded.size() > found->second.asset.payload.size() - found->second.receivedBytes) {
       return bridgeResult(false, "DSP asset chunks arrived out of sequence");
@@ -4409,6 +4863,64 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
               found->second.asset.payload.begin() +
                   static_cast<std::ptrdiff_t>(found->second.receivedBytes));
     found->second.receivedBytes += decoded.size();
+    return bridgeResult(true);
+  }
+
+  if (message.action == UiAction::appendPluginAssetPage ||
+      message.action == UiAction::cancelPluginAsset) {
+    std::scoped_lock transferLock(assetTransferMutex_);
+    const auto found = pendingAssetTransfers_.find(assetKey(message.asset.logicalId, message.asset.slot));
+    if (found == pendingAssetTransfers_.end() ||
+        found->second.operationRevision != message.operationRevision ||
+        found->second.stateEpoch != requestStateEpoch ||
+        found->second.pageGeneration != requestPageGeneration) {
+      return bridgeResult(false, "The instrument load has changed. Try loading it again.");
+    }
+    if (message.action == UiAction::cancelPluginAsset) {
+      pendingAssetTransfers_.erase(found);
+      return bridgeResult(true);
+    }
+    auto &transfer = found->second;
+    if (transfer.asset.streamGeneration == 0 ||
+        message.asset.streamGeneration != transfer.asset.streamGeneration) {
+      return bridgeResult(false, "The instrument load has changed. Try loading it again.");
+    }
+    try {
+      auto page = std::move(message.assetPage);
+      const auto floatCount = static_cast<std::size_t>(page.frames) * page.channels;
+      const auto pageBytes = floatCount * sizeof(float);
+      if (pageBytes == 0 || transfer.asset.initialPages.size() >= EngineHost::kMaxSamplePages) {
+        return bridgeResult(false, "The instrument exceeds the plug-in capacity.");
+      }
+      std::vector<std::uint64_t> replacedKeys;
+      auto pendingFootprint = static_cast<std::uint64_t>(pageBytes);
+      for (const auto &[key, pending] : pendingAssetTransfers_) {
+        if (pending.budget == transfer.budget) {
+          replacedKeys.push_back(key);
+          pendingFootprint += pending.asset.footprintBytes + pending.receivedPageBytes;
+        }
+      }
+      pendingFootprint += engine_.assetFootprint(transfer.budget, replacedKeys);
+      if (pendingFootprint > transfer.budget) {
+        return bridgeResult(false, "The instrument exceeds the plug-in capacity.");
+      }
+      std::vector<std::uint8_t> decoded;
+      if (!choc::base64::decodeToContainer(decoded, message.content) ||
+          decoded.size() != pageBytes) {
+        return bridgeResult(false, "The instrument sample could not be read.");
+      }
+      page.pcm.resize(floatCount);
+      std::memcpy(page.pcm.data(), decoded.data(), pageBytes);
+      if (!std::all_of(page.pcm.begin(), page.pcm.end(), [](float sample) {
+            return std::isfinite(sample);
+          })) {
+        return bridgeResult(false, "The instrument sample could not be read.");
+      }
+      transfer.asset.initialPages.push_back(std::move(page));
+      transfer.receivedPageBytes += pageBytes;
+    } catch (const std::bad_alloc &) {
+      return bridgeResult(false, "The instrument exceeds the available memory.");
+    }
     return bridgeResult(true);
   }
 
@@ -4422,6 +4934,7 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
       if (found == pendingAssetTransfers_.end() ||
           found->second.operationRevision != message.operationRevision ||
           found->second.stateEpoch != requestStateEpoch ||
+          found->second.pageGeneration != requestPageGeneration ||
           found->second.receivedBytes != found->second.asset.payload.size()) {
         return bridgeResult(false, "DSP asset transfer is incomplete");
       }
@@ -4920,6 +5433,7 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
         }
         EngineMutationWindow engineWindow{*this};
         const AudioTimelineWindow timelineWindow{*this};
+        engine_.replaceSoundFontMixerStates(pendingSoundFontMixerStates_);
         acknowledgePublishedAutomationLocked();
         clearPendingControllerWritesLocked();
         {
@@ -4974,6 +5488,7 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
             [](const RuntimePlugin &runtime) {
               return runtime.contextuallyBypassed;
             });
+        pendingSoundFontMixerStates_.clear();
         stateReplacementPending_.store(false, std::memory_order_release);
         replacementPageAuthorized_ = false;
         engineWindow.setRestoreOnClose(
@@ -5434,6 +5949,7 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     // a runtime image that already carries the new value would be stranded
     // ahead of both the editor and the host.
     bool topologyChanged = true;
+    std::int8_t previousChannelSpec = -1;
     PipelineState current;
     // The topology the engine is running now. A rebuild that fails takes the
     // instances with it, so the rollback needs it to put the engine back.
@@ -5449,6 +5965,7 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
                                       });
       if (found != pipeline.plugins.end()) {
         topologyChanged = !sameTopology(*found, update.logical);
+        previousChannelSpec = encodeChannelSpec(found->channel);
         replacement.extraJson = mergeExtraJsonObjects(found->extraJson, replacement.extraJson);
         replacement.parametersJson =
             mergeExtraJsonObjects(found->parametersJson, replacement.parametersJson);
@@ -5582,7 +6099,13 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
       if (runtimeMissing && runtimePlugins_.size() >= kMaxPluginInstances) {
         return bridgeResult(false, "Pipeline exceeds 96 native DSP instances");
       }
-      const auto canReuseInstance = !runtimeMissing &&
+      const auto samplePlayer = update.runtime.type == "SFZNotePlayerPlugin" ||
+                                update.runtime.type == "SoundFontPlayerPlugin";
+      const auto samplerWidthChanged = samplePlayer &&
+          EngineHost::samplePlayerProcessingChannels(previousChannelSpec, context.channels) !=
+          EngineHost::samplePlayerProcessingChannels(encodeChannelSpec(replacement.channel),
+                                                     context.channels);
+      const auto canReuseInstance = !runtimeMissing && !samplerWidthChanged &&
                                     runtime->type == update.runtime.type &&
                                     runtime->paramsHash == update.runtime.paramsHash &&
                                     runtime->tapId == update.runtime.tapId &&

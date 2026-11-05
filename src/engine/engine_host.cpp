@@ -7,6 +7,7 @@
 #include "SFZNotePlayerPluginParams.h"
 #include "RhythmAnalyzerPluginParams.h"
 #include "DisplayDspPolicy.h"
+#include "../plugins/others/sfz/bank.h"
 
 #include <algorithm>
 #include <cmath>
@@ -15,6 +16,7 @@
 #include <limits>
 #include <new>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 
 #if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
@@ -32,10 +34,67 @@ struct EngineHost::LatencyUpdateStorage {
 struct EngineHost::PreparedAssetUpdate::Storage {
   effetune::Engine::InstanceAssetSnapshot snapshot;
   effetune::Engine::InstanceAssetUpdate update;
+  effetune::Engine::InstanceAssetUpdate failedActivation;
   RuntimeAsset asset;
+  Engine *owner = nullptr;
+  double sampleRate = 0.0;
+  std::uint32_t maxFrames = 0;
+  std::uint32_t footprintLimit = 0;
+  bool soundFont = false;
   bool clear = false;
   bool applied = false;
   std::uint64_t requestRevision = 0;
+};
+
+struct EngineHost::SoundFontMixerProjection {
+  std::atomic<std::uint64_t> sequence{0};
+  std::array<std::atomic<std::uint64_t>, 16> rows{};
+
+  void publish(const SoundFontMixerState &state) noexcept {
+    static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
+    sequence.fetch_add(1u, std::memory_order_acq_rel);
+    for (std::size_t index = 0; index < rows.size(); ++index) {
+      const auto &row = state.channels[index];
+      const std::array values{row.bankMsb, row.bankLsb, row.program, row.volume,
+                              row.pan, row.expression, row.reverb, row.chorus};
+      auto packed = std::uint64_t{row.selectedBank} << 56u;
+      for (std::size_t field = 0; field < values.size(); ++field)
+        packed |= std::uint64_t{values[field] & 0x7fu} << (7u * field);
+      rows[index].store(packed, std::memory_order_release);
+    }
+    sequence.fetch_add(1u, std::memory_order_release);
+  }
+
+  [[nodiscard]] std::optional<SoundFontMixerState> read() const noexcept {
+    for (;;) {
+      const auto before = sequence.load(std::memory_order_acquire);
+      if (before == 0u) return std::nullopt;
+      if ((before & 1u) != 0u) continue;
+      const auto result = readRows();
+      if (before == sequence.load(std::memory_order_acquire)) return result;
+    }
+  }
+
+  [[nodiscard]] std::optional<SoundFontMixerState> readOnOwner() const noexcept {
+    // The owner is the only publisher, so it never retries.
+    if (sequence.load(std::memory_order_relaxed) == 0u) return std::nullopt;
+    return readRows();
+  }
+
+private:
+  [[nodiscard]] SoundFontMixerState readRows() const noexcept {
+    SoundFontMixerState result;
+    for (std::size_t index = 0; index < rows.size(); ++index) {
+      const auto packed = rows[index].load(std::memory_order_acquire);
+      const auto field = [packed](unsigned bit) {
+        return static_cast<std::uint8_t>((packed >> bit) & 0x7fu);
+      };
+      result.channels[index] = {field(0), field(7), field(14), field(21), field(28),
+                                field(35), field(42), field(49),
+                                static_cast<std::uint8_t>(packed >> 56u)};
+    }
+    return result;
+  }
 };
 
 EngineHost::PreparedAssetUpdate::PreparedAssetUpdate() : storage_(std::make_unique<Storage>()) {}
@@ -147,7 +206,8 @@ void addDroppedFrames(std::atomic<std::uint32_t> &destination,
 }
 
 [[nodiscard]] bool sameAsset(const RuntimeAsset &left, const RuntimeAsset &right) noexcept {
-  return left.logicalId == right.logicalId && left.slot == right.slot &&
+  return left.streamGeneration == 0 && right.streamGeneration == 0 &&
+         left.logicalId == right.logicalId && left.slot == right.slot &&
          left.formatTag == right.formatTag && left.channels == right.channels &&
          left.frames == right.frames && left.topology == right.topology &&
          left.headBlock == right.headBlock && left.rateDivider == right.rateDivider &&
@@ -161,6 +221,104 @@ void addDroppedFrames(std::atomic<std::uint32_t> &destination,
          (static_cast<std::uint32_t>(bytes[1]) << 8u) |
          (static_cast<std::uint32_t>(bytes[2]) << 16u) |
          (static_cast<std::uint32_t>(bytes[3]) << 24u);
+}
+
+[[nodiscard]] std::uint32_t readUint16(const std::uint8_t *bytes) noexcept {
+  return bytes[0] | (static_cast<std::uint32_t>(bytes[1]) << 8u);
+}
+
+[[nodiscard]] AssetBeginInfo assetInfo(const RuntimeAsset &asset) noexcept {
+  return {asset.channels, asset.frames, asset.topology, asset.headBlock, asset.rateDivider,
+          asset.pathCount, asset.inputCount, asset.processingChannels, asset.footprintBytes,
+          static_cast<std::uint32_t>(asset.payload.size())};
+}
+
+[[nodiscard]] std::uint64_t retainedPageBytes(const RuntimeAsset &asset) noexcept {
+  std::uint64_t bytes = asset.initialPages.capacity() * sizeof(RuntimeSamplePage);
+  for (const auto &page : asset.initialPages)
+    bytes += page.pcm.capacity() * sizeof(float);
+  return bytes;
+}
+
+void sortSamplePages(RuntimeAsset &asset) {
+  std::sort(asset.initialPages.begin(), asset.initialPages.end(), [](const auto &a, const auto &b) {
+    return std::tie(a.sample, a.index) < std::tie(b.sample, b.index);
+  });
+}
+
+[[nodiscard]] bool hasCompletePageSet(
+    const RuntimeAsset &asset, const plugins::others::sfz::SFZBank::ControlLayout &layout) noexcept {
+  namespace sfz = plugins::others::sfz;
+  if (!layout.streamed) return asset.streamGeneration == 0 && asset.initialPages.empty();
+  if (asset.streamGeneration == 0 || asset.initialPages.size() > EngineHost::kMaxSamplePages)
+    return false;
+  constexpr auto pageFrames = sfz::SamplePageCache::kPageFrames;
+  static_assert(pageFrames == EngineHost::kSamplePageFrames);
+  std::size_t nextPage = 0;
+  for (std::uint32_t sample = 0; sample < layout.sampleCount; ++sample) {
+    const auto *record = asset.payload.data() + 32u +
+        4u * (layout.sampleOffset + sample * (layout.loading ? 16u : 12u));
+    const auto frames = readUint32(record) | (std::uint64_t{readUint32(record + 4u)} << 32u);
+    const auto channels = readUint32(record + 8u);
+    for (std::uint64_t index = 0, remaining = frames; remaining != 0; ++index) {
+      if (nextPage == asset.initialPages.size()) return false;
+      const auto &page = asset.initialPages[nextPage++];
+      const auto count = std::min<std::uint64_t>(pageFrames, remaining);
+      if (page.sample != sample || page.index != index || page.flags != 1u ||
+          page.frames != count || page.channels != channels ||
+          page.pcm.size() != count * channels) return false;
+      remaining -= count;
+    }
+  }
+  return nextPage == asset.initialPages.size();
+}
+
+[[nodiscard]] bool prepareSamplePlayerAsset(
+    Engine &engine, const Engine::InstanceAssetSnapshot &snapshot,
+    Engine::InstanceAssetUpdate &update, const RuntimeAsset &asset, const bool soundFont,
+    const double sampleRate, const std::uint32_t maxFrames, const std::uint32_t processingChannels,
+    const std::uint32_t footprintLimit,
+    std::uint32_t *preparedFootprint = nullptr) noexcept {
+  using Bank = plugins::others::sfz::SFZBank;
+  auto info = assetInfo(asset);
+  info.processingChannels = processingChannels;
+  Bank::ControlLayout layout;
+  if (Bank::controlLayout(info, asset.payload, asset.formatTag, layout) != ET_OK ||
+      !hasCompletePageSet(asset, layout)) return false;
+  std::uint64_t extra = 0;
+  if (et_sample_player_preparation_bytes(asset.payload.data(), info.byteSize, info.byteSize,
+          asset.formatTag, static_cast<float>(sampleRate), info.processingChannels, maxFrames, 0.0,
+          &extra, soundFont ? ET_SAMPLE_PLAYER_MAIN : ET_SAMPLE_PLAYER_NOTE) != ET_OK ||
+      extra > footprintLimit) return false;
+  const auto required = std::max<std::uint64_t>(info.footprintBytes, info.byteSize + extra);
+  if (required + retainedPageBytes(asset) > footprintLimit) return false;
+  info.footprintBytes = static_cast<std::uint32_t>(required);
+  if (Engine::prepareInstanceAssetUpdate(snapshot, info, asset.payload.data(), info.byteSize,
+                                        asset.formatTag, update) != ET_OK) return false;
+  if (layout.streamed) {
+    if (engine.configureInstanceAssetStream(update, asset.streamGeneration) != ET_OK) return false;
+    for (const auto &page : asset.initialPages) {
+      if (engine.publishInstanceAssetSamplePage(update, asset.streamGeneration, page.sample,
+              page.index, page.pcm.data(), page.frames, page.channels, page.flags) != ET_OK)
+        return false;
+    }
+  }
+  if (preparedFootprint != nullptr) *preparedFootprint = info.footprintBytes;
+  return true;
+}
+
+[[nodiscard]] bool activateSamplePlayerStream(
+    Engine &engine, const et_instance instance, const std::uint64_t generation,
+    Engine::InstanceAssetUpdate &failedActivation) noexcept {
+  // Reasserting the generation preserves the populated cache and prepares the
+  // instance-owned scratch required by the upstream renderer.
+  if (generation == 0u || engine.configureInstanceSampleStream(instance, generation) == ET_OK)
+    return true;
+  Engine::InstanceAssetSnapshot snapshot;
+  if (engine.captureInstanceAssetSnapshot(instance, 0, snapshot, 0.0) == ET_OK &&
+      Engine::prepareInstanceAssetClear(snapshot, failedActivation) == ET_OK)
+    (void)engine.applyInstanceAssetUpdate(failedActivation);
+  return false;
 }
 
 void writeUint32(std::uint8_t *bytes, const std::uint32_t value) noexcept {
@@ -180,6 +338,16 @@ void writeUint32(std::uint8_t *bytes, const std::uint32_t value) noexcept {
   return nodeCount <= kMaxPipelineNodes &&
          byteCount == kPipelineDescriptorHeaderBytes +
                           nodeCount * kPipelineDescriptorNodeBytes;
+}
+
+[[nodiscard]] bool midiNodeRuns(const std::uint8_t *node, const std::uint32_t channels) noexcept {
+  if (node[4] == 0u || node[8] == 0u) return false;
+  const auto spec = static_cast<std::int8_t>(node[7]);
+  if (spec == -2) return true;
+  if (spec == -1) return channels >= 2u;
+  const auto required = spec >= 16 ? static_cast<std::uint32_t>(spec - 16) * 2u + 2u :
+                                    static_cast<std::uint32_t>(spec) + 1u;
+  return channels >= required;
 }
 
 } // namespace
@@ -295,6 +463,11 @@ void EngineHost::reset() {
   spectrumCapture_.invalidate();
   if (prepared_) {
     (void)engine_->reset();
+    for (auto &[id, entry] : instances_) {
+      (void)id;
+      entry.midiRendering = false;
+      restoreSoundFontMixerUnlocked(entry);
+    }
     refreshCircuitFaultsUnlocked();
     combined_ = engine_->combined();
     processedFrames_ = 0.0;
@@ -302,7 +475,7 @@ void EngineHost::reset() {
   }
 }
 
-void EngineHost::clearInstancesUnlocked() noexcept {
+void EngineHost::clearInstancesUnlocked(const std::span<const std::uint32_t> retain) noexcept {
   // Rebuild owns the engine exclusively; polling holds engineMutex_ as well.
   // Neither raw frames nor queued deliveries may outlive their source instances.
   std::uint32_t dropped = 0;
@@ -314,17 +487,20 @@ void EngineHost::clearInstancesUnlocked() noexcept {
   telemetry_->producerDroppedFrames.store(0, std::memory_order_release);
   telemetry_->deliveryDroppedFrames.store(0, std::memory_order_release);
   telemetrySources_.clear();
+  soundFontMixerTaps_.clear();
   spectrumCapture_.invalidate();
   analysisNodes_.fill(nullptr);
   analysisSourcesDirty_ = true;
+  hasSoundFont_ = false;
   spectrumInstanceIds_.clear();
-  for (const auto &[logicalId, entry] : instances_) {
-    (void)logicalId;
-    if (entry.instance != 0) {
-      engine_->destroyInstance(entry.instance);
+  for (auto instance = instances_.begin(); instance != instances_.end();) {
+    if (std::find(retain.begin(), retain.end(), instance->first) != retain.end()) {
+      ++instance;
+      continue;
     }
+    engine_->destroyInstance(instance->second.instance);
+    instance = instances_.erase(instance);
   }
-  instances_.clear();
   // Without an instance there is no kernel to hold a preparation state, so the
   // projection has to say so until the assets are staged again.
   for (auto &[key, asset] : assets_) {
@@ -339,6 +515,13 @@ void EngineHost::clearInstancesUnlocked() noexcept {
 std::uint32_t EngineHost::resolveInstance(const std::uint32_t logicalId) const noexcept {
   const auto found = instances_.find(logicalId);
   return found == instances_.end() ? 0u : found->second.instance;
+}
+
+std::uint32_t EngineHost::samplePlayerProcessingChannels(const std::int8_t channelSpec,
+                                                       const std::uint32_t channels) noexcept {
+  if (channelSpec == -2) return channels;
+  if (channelSpec == -1 || channelSpec >= 16) return std::min(2u, channels);
+  return 1u;
 }
 
 bool EngineHost::rebuild(const PipelineState &pipeline,
@@ -367,8 +550,41 @@ bool EngineHost::rebuild(const PipelineState &pipeline,
     }
   }
 
-  clearInstancesUnlocked();
-  for (const auto &runtime : runtimePlugins) {
+  std::array<std::uint32_t, kMaxPluginInstances> sampleChannels{};
+  std::array<std::uint32_t, kMaxPluginInstances> retained{};
+  std::size_t retainedCount = 0;
+  try {
+    for (std::size_t index = 0; index < runtimePlugins.size(); ++index) {
+      const auto &runtime = runtimePlugins[index];
+      if (runtime.logicalId == 0 || runtime.contextuallyBypassed ||
+          (runtime.type != "SFZNotePlayerPlugin" && runtime.type != "SoundFontPlayerPlugin"))
+        continue;
+      const auto plugin = std::find_if(pipeline.plugins.begin(), pipeline.plugins.end(),
+          [&](const PluginState &candidate) { return candidate.id == runtime.logicalId; });
+      const auto spec = plugin == pipeline.plugins.end() ? std::int8_t{-1}
+                                                         : encodeChannelSpec(plugin->channel);
+      const auto width = samplePlayerProcessingChannels(spec, channels_);
+      sampleChannels[index] = width;
+      const auto current = instances_.find(runtime.logicalId);
+      const auto kernel = kernels_.find(runtime.type);
+      if (current != instances_.end() && kernel != kernels_.end() &&
+          !current->second.contextuallyBypassed && current->second.kernelIndex == kernel->second.index &&
+          current->second.paramsHash == runtime.paramsHash &&
+          current->second.samplePlayerChannels == width) {
+        retained[retainedCount++] = runtime.logicalId;
+      }
+    }
+  } catch (const std::exception &exception) {
+    setError(error, exception.what());
+    return false;
+  }
+  // Engine::prepare always clears the instances when the rate, capacity or
+  // output layout changes. Ordinary topology edits can keep compatible banks
+  // and their live voices without copying PCM while the audio gate is closed.
+  clearInstancesUnlocked(std::span(retained).first(retainedCount));
+  bool sampleReplayFailed = false;
+  for (std::size_t index = 0; index < runtimePlugins.size(); ++index) {
+    const auto &runtime = runtimePlugins[index];
     if (runtime.logicalId == 0 || runtime.type.empty()) {
       continue;
     }
@@ -398,7 +614,9 @@ bool EngineHost::rebuild(const PipelineState &pipeline,
     const auto *instanceType = runtime.contextuallyBypassed
                                    ? "VolumePlugin"
                                    : runtime.type.c_str();
-    const auto instance = engine_->createInstance(instanceType);
+    const auto existing = instances_.find(runtime.logicalId);
+    const auto keepInstance = existing != instances_.end();
+    const auto instance = keepInstance ? existing->second.instance : engine_->createInstance(instanceType);
     if (instance == 0) {
       clearInstancesUnlocked();
       setError(error, "Unable to create DSP instance for " + runtime.type);
@@ -411,8 +629,9 @@ bool EngineHost::rebuild(const PipelineState &pipeline,
     const auto instanceParamsHash = runtime.contextuallyBypassed
                                         ? instanceKernel->second.paramsHash
                                         : runtime.paramsHash;
-    InstanceEntry instanceEntry{instance, runtime.paramsHash, kernel->second.index,
+    InstanceEntry newEntry{instance, runtime.paramsHash, kernel->second.index,
                         runtime.contextuallyBypassed, {}, nullptr};
+    auto &instanceEntry = keepInstance ? existing->second : newEntry;
     if (runtime.type == "NoteSpectrogramPlugin") {
       instanceEntry.analysisRole = AnalysisRole::producer;
     } else if (runtime.type == "SFZNotePlayerPlugin") {
@@ -424,8 +643,12 @@ bool EngineHost::rebuild(const PipelineState &pipeline,
       instanceEntry.analysisRole = AnalysisRole::display;
     }
     try {
-      instanceEntry.assetBudget = runtime.type == "SFZNotePlayerPlugin"
-                                      ? kSfzAssetBudgetBytes : kAggregateAssetBudgetBytes;
+      instanceEntry.soundFont = runtime.type == "SoundFontPlayerPlugin";
+      hasSoundFont_ = hasSoundFont_ || (instanceEntry.soundFont && !runtime.contextuallyBypassed);
+      if (instanceEntry.soundFont || instanceEntry.analysisRole == AnalysisRole::consumer) {
+        instanceEntry.assetBudget = kSfzAssetBudgetBytes;
+        instanceEntry.samplePlayerChannels = sampleChannels[index];
+      }
       if (!runtime.contextuallyBypassed &&
           (runtime.type == "TubeSimulatorPlugin" || runtime.type == "AdaptivePredictionEffectPlugin")) {
         instanceEntry.circuitFault = std::make_unique<CircuitFaultProjection>();
@@ -465,20 +688,21 @@ bool EngineHost::rebuild(const PipelineState &pipeline,
       return false;
     }
     try {
-      const auto inserted = instances_
-                                .emplace(runtime.logicalId,
-                                         std::move(instanceEntry))
-                                .second;
-      if (!inserted) {
-        engine_->destroyInstance(instance);
-        clearInstancesUnlocked();
-        setError(error, "Native DSP plug-in IDs must be unique");
-        return false;
-      }
+      if (!keepInstance)
+        instances_.emplace(runtime.logicalId, std::move(newEntry));
       spectrumInstanceIds_.emplace(instance, runtime.logicalId);
       if (!runtime.contextuallyBypassed)
         telemetrySources_.emplace(tap, ++nextTelemetrySourceId_);
-      if (runtime.type == "SFZNotePlayerPlugin") {
+      if (runtime.type == "SoundFontPlayerPlugin" && !runtime.contextuallyBypassed) {
+        auto projection = soundFontMixers_.find(runtime.logicalId);
+        if (projection == soundFontMixers_.end())
+          projection = soundFontMixers_.emplace(
+              runtime.logicalId, std::make_unique<SoundFontMixerProjection>()).first;
+        auto &entry = instances_.at(runtime.logicalId);
+        entry.soundFontMixer = projection->second.get();
+        soundFontMixerTaps_.emplace(tap, &entry);
+      }
+      if (runtime.type == "SFZNotePlayerPlugin" || runtime.type == "SoundFontPlayerPlugin") {
         auto &cached = assets_[(static_cast<std::uint64_t>(runtime.logicalId) << 32u)];
         cached.asset.logicalId = runtime.logicalId;
         cached.budget = kSfzAssetBudgetBytes;
@@ -490,10 +714,18 @@ bool EngineHost::rebuild(const PipelineState &pipeline,
       setError(error, "Unable to track the DSP instance");
       return false;
     }
-    for (const auto &[key, entry] : assets_) {
-      (void)key;
-      if (entry.asset.logicalId == runtime.logicalId && !entry.asset.payload.empty()) {
-        (void)stageAssetUnlocked(entry.asset);
+    if (!keepInstance) {
+      for (auto &[key, entry] : assets_) {
+        if (entry.asset.logicalId != runtime.logicalId || entry.asset.payload.empty()) continue;
+        if (!stageAssetUnlocked(entry.asset) &&
+            entry.budget == kSfzAssetBudgetBytes &&
+            static_cast<std::uint32_t>(key) == 0u) {
+          const auto current = instances_.find(runtime.logicalId);
+          if (current->second.samplePlayerChannels != 0u) {
+            current->second.sampleAssetUnavailable = true;
+            sampleReplayFailed = true;
+          }
+        }
       }
     }
   }
@@ -526,7 +758,23 @@ bool EngineHost::rebuild(const PipelineState &pipeline,
   combined_ = engine_->combined();
   (void)refreshLatencyUnlocked();
   (void)refreshAssetStatesUnlocked();
+  if (sampleReplayFailed) recordProcessFailure(ProcessError::sampleAssetUnavailable);
   return combined_ != nullptr;
+}
+
+bool EngineHost::descriptorPreservesSamplePlayerWidths(const std::uint8_t *descriptor) const noexcept {
+  const auto count = readUint32(descriptor + 4u);
+  for (std::uint32_t index = 0; index < count; ++index) {
+    const auto *node = descriptor + kPipelineDescriptorHeaderBytes + index * kPipelineDescriptorNodeBytes;
+    const auto logical = spectrumInstanceIds_.find(readUint32(node));
+    if (logical == spectrumInstanceIds_.end()) continue;
+    const auto instance = instances_.find(logical->second);
+    if (instance != instances_.end() && instance->second.samplePlayerChannels != 0u &&
+        instance->second.samplePlayerChannels !=
+            samplePlayerProcessingChannels(static_cast<std::int8_t>(node[7]), channels_))
+      return false;
+  }
+  return true;
 }
 
 bool EngineHost::updateDescriptor(const PipelineState &pipeline, std::string *error) {
@@ -545,6 +793,10 @@ bool EngineHost::updateDescriptor(const PipelineState &pipeline, std::string *er
     const auto descriptor = encodePipelineDescriptor(
         routedPipeline,
         [this](const std::uint32_t logicalId) { return resolveInstance(logicalId); });
+    if (!descriptorPreservesSamplePlayerWidths(descriptor.data())) {
+      setError(error, "Changing the instrument channel width requires a pipeline rebuild.");
+      return false;
+    }
     const auto status =
         engine_->configurePipeline(descriptor.data(), static_cast<std::uint32_t>(descriptor.size()));
     if (status != ET_OK) {
@@ -619,6 +871,10 @@ bool EngineHost::applyDescriptorCommand(const AudioCommand &command,
       return false;
     }
     writeUint32(node, instance->second.instance);
+  }
+  if (!descriptorPreservesSamplePlayerWidths(descriptor.data())) {
+    setError(error, "Changing the instrument channel width requires a pipeline rebuild.");
+    return false;
   }
   const auto status = engine_->configurePipeline(descriptor.data(),
                                                   command.descriptorByteCount);
@@ -742,12 +998,22 @@ std::uint64_t EngineHost::assetFootprint(const std::uint32_t budget,
   for (const auto &[key, entry] : assets_) {
     if (entry.budget == budget &&
         std::find(excludedKeys.begin(), excludedKeys.end(), key) == excludedKeys.end())
-      total += entry.asset.footprintBytes;
+      total += entry.asset.footprintBytes + retainedPageBytes(entry.asset);
   }
   return total;
 }
 
-bool EngineHost::stageAssetUnlocked(const RuntimeAsset &asset, std::string *error) {
+std::uint32_t EngineHost::remainingAssetBudgetUnlocked(const std::uint64_t key,
+                                                      const std::uint32_t budget) const noexcept {
+  std::uint64_t used = 0;
+  for (const auto &[cachedKey, cached] : assets_) {
+    if (cachedKey != key && cached.budget == budget)
+      used += cached.asset.footprintBytes + retainedPageBytes(cached.asset);
+  }
+  return used < budget ? budget - static_cast<std::uint32_t>(used) : 0u;
+}
+
+bool EngineHost::stageAssetUnlocked(RuntimeAsset &asset, std::string *error) {
   const auto found = instances_.find(asset.logicalId);
   if (found == instances_.end()) {
     setError(error, "DSP asset target is unavailable");
@@ -761,26 +1027,36 @@ bool EngineHost::stageAssetUnlocked(const RuntimeAsset &asset, std::string *erro
   if (found->second.contextuallyBypassed) {
     return true;
   }
-  const AssetBeginInfo beginInfo{asset.channels,
-                                 asset.frames,
-                                 asset.topology,
-                                 asset.headBlock,
-                                 asset.rateDivider,
-                                 asset.pathCount,
-                                 asset.inputCount,
-                                 asset.processingChannels,
-                                 asset.footprintBytes,
-                                 static_cast<std::uint32_t>(asset.payload.size())};
-  if (found->second.analysisRole == AnalysisRole::consumer && asset.slot == 0) {
+  const auto beginInfo = assetInfo(asset);
+  if (found->second.assetBudget == kSfzAssetBudgetBytes && asset.slot == 0) {
     Engine::InstanceAssetSnapshot snapshot;
     Engine::InstanceAssetUpdate update;
-    if (engine_->captureInstanceAssetSnapshot(found->second.instance, 0, snapshot) != ET_OK ||
-        Engine::prepareInstanceAssetUpdate(snapshot, beginInfo, asset.payload.data(),
-            static_cast<std::uint32_t>(asset.payload.size()), asset.formatTag, update) != ET_OK ||
+    const auto budget = remainingAssetBudgetUnlocked(
+        static_cast<std::uint64_t>(asset.logicalId) << 32u, found->second.assetBudget);
+    const auto processingChannels = found->second.samplePlayerChannels;
+    auto preparedFootprint = asset.footprintBytes;
+    if (engine_->captureInstanceAssetSnapshot(found->second.instance, 0, snapshot, 0.0) != ET_OK ||
+        !prepareSamplePlayerAsset(*engine_, snapshot, update, asset, found->second.soundFont,
+            sampleRate_, std::max(maxProcessFrames_, kMinimumArenaFrames),
+            processingChannels, std::min(capacity, budget), &preparedFootprint) ||
         engine_->applyInstanceAssetUpdate(update) != ET_OK) {
-      setError(error, "The instrument could not be loaded. Select another SFZ instrument.");
+      setError(error, "The instrument could not be loaded. Select another instrument.");
       return false;
     }
+    Engine::InstanceAssetUpdate failedActivation;
+    if (!activateSamplePlayerStream(*engine_, found->second.instance, asset.streamGeneration,
+                                    failedActivation)) {
+      found->second.midiRendering = false;
+      found->second.sampleAssetUnavailable = true;
+      (void)refreshAssetStatesUnlocked();
+      setError(error, "The instrument could not be activated. Try a smaller instrument.");
+      return false;
+    }
+    asset.footprintBytes = preparedFootprint;
+    asset.processingChannels = processingChannels;
+    found->second.sampleAssetUnavailable = false;
+    found->second.midiRendering = false;
+    restoreSoundFontMixerUnlocked(found->second);
     return true;
   }
   auto *staging = engine_->beginInstanceAsset(found->second.instance, asset.slot, beginInfo);
@@ -803,11 +1079,13 @@ bool EngineHost::refreshAssetStatesUnlocked() noexcept {
   auto pending = false;
   for (auto &[key, entry] : assets_) {
     const auto instance = instances_.find(static_cast<std::uint32_t>(key >> 32u));
-    const auto state = instance == instances_.end() ||
-                               instance->second.contextuallyBypassed
-                           ? static_cast<std::uint32_t>(ET_ASSET_STATE_NONE)
-                           : engine_->instanceAssetState(instance->second.instance,
-                                                         static_cast<std::uint32_t>(key));
+    const auto slot = static_cast<std::uint32_t>(key);
+    auto state = static_cast<std::uint32_t>(ET_ASSET_STATE_NONE);
+    if (instance != instances_.end() && !instance->second.contextuallyBypassed) {
+      state = slot == 0 && instance->second.sampleAssetUnavailable
+          ? static_cast<std::uint32_t>(ET_ASSET_STATE_ERROR)
+          : engine_->instanceAssetState(instance->second.instance, slot);
+    }
     entry.state.store(state, std::memory_order_release);
     const auto phase = state & 0xffu;
     pending = pending || phase == ET_ASSET_STATE_STAGED ||
@@ -820,7 +1098,7 @@ bool EngineHost::supportsPreparedAsset(const std::uint32_t logicalId, const std:
   std::scoped_lock lock(engineMutex_);
   const auto instance = instances_.find(logicalId);
   return slot == 0 && instance != instances_.end() &&
-         instance->second.analysisRole == AnalysisRole::consumer &&
+         instance->second.assetBudget == kSfzAssetBudgetBytes &&
          !instance->second.contextuallyBypassed;
 }
 
@@ -830,27 +1108,38 @@ std::unique_ptr<EngineHost::PreparedAssetUpdate> EngineHost::createAssetUpdate(
   const auto instance = instances_.find(asset.logicalId);
   const auto key = static_cast<std::uint64_t>(asset.logicalId) << 32u;
   if (asset.slot != 0 || instance == instances_.end() ||
-      instance->second.analysisRole != AnalysisRole::consumer || assets_.find(key) == assets_.end()) {
+      instance->second.assetBudget != kSfzAssetBudgetBytes || instance->second.contextuallyBypassed ||
+      assets_.find(key) == assets_.end()) {
     setError(error, "The instrument is no longer available.");
     return {};
   }
+  auto footprintLimit = kSfzAssetBudgetBytes;
   if (!clear) {
     const auto capacity = et_kernel_asset_capacity(instance->second.kernelIndex, asset.slot);
-    std::uint64_t footprint = asset.footprintBytes;
-    for (const auto &[cachedKey, cached] : assets_) {
-      if (cachedKey != key && cached.budget == kSfzAssetBudgetBytes) footprint += cached.asset.footprintBytes;
-    }
+    const auto remaining = remainingAssetBudgetUnlocked(key, kSfzAssetBudgetBytes);
     if (!AssetLimits{capacity, kSfzAssetBudgetBytes}.accepts(asset.payload.size(), asset.footprintBytes) ||
-        footprint > kSfzAssetBudgetBytes) {
+        asset.footprintBytes + retainedPageBytes(asset) > remaining) {
       setError(error, "The instrument exceeds the available sample memory.");
       return {};
     }
+    footprintLimit = std::min(capacity, remaining);
   }
   try {
     auto result = std::make_unique<PreparedAssetUpdate>();
+    sortSamplePages(asset);
+    // The renderer can finish sending a bank after the route changes. Native
+    // preparation must use the width of the destination instance.
+    asset.processingChannels = instance->second.samplePlayerChannels;
     result->storage_->asset = std::move(asset);
+    result->storage_->owner = engine_.get();
+    result->storage_->sampleRate = sampleRate_;
+    result->storage_->maxFrames = std::max(maxProcessFrames_, kMinimumArenaFrames);
+    result->storage_->footprintLimit = footprintLimit;
+    result->storage_->soundFont = instance->second.soundFont;
     result->storage_->clear = clear;
-    result->storage_->requestRevision = requestRevision;
+    result->storage_->requestRevision = requestRevision == 0
+        ? assets_.find(key)->second.requestRevision.load(std::memory_order_acquire)
+        : requestRevision;
     return result;
   } catch (const std::bad_alloc &) {
     setError(error, "There is not enough memory to load the instrument.");
@@ -871,30 +1160,44 @@ bool EngineHost::captureAssetUpdate(PreparedAssetUpdate &pending) noexcept {
   return cached != assets_.end() &&
          (storage.requestRevision == 0 || storage.requestRevision == cached->second.requestRevision.load(std::memory_order_acquire)) &&
          instance != instances_.end() &&
+         instance->second.samplePlayerChannels == storage.asset.processingChannels &&
          engine_->captureInstanceAssetSnapshot(instance->second.instance, storage.asset.slot,
-                                                storage.snapshot) == ET_OK;
+                                                storage.snapshot, 0.0) == ET_OK;
 }
 
 bool EngineHost::prepareAssetUpdate(PreparedAssetUpdate &pending) noexcept {
   auto &storage = *pending.storage_;
   if (storage.clear) return Engine::prepareInstanceAssetClear(storage.snapshot, storage.update) == ET_OK;
-  const auto &asset = storage.asset;
-  const AssetBeginInfo info{asset.channels, asset.frames, asset.topology, asset.headBlock,
-      asset.rateDivider, asset.pathCount, asset.inputCount, asset.processingChannels,
-      asset.footprintBytes, static_cast<std::uint32_t>(asset.payload.size())};
-  return Engine::prepareInstanceAssetUpdate(storage.snapshot, info, asset.payload.data(),
-      static_cast<std::uint32_t>(asset.payload.size()), asset.formatTag, storage.update) == ET_OK;
+  return prepareSamplePlayerAsset(*storage.owner, storage.snapshot, storage.update, storage.asset,
+      storage.soundFont, storage.sampleRate, storage.maxFrames, storage.asset.processingChannels,
+      storage.footprintLimit,
+      &storage.asset.footprintBytes);
 }
 
-bool EngineHost::applyAssetUpdate(PreparedAssetUpdate &pending) noexcept {
+bool EngineHost::applyAssetUpdate(PreparedAssetUpdate &pending,
+                                  const bool allowPagedActivation) noexcept {
   auto &storage = *pending.storage_;
+  const auto generation = storage.clear ? 0u : storage.asset.streamGeneration;
+  if (generation != 0u && !allowPagedActivation) return false;
   const auto current = assets_.find(static_cast<std::uint64_t>(storage.asset.logicalId) << 32u);
-  if (current == assets_.end() || (storage.requestRevision != 0 &&
+  const auto instance = instances_.find(storage.asset.logicalId);
+  if (instance == instances_.end() ||
+      instance->second.samplePlayerChannels != storage.asset.processingChannels ||
+      current == assets_.end() || (storage.requestRevision != 0 &&
       storage.requestRevision != current->second.requestRevision.load(std::memory_order_acquire))) return false;
   storage.applied = engine_->applyInstanceAssetUpdate(storage.update) == ET_OK;
   if (storage.applied) {
-    const auto cached = assets_.find(static_cast<std::uint64_t>(storage.asset.logicalId) << 32u);
-    if (cached != assets_.end()) cached->second.state.store(
+    instance->second.midiRendering = false;
+    if (!activateSamplePlayerStream(*engine_, instance->second.instance, generation,
+                                    storage.failedActivation)) {
+      instance->second.sampleAssetUnavailable = true;
+      current->second.state.store(ET_ASSET_STATE_ERROR, std::memory_order_release);
+      storage.applied = false;
+      return false;
+    }
+    instance->second.sampleAssetUnavailable = false;
+    if (!storage.clear) restoreSoundFontMixerUnlocked(instance->second);
+    current->second.state.store(
         storage.clear ? ET_ASSET_STATE_NONE : ET_ASSET_STATE_ACTIVE, std::memory_order_release);
   }
   return storage.applied;
@@ -913,6 +1216,7 @@ void EngineHost::finishAssetUpdate(PreparedAssetUpdate &pending) {
 
 bool EngineHost::setAsset(RuntimeAsset asset, std::string *error) {
   std::scoped_lock lock(engineMutex_);
+  sortSamplePages(asset);
   const auto key = (static_cast<std::uint64_t>(asset.logicalId) << 32u) | asset.slot;
   const auto instance = instances_.find(asset.logicalId);
   if (instance == instances_.end()) {
@@ -920,10 +1224,10 @@ bool EngineHost::setAsset(RuntimeAsset asset, std::string *error) {
     return false;
   }
   const auto budget = instance->second.assetBudget;
-  std::uint64_t aggregate = asset.footprintBytes;
+  std::uint64_t aggregate = asset.footprintBytes + retainedPageBytes(asset);
   for (const auto &[cachedKey, cached] : assets_) {
     if (cachedKey != key && cached.budget == budget) {
-      aggregate += cached.asset.footprintBytes;
+      aggregate += cached.asset.footprintBytes + retainedPageBytes(cached.asset);
     }
   }
   if (aggregate > budget) {
@@ -989,7 +1293,9 @@ bool EngineHost::clearAsset(const std::uint32_t logicalId, const std::uint32_t s
     engine_->abortInstanceAsset(found->second.instance, slot);
   }
   const auto key = (static_cast<std::uint64_t>(logicalId) << 32u) | slot;
-  if (found != instances_.end() && found->second.analysisRole == AnalysisRole::consumer && slot == 0) {
+  if (found != instances_.end() && found->second.assetBudget == kSfzAssetBudgetBytes && slot == 0) {
+    found->second.sampleAssetUnavailable = false;
+    found->second.midiRendering = false;
     auto &cached = assets_[key];
     cached.asset = {};
     cached.asset.logicalId = logicalId;
@@ -1032,7 +1338,38 @@ void EngineHost::retainAssets(const std::span<const std::uint32_t> logicalIds) {
       ++item;
     }
   }
+  for (auto item = soundFontMixers_.begin(); item != soundFontMixers_.end();) {
+    if (!instances_.contains(item->first) &&
+        std::find(logicalIds.begin(), logicalIds.end(), item->first) == logicalIds.end())
+      item = soundFontMixers_.erase(item);
+    else
+      ++item;
+  }
   assetPreparationLatencyPolling_ = refreshAssetStatesUnlocked();
+}
+
+std::optional<SoundFontMixerState> EngineHost::soundFontMixerState(
+    const std::uint32_t logicalId) const {
+  std::scoped_lock lock(engineMutex_);
+  const auto found = soundFontMixers_.find(logicalId);
+  return found == soundFontMixers_.end() ? std::nullopt : found->second->read();
+}
+
+void EngineHost::replaceSoundFontMixerStates(
+    const std::map<std::uint32_t, SoundFontMixerState> &states) {
+  std::map<std::uint32_t, std::unique_ptr<SoundFontMixerProjection>> replacement;
+  for (const auto &[id, state] : states) {
+    auto projection = std::make_unique<SoundFontMixerProjection>();
+    projection->publish(state);
+    replacement.emplace(id, std::move(projection));
+  }
+  std::scoped_lock lock(engineMutex_);
+  soundFontMixers_.swap(replacement);
+  for (auto &[id, entry] : instances_) {
+    const auto state = soundFontMixers_.find(id);
+    entry.soundFontMixer = entry.soundFont && state != soundFontMixers_.end()
+        ? state->second.get() : nullptr;
+  }
 }
 
 bool EngineHost::applyCommandUnlocked(const AudioCommand &command,
@@ -1074,8 +1411,119 @@ bool EngineHost::applyCommandUnlocked(const AudioCommand &command,
     analysisSourcesDirty_ = true;
     return engine_->resetInstance(found->second.instance) == ET_OK;
   }
+  case AudioCommandType::soundFontMidiControl:
+    return applySoundFontControlUnlocked(command);
   }
   return false;
+}
+
+bool EngineHost::applySoundFontControlUnlocked(const AudioCommand &command) noexcept {
+  const auto found = instances_.find(command.logicalId);
+  if (found == instances_.end() || !found->second.soundFont || found->second.contextuallyBypassed)
+    return true;
+  const auto instance = found->second.instance;
+  const auto &control = command.soundFontControl;
+  switch (control.kind) {
+  case SoundFontControlKind::metering:
+    return engine_->setInstanceMidiMetering(instance, control.value) == ET_OK;
+  case SoundFontControlKind::mix:
+    // Establish the first generation before the mixer changes a channel mask.
+    if (engine_->instanceMidiGeneration(instance) == 0u)
+      (void)engine_->setInstanceMidiEvents(instance, nullptr, 0u, 1u, ET_MIDI_RETIME);
+    return engine_->setInstanceMidiChannelMix(instance, control.channel, control.value) == ET_OK;
+  case SoundFontControlKind::channel: {
+    if (control.messageCount == 0 || control.messageCount > control.messages.size()) return false;
+    std::array<et_midi_event, 3> edits{};
+    for (std::uint32_t index = 0; index < control.messageCount; ++index)
+      edits[index].message = control.messages[index];
+    // A bank can be cleared or exchanged after the UI queued this edit.
+    (void)engine_->setInstanceMidiEvents(instance, edits.data(), control.messageCount,
+        engine_->instanceMidiGeneration(instance), ET_MIDI_CONTROL_ONLY);
+    return true;
+  }
+  }
+  return false;
+}
+
+void EngineHost::restoreSoundFontMixerUnlocked(InstanceEntry &entry) noexcept {
+  if (!entry.soundFontMixer ||
+      (engine_->instanceAssetState(entry.instance, 0) & 0xffu) != ET_ASSET_STATE_ACTIVE)
+    return;
+  const auto state = entry.soundFontMixer->readOnOwner();
+  if (!state) return;
+  auto generation = engine_->instanceMidiGeneration(entry.instance);
+  if (generation == 0u) generation = 1u;
+  // Retiming with no events consumes a prepared bank's pending note reset
+  // before channel hydration, without starting notes or playback.
+  if (engine_->setInstanceMidiEvents(entry.instance, nullptr, 0u, generation, ET_MIDI_RETIME) != ET_OK)
+    return;
+
+  std::array<et_midi_event, 16u * 10u> events{};
+  std::uint32_t count = 0;
+  for (std::uint32_t channel = 0; channel < state->channels.size(); ++channel) {
+    const auto &row = state->channels[channel];
+    const auto percussion = row.selectedBank == 128u;
+    events[count++] = {0u, (channel << 8u) | (percussion ? 0x10000u : 0u), 0u,
+                       ET_MIDI_DRUM_MODE, 0u, 0u};
+    const auto cc = [&](const std::uint32_t controller, const std::uint32_t value) {
+      events[count++] = {0u, 0xb0u | channel | (controller << 8u) | (value << 16u), 0u,
+                         ET_MIDI_HYDRATE_CHANNEL_ONLY, 0u, 0u};
+    };
+    cc(0, percussion ? row.bankMsb : row.selectedBank);
+    events[count++] = {0u, 0xc0u | channel | (std::uint32_t{row.program} << 8u), 0u,
+                       ET_MIDI_HYDRATE_CHANNEL_ONLY, 0u, 0u};
+    // Pending Bank Select can differ from the bank that the program selected.
+    cc(0, row.bankMsb);
+    cc(32, row.bankLsb);
+    cc(7, row.volume);
+    cc(10, row.pan);
+    cc(11, row.expression);
+    cc(91, row.reverb);
+    cc(93, row.chorus);
+  }
+  (void)engine_->setInstanceMidiEvents(entry.instance, events.data(), count, generation,
+                                       ET_MIDI_HYDRATE_CHANNEL_STATE);
+}
+
+void EngineHost::resetSoundFontInputUnlocked(InstanceEntry &entry) noexcept {
+  if (!entry.midiRendering) return;
+  // A skipped node will miss note-offs. Release its input state before
+  // it can rejoin the active pipeline.
+  const auto generation = engine_->instanceMidiGeneration(entry.instance);
+  (void)engine_->setInstanceMidiEvents(entry.instance, nullptr, 0u, generation, ET_MIDI_RESET);
+  entry.midiRendering = false;
+  restoreSoundFontMixerUnlocked(entry);
+}
+
+void EngineHost::stageMidiUnlocked(const std::span<const et_midi_event> events,
+                                  const std::uint32_t channels,
+                                  const bool masterBypass) noexcept {
+  if (!hasSoundFont_ || activeDescriptorByteCount_ == 0) return;
+  const auto nodeCount = readUint32(activeDescriptor_.data() + 4u);
+  for (std::uint32_t index = 0; index < nodeCount; ++index) {
+    auto *entry = analysisNodes_[index];
+    if (entry == nullptr || !entry->soundFont || entry->contextuallyBypassed) continue;
+    const auto *node = activeDescriptor_.data() + kPipelineDescriptorHeaderBytes +
+                       index * kPipelineDescriptorNodeBytes;
+    if (masterBypass || !midiNodeRuns(node, channels)) {
+      resetSoundFontInputUnlocked(*entry);
+      continue;
+    }
+    const auto instance = entry->instance;
+    if ((engine_->instanceAssetState(instance, 0) & 0xffu) != ET_ASSET_STATE_ACTIVE) continue;
+    const auto generation = engine_->instanceMidiGeneration(instance);
+    const auto attached = generation == 0u ? 1u : generation;
+    if ((generation == 0u || !events.empty()) &&
+        engine_->setInstanceMidiEvents(instance, events.empty() ? nullptr : events.data(),
+            static_cast<std::uint32_t>(events.size()), attached,
+            generation == 0u ? static_cast<std::uint32_t>(ET_MIDI_RETIME) : 0u) != ET_OK) {
+      recordProcessFailure(ProcessError::midiEventsRejected);
+      continue;
+    }
+    if (engine_->setInstanceMidiClock(instance, engine_->instanceMidiClock(instance),
+                                     attached, ET_MIDI_CLOCK_RUNNING) == ET_OK)
+      entry->midiRendering = true;
+  }
 }
 
 bool EngineHost::tryProcessBlock(float *const *channels, const std::uint32_t channelCount,
@@ -1183,7 +1631,9 @@ bool EngineHost::ProcessBatch::processChunk(const float *const *input, float *co
                                             const std::uint32_t channelCount,
                                             const std::uint32_t frameCount,
                                             const double timeSeconds,
-                                            const bool masterBypass) noexcept {
+                                            const bool masterBypass,
+                                            const std::span<const et_midi_event> midiEvents,
+                                            const et_host_transport *transport) noexcept {
   if (host_ == nullptr || failed_ || input == nullptr || output == nullptr || channelCount == 0 ||
       channelCount > host_->channels_ || frameCount == 0 ||
       frameCount > host_->maxProcessFrames_ || !std::isfinite(timeSeconds)) {
@@ -1225,6 +1675,21 @@ bool EngineHost::ProcessBatch::processChunk(const float *const *input, float *co
     host_->recordProcessFailure(ProcessError::commandRejected);
     failed_ = true;
     return false;
+  }
+  if (midiEvents.size() <= kMaxMidiEvents &&
+      (midiEvents.empty() || midiEvents.back().offset_frames < frameCount)) {
+    host_->stageMidiUnlocked(midiEvents, channelCount, masterBypass);
+  } else {
+    host_->recordProcessFailure(ProcessError::midiEventsRejected);
+    host_->stageMidiUnlocked({}, channelCount, masterBypass);
+  }
+  if (transport == nullptr) {
+    host_->engine_->setHostTransport(nullptr);
+  } else {
+    const HostTransport context{transport->flags, transport->tempo_bpm, transport->ppq_position,
+        transport->bar_start_ppq, transport->time_signature_numerator,
+        transport->time_signature_denominator};
+    host_->engine_->setHostTransport(&context);
   }
   host_->spectrumCapture_.beginBlock(masterBypass);
   {
@@ -1475,6 +1940,18 @@ void EngineHost::storeActiveDescriptorUnlocked(const std::uint8_t *descriptor,
       if (entry != instances_.end()) analysisNodes_[index] = &entry->second;
     }
   }
+  if (hasSoundFont_) {
+    for (auto &[id, entry] : instances_) {
+      (void)id;
+      if (!entry.midiRendering) continue;
+      const auto active = std::find(analysisNodes_.begin(), analysisNodes_.end(), &entry);
+      if (active == analysisNodes_.end() ||
+          !midiNodeRuns(descriptor + kPipelineDescriptorHeaderBytes +
+                           std::distance(analysisNodes_.begin(), active) * kPipelineDescriptorNodeBytes,
+                       channels_))
+        resetSoundFontInputUnlocked(entry);
+    }
+  }
 }
 
 bool EngineHost::refreshAnalysisSourcesUnlocked(const std::uint32_t channels,
@@ -1605,6 +2082,38 @@ bool EngineHost::refreshLatencyUnlocked(bool *instanceLatencyChanged) noexcept {
   return previous != pipelineLatency;
 }
 
+void EngineHost::updateSoundFontMixerTelemetryUnlocked(
+    const std::span<const std::uint8_t> bytes) noexcept {
+  if (soundFontMixerTaps_.empty()) return;
+  for (std::size_t offset = 0; bytes.size() - offset >= 16u;) {
+    const auto *header = bytes.data() + offset;
+    const auto size = readUint16(header + 12u);
+    const auto frameBytes = (16u + size + 3u) & ~3u;
+    if (frameBytes > bytes.size() - offset) break;
+    offset += frameBytes;
+    if (readUint16(header) != 35u || readUint16(header + 2u) != 2u || size != 584u) continue;
+    const auto found = soundFontMixerTaps_.find(readUint32(header + 4u));
+    if (found == soundFontMixerTaps_.end()) continue;
+    const auto &entry = *found->second;
+    // An unloaded player emits default-looking rows. Keep a saved mixer
+    // available for the bank that has yet to load.
+    if (!entry.soundFontMixer ||
+        (engine_->instanceAssetState(entry.instance, 0) & 0xffu) != ET_ASSET_STATE_ACTIVE)
+      continue;
+    SoundFontMixerState mixer;
+    for (std::size_t channel = 0; channel < mixer.channels.size(); ++channel) {
+      const auto *row = header + 16u + 8u + 32u * channel;
+      const auto bank = readUint16(row);
+      const auto resolved = bank <= 128u && row[2] <= 127u;
+      mixer.channels[channel] = {row[14], row[15], resolved ? row[2] : row[9],
+                                 row[3], row[4], row[5], row[6], row[7],
+                                 static_cast<std::uint8_t>(
+                                     resolved ? bank : channel == 9u ? 128u : row[14])};
+    }
+    entry.soundFontMixer->publish(mixer);
+  }
+}
+
 void EngineHost::drainTelemetryUnlocked() noexcept {
   const auto write = telemetry_->write.load(std::memory_order_relaxed);
   const auto next = (write + 1u) % TelemetryStorage::kSlotCount;
@@ -1613,6 +2122,7 @@ void EngineHost::drainTelemetryUnlocked() noexcept {
     const auto bytes = engine_->readTelemetry(
         telemetry_->discard.data(), static_cast<std::uint32_t>(telemetry_->discard.size()),
         &dropped);
+    updateSoundFontMixerTelemetryUnlocked(std::span(telemetry_->discard).first(bytes));
     addDroppedFrames(telemetry_->producerDroppedFrames,
                      static_cast<std::uint64_t>(dropped) +
                          countTelemetryFrames(telemetry_->discard.data(), bytes));
@@ -1622,6 +2132,7 @@ void EngineHost::drainTelemetryUnlocked() noexcept {
   slot.byteCount = engine_->readTelemetry(slot.bytes.data(),
                                           static_cast<std::uint32_t>(slot.bytes.size()), &dropped);
   slot.droppedFrames = dropped;
+  updateSoundFontMixerTelemetryUnlocked(std::span(slot.bytes).first(slot.byteCount));
   if (slot.byteCount != 0 || dropped != 0) {
     telemetry_->write.store(next, std::memory_order_release);
   }

@@ -8,6 +8,14 @@ import {
   unpackDSPAutomationValue
 } from './js/audio/dsp-params.generated.js';
 import { getPluginExecutionCapabilities } from './js/audio/plugin-execution-capabilities.js';
+import { loadDspModule } from './js/audio/dsp-wasm-loader.js';
+import { SfzEffectCost } from './js/sfz/effect-cost.js';
+import { SFZ_STORAGE_TABLE_VERSION, SFZ_STREAM_TABLE_VERSION, SF2_TABLE_VERSION } from './js/sfz/asset.js';
+import { sfzPlayerKind, sfzPluginPreparationContext } from './js/sfz/preparation-context.js';
+import { SFZ_SAMPLE_PAGE_FRAMES } from './js/sfz/sample-stream.js';
+import { getSfzMaxBytes } from './js/sfz/limits.js';
+import { MidiInputState } from './js/midi/smf-timeline.js';
+import { getMidiEventList } from './js/midi/event-list.js';
 
 window.dspParamPackers = DSP_PARAM_PACKERS;
 
@@ -15,6 +23,7 @@ const noop = () => {};
 const ASSET_CHUNK_BYTES = 192 * 1024;
 const IR_ASSET_HEADER_BYTES = 32;
 const IR_ASSET_MAGIC = 0x31415445;
+const SAMPLER_TABLE_MAGIC = 0x53465a;
 // An upper bound on how long the value a gesture ended on may wait for a frame
 // that may never be painted. Short enough to stay inaudible, long enough that an
 // ordinary drag still costs one request per displayed frame.
@@ -162,6 +171,7 @@ class NativePort {
     this.listeners = new Set();
     this.assetOperations = new Map();
     this.assetResidents = new Map();
+    this.nextStreamGeneration = 0;
     this.adoptedAutomationValues = new Map();
     this.deferredHostAutomationDeltas = new Map();
     this.pendingPluginUpdates = new Map();
@@ -428,7 +438,8 @@ class NativePort {
       });
     }
     if (message.type === 'setPluginAsset') {
-      this.queueAssetOperation(message, () => this.setPluginAsset(message));
+      const plugin = this.owner.getCurrentPipeline?.().find(candidate => candidate.id === message.pluginId);
+      this.queueAssetOperation(message, () => this.setPluginAsset(message, plugin));
       return;
     }
     if (message.type === 'clearPluginAsset') {
@@ -697,7 +708,7 @@ class NativePort {
     void current.then(cleanup, cleanup);
   }
 
-  async setPluginAsset(message) {
+  async setPluginAsset(message, plugin) {
     const payload = message.payload instanceof ArrayBuffer
       ? new Uint8Array(message.payload)
       : ArrayBuffer.isView(message.payload)
@@ -727,23 +738,27 @@ class NativePort {
       byteSize: payload.byteLength,
       operationRevision: message.operationRevision
     };
-    await window.__effetuneHostCall('pipeline/assetBegin', metadata);
-    for (let offset = 0; offset < payload.byteLength; offset += ASSET_CHUNK_BYTES) {
-      const chunk = payload.subarray(offset, Math.min(offset + ASSET_CHUNK_BYTES,
-        payload.byteLength));
-      await window.__effetuneHostCall('pipeline/assetChunk', {
-        pluginId: message.pluginId,
-        slot: message.slot >>> 0,
-        operationRevision: message.operationRevision,
-        offset,
-        data: encodeBase64(chunk)
-      });
+    const tableVersion = payload.byteLength >= 96 && header.getUint32(32, true) === SAMPLER_TABLE_MAGIC
+      ? header.getUint32(36, true) : 0;
+    const streamed = [SFZ_STREAM_TABLE_VERSION, SF2_TABLE_VERSION, SFZ_STORAGE_TABLE_VERSION].includes(tableVersion);
+    const target = { pluginId: metadata.pluginId, slot: metadata.slot, operationRevision: metadata.operationRevision };
+    const current = () => !this.spectrumClosed && this.owner.getCurrentPipeline().includes(plugin) &&
+      plugin.getWasmAssetOperationRevision(target.slot) === target.operationRevision;
+    let preload;
+    if (streamed) {
+      if (!current()) throw new Error('The instrument selection changed.');
+      const descriptor = plugin.getWasmAssetRevisionDescriptor(target.slot, target.operationRevision,
+        message.replayEpoch, this.owner.nativeNode);
+      if (!descriptor?.sampleProviderFactory) throw new Error('Instrument samples are unavailable. Reload the instrument.');
+      metadata.streamGeneration = ++this.nextStreamGeneration;
+      preload = async () => {
+        await this.preloadPluginSamples(descriptor, target, metadata.streamGeneration,
+          header.getUint32(88, true), current, progress => plugin.onSfzPreparationProgress?.({ ...progress,
+            operationRevision: target.operationRevision, replayEpoch: message.replayEpoch ?? null }));
+        if (!current()) throw new Error('The instrument selection changed.');
+      };
     }
-    const result = await window.__effetuneHostCall('pipeline/assetCommit', {
-      pluginId: message.pluginId,
-      slot: message.slot >>> 0,
-      operationRevision: message.operationRevision
-    });
+    const result = await this.uploadPluginAsset(metadata, payload, target, preload);
     const resident = {
       pluginId: message.pluginId,
       slot: message.slot >>> 0,
@@ -754,6 +769,62 @@ class NativePort {
     this.assetResidents.set(this.assetKey(message), resident);
     this.dispatchAssetState(resident);
     this.pollAssetState(resident);
+    if (plugin?._midiMeteringDesired) this.owner.setSoundFontMidiMetering?.(plugin, true);
+  }
+
+  async uploadPluginAsset(metadata, payload, target, preload) {
+    await window.__effetuneHostCall('pipeline/assetBegin', metadata);
+    try {
+      for (let offset = 0; offset < payload.byteLength; offset += ASSET_CHUNK_BYTES) {
+        const chunk = payload.subarray(offset, offset + ASSET_CHUNK_BYTES);
+        await window.__effetuneHostCall('pipeline/assetChunk', { ...target, offset, data: encodeBase64(chunk) });
+      }
+      await preload?.();
+      return await window.__effetuneHostCall('pipeline/assetCommit', target);
+    } catch (error) {
+      await window.__effetuneHostCall('pipeline/assetCancel', target).catch(noop);
+      throw error;
+    }
+  }
+
+  async preloadPluginSamples(descriptor, target, generation, capacity, current, onProgress) {
+    // Keep the complete bank in native memory so audio never depends on an open editor.
+    let provider;
+    try {
+      provider = await descriptor.sampleProviderFactory({ generation, onProgress,
+        publish: async ({ sample, pageIndex, frames, channels, pcm }) => {
+          if (!current()) throw new Error('The instrument selection changed.');
+          const bytes = new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+          await window.__effetuneHostCall('pipeline/assetPage', { ...target, generation, sample,
+            page: pageIndex, frames, channels, flags: 1, bytes: encodeBase64(bytes) });
+          return true;
+        }
+      });
+      const pageCount = sample => Math.ceil(sample.frames / SFZ_SAMPLE_PAGE_FRAMES);
+      const totalCount = provider.samples.reduce((total, sample) => total + pageCount(sample), 0);
+      const replayBytes = provider.samples.reduce((total, sample) => total + sample.frames * sample.channels * 4, 0);
+      if (totalCount > capacity || replayBytes + descriptor.footprintBytes > getSfzMaxBytes(window.appConfig?.sfzMaxSizeMiB)) {
+        throw Object.assign(new Error('The instrument exceeds the SoundFont memory limit.'), { code: 'too-large' });
+      }
+      const batch = [];
+      let completedCount = 0;
+      const flush = async () => {
+        if (!batch.length) return;
+        const count = batch.length;
+        await provider.requestPages(batch.splice(0));
+        completedCount += count;
+        onProgress({ phase: 'prebuffer', completedCount, totalCount });
+      };
+      for (const sample of provider.samples) {
+        for (let pageIndex = 0; pageIndex < pageCount(sample); ++pageIndex) {
+          batch.push({ generation, sample: sample.sample, pageIndex, resident: true });
+          if (batch.length === 32) await flush();
+        }
+      }
+      await flush();
+    } finally {
+      provider?.close();
+    }
   }
 
   async clearPluginAsset(message) {
@@ -827,7 +898,7 @@ class NativePort {
       type: 'assetLoadRejected',
       pluginId: message.pluginId,
       slot: message.slot >>> 0,
-      reason: 'native-host',
+      reason: error?.code === 'too-large' ? 'capacity' : 'native-host',
       operationRevision: message.operationRevision,
       replayFailure: Number.isSafeInteger(message.replayEpoch),
       residentRetained,
@@ -929,6 +1000,7 @@ class NativePort {
   close() {
     this.stopFrequencyPreview();
     this.spectrumClosed = true;
+    this.owner.nativeSfzEffectCost?.close();
     this.synchronizeSpectrumTaps();
     void this.postMessage({ type: 'setVisualizerSources', sources: [] });
     // The port is the only route the close itself can leave through, and the
@@ -1055,10 +1127,12 @@ export class AudioManager extends BrowserAudioManager {
       const spectrumRevision = this.nativePort.spectrumPublishedRevision;
       const runtimePipeline = [...this.getCurrentPipeline()];
       const result = await window.__effetuneHostCall(hidden ? 'host/getInfo' : 'telemetry/read', {
-        nowPlayingRevision: this.nowPlayingRevision
+        nowPlayingRevision: this.nowPlayingRevision,
+        ...(hidden && { midiTelemetry: true })
       });
       this.applyNativeNowPlaying(result);
       this.applyNativeHostTransport(result);
+      this.applyNativeMidiInput?.(result);
       this.applyNativePerformanceStatus(result);
       this.applyHostAutomationDeltas(result.automationDeltas);
       this.applyHostDiagnostics(result.diagnostics);
@@ -1106,6 +1180,7 @@ export class AudioManager extends BrowserAudioManager {
       this.applyNativeNowPlaying(info);
       this.applyNativeHostTransport(info);
       this.contextManager.audioContext = fakeAudioContext(info.engineSampleRate, info.channels);
+      this.nativeMaxEngineFrames = info.maxEngineFrames;
       this.nativeContextGeneration = info.contextGeneration || 0;
       this.preserveReadyNativePipelineDuringStartup =
         info.dspReady === true && info.stateReplacementPending !== true;
@@ -1132,6 +1207,113 @@ export class AudioManager extends BrowserAudioManager {
     this.workletNode = this.nativeNode;
     window.workletNode = this.nativeNode;
     return '';
+  }
+
+  applyNativeMidiInput({ midiEvents, midiPosition, midiGeneration, midiDroppedEvents }) {
+    if (!Array.isArray(midiEvents) || !Number.isFinite(midiPosition) || midiPosition < 0 ||
+        !Number.isSafeInteger(midiGeneration)) return;
+    if (this.nativeMidi?.generation !== midiGeneration || midiDroppedEvents > 0) {
+      this.nativeMidi = { generation: midiGeneration, state: new MidiInputState(), rows: [], anchors: [] };
+    }
+    const midi = this.nativeMidi;
+    midi.position = midiPosition;
+    const events = [];
+    for (const row of midiEvents) {
+      if (!Array.isArray(row)) continue;
+      const [seconds, message] = row;
+      const status = message & 255;
+      if (!Number.isFinite(seconds) || seconds < 0 || !Number.isSafeInteger(message) ||
+          message < 0 || message > 0x7f7fff || status < 0x80 || status >= 0xf0 || (message & 0x8000) !== 0) continue;
+      const event = { type: 'midi', seconds, tick: 0, status, data1: (message >> 8) & 127, data2: (message >> 16) & 127 };
+      midi.state.apply(event);
+      events.push(event);
+    }
+    if (events.length) {
+      this.nativeMidiSeen = true;
+      const rows = getMidiEventList({ displayEvents: events, division: 1 });
+      midi.rows = [...midi.rows, ...rows.map(row => ({ ...row, position: row.seconds.toFixed(3) }))]
+        .sort((left, right) => left.seconds - right.seconds).slice(-512);
+    }
+    const { tempoBpm: bpm, ppqPosition: quarter, playing } = this.hostTransport ?? {};
+    const anchors = midi.anchors;
+    midi.playing = playing === true;
+    if (!Number.isFinite(bpm) || bpm <= 0 || !Number.isFinite(quarter)) {
+      anchors.length = 0;
+      return;
+    }
+    const previous = anchors.at(-1);
+    const predicted = previous && previous.quarter + (previous.playing ? (midiPosition - previous.position) * previous.bpm / 60 : 0);
+    if (!previous || previous.bpm !== bpm || previous.playing !== midi.playing || Math.abs(predicted - quarter) > 0.01) {
+      anchors.push({ position: midiPosition, quarter, bpm, playing: midi.playing });
+      if (anchors.length > 64) anchors.shift();
+    }
+  }
+
+  getLiveMidiPresentation() {
+    const midi = this.nativeMidi;
+    if (!midi || !(this.nativeMidiSeen || this.getCurrentPipeline().some(plugin =>
+      plugin.constructor?.name === 'SoundFontPlayerPlugin' && plugin.enabled !== false))) return null;
+    midi.state.prune(midi.position);
+    const beatAt = midi.anchors.length ? position => {
+      const anchor = midi.anchors.findLast(item => item.position <= position) ?? midi.anchors[0];
+      return { quarter: anchor.quarter + (anchor.playing ? (position - anchor.position) * anchor.bpm / 60 : 0),
+        bpm: anchor.bpm };
+    } : null;
+    return { hasMidi: true, live: midi.state, position: midi.position, generation: midi.generation,
+      playing: midi.playing, paused: !midi.playing, speed: 1, preparing: false,
+      eventRows: midi.rows, beat: beatAt?.(midi.position), beatAt };
+  }
+
+  hasSfzSampleStreaming() {
+    return Number.isInteger(this.nativeMaxEngineFrames) && this.nativeMaxEngineFrames > 0;
+  }
+
+  async getSfzPreparationContext(plugin) {
+    if (!this.hasSfzSampleStreaming() || !this.audioContext) return null;
+    return sfzPluginPreparationContext(plugin, {
+      sampleRate: this.audioContext.sampleRate,
+      outputChannelCount: this.audioContext.destination.channelCount,
+      maxFrames: this.nativeMaxEngineFrames,
+      playerKind: sfzPlayerKind(plugin.constructor.name)
+    });
+  }
+
+  async estimateSfzEffectPreparation(payload, context, formatTag) {
+    if (!this.nativeSfzEffectCost || this.nativeSfzEffectCost.closed) {
+      const info = await loadDspModule();
+      if (!info) throw new Error('The instrument preparation module is unavailable.');
+      if (!this.nativeSfzEffectCost || this.nativeSfzEffectCost.closed) {
+        this.nativeSfzEffectCost = new SfzEffectCost(info.bytes ?? info.module);
+      }
+    }
+    return this.nativeSfzEffectCost.estimate(payload, context, formatTag);
+  }
+
+  setSoundFontMidiMetering(plugin, enabled) {
+    if (!this.getCurrentPipeline().includes(plugin)) return;
+    void window.__effetuneHostCall('soundFont/control', { pluginId: plugin.id, kind: 'metering', enabled })
+      .catch(error => console.error('[EffeTune Mixwright] SoundFont meters could not be updated', error));
+  }
+
+  async sendSoundFontMixerAction(plugin, { type, channel, value, bank, program, controller }) {
+    if (!this.getCurrentPipeline().includes(plugin) || !plugin.sf ||
+        !Number.isInteger(channel) || channel < 0 || channel > 15) {
+      throw new Error('The SoundFont channel is unavailable.');
+    }
+    const target = { pluginId: plugin.id, channel };
+    const midi = (status, data1, data2 = 0) => status | channel | (data1 << 8) | (data2 << 16);
+    const byte = number => Number.isInteger(number) && number >= 0 && number <= 127;
+    let payload;
+    if ((type === 'mute' || type === 'solo') && typeof value === 'boolean') {
+      payload = { ...target, kind: 'mix', action: (type === 'solo' ? 2 : 0) + Number(value) };
+    } else if (type === 'program' && byte(program) && (channel === 9 ? bank === 128 : byte(bank))) {
+      payload = { ...target, kind: 'channel', messages: [midi(0xb0, 0, channel === 9 ? 0 : bank),
+        midi(0xb0, 32), midi(0xc0, program)] };
+    } else if (type === 'control' && [7, 10, 11, 91, 93].includes(controller) && byte(value)) {
+      payload = { ...target, kind: 'channel', messages: [midi(0xb0, controller, value)] };
+    } else throw new Error('The SoundFont channel control is invalid.');
+    await window.__effetuneHostCall('soundFont/control', payload);
+    return true;
   }
 
   updateExposedProperties() {
@@ -1641,6 +1823,7 @@ export class AudioManager extends BrowserAudioManager {
           this.audioContext.destination.channelCount = latest.channels;
           this.audioContext.destination.maxChannelCount = latest.channels;
         }
+        if (latest.maxEngineFrames) this.nativeMaxEngineFrames = latest.maxEngineFrames;
         exposeAudioOutputChannelCount(this);
         // The rebuild resolves every rate-derived parameter against the new engine
         // rate while keeping the plug-in ids, so a baseline still describing the

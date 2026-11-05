@@ -21,4 +21,11 @@ DEF_CLASS2(INLINE_UID_FROM_FUID(effetune::vst::plugin::kProcessorId),
            EFFETUNE_PLUGIN_VERSION_STR, kVstVersionString,
            effetune::vst::plugin::EffeTuneProcessor::createInstance)
 
+#if !defined(EFFETUNE_AUTOMATION_HOST_GATE_FIXTURE)
+DEF_CLASS2(INLINE_UID_FROM_FUID(effetune::vst::plugin::kInstrumentId),
+           PClassInfo::kManyInstances, kVstAudioEffectClass, "EffeTune Mixwright Instrument", 0,
+           PlugType::kInstrumentSampler, EFFETUNE_PLUGIN_VERSION_STR, kVstVersionString,
+           effetune::vst::plugin::EffeTuneProcessor::createInstrument)
+#endif
+
 END_FACTORY
