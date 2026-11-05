@@ -13,6 +13,125 @@ const assets = path.resolve(process.argv[assetsIndex + 1]);
 const assetText = relative => readFile(path.join(assets, relative), 'utf8');
 const assetModule = relative => import(pathToFileURL(path.join(assets, relative)).href);
 
+test('legacy SFZ Note Player references instantiate the current instrument under its stable type', async () => {
+  const { PluginManager } = await assetModule('js/plugin-manager.js');
+  const { getSerializablePluginStateShort } = await assetModule('js/utils/serialization-utils.js');
+  const manager = new PluginManager();
+  const { pluginDefinitions } = manager.parsePluginsDefinition(await assetText('plugins/plugins.txt'));
+  const canonicalName = 'SoundFont Note Player';
+  const type = pluginDefinitions.get(canonicalName)?.className;
+  assert.equal(type, 'SFZNotePlayerPlugin');
+  assert.equal(pluginDefinitions.has('SFZ Note Player'), false);
+  manager.pluginClasses[canonicalName] = class SFZNotePlayerPlugin {
+    name = canonicalName;
+    enabled = true;
+    getParameters() { return { type: this.constructor.name, enabled: this.enabled }; }
+  };
+  for (const reference of ['SFZ Note Player', type, canonicalName]) {
+    assert.equal(manager.isPluginAvailable(reference), true);
+    const plugin = manager.createPlugin(reference, { audioHostActive: false });
+    assert.equal(plugin.constructor.name, type);
+    assert.equal(getSerializablePluginStateShort(plugin).nm, canonicalName);
+  }
+  assert.equal(manager.isPluginAvailable('SFZ'), false);
+});
+
+async function spaceKeyFixture() {
+  const app = await assetText('js/app.js');
+  const match = app.match(/import \{ (install(?:VstSpaceKeyHandler|SpaceKeyGuard)) \} from '([^']+)'/);
+  assert.ok(match, 'The application must install its Space key handler');
+  const module = await import(new URL(match[2], pathToFileURL(path.join(assets, 'js/app.js'))));
+  const listeners = [];
+  const calls = [];
+  const windowRef = {
+    addEventListener(type, handler, capture = false) { listeners.push({ type, handler, capture }); },
+    async vst_forwardHostSpace(down, shift) { calls.push({ down, shift }); return true; }
+  };
+  module[match[1]](windowRef);
+  const dispatch = (type, options = {}, consume) => {
+    const event = { type, key: ' ', target: { tagName: 'BODY' }, isTrusted: true,
+      defaultPrevented: false, cancelBubble: false,
+      preventDefault() { this.defaultPrevented = true; },
+      stopPropagation() { this.cancelBubble = true; }, ...options };
+    for (const listener of listeners.filter(value => value.type === type && value.capture)) {
+      listener.handler(event);
+    }
+    consume?.(event);
+    if (!event.cancelBubble) {
+      for (const listener of listeners.filter(value => value.type === type && !value.capture)) {
+        listener.handler(event);
+      }
+    }
+    return event;
+  };
+  return { calls, dispatch };
+}
+
+test('unused Space reaches the host once per press while its page-scroll default stays cancelled', async () => {
+  for (const target of [{ tagName: 'BODY' }, { tagName: 'DIV' }, { tagName: 'INPUT', type: 'range' }]) {
+    const { calls, dispatch } = await spaceKeyFixture();
+    assert.equal(dispatch('keydown', { target }).defaultPrevented, true);
+    assert.equal(dispatch('keydown', { target, repeat: true }).defaultPrevented, true);
+    dispatch('keyup', { target });
+    assert.deepEqual(calls, [{ down: true, shift: false }, { down: false, shift: false }]);
+    dispatch('keydown', { target });
+    dispatch('keyup', { target });
+    assert.equal(calls.length, 4, 'a second press can stop playback again');
+  }
+});
+
+test('Space remains available to text entry, focused controls and application handlers', async () => {
+  const { calls, dispatch } = await spaceKeyFixture();
+  for (const target of [
+    { tagName: 'INPUT', type: 'text' }, { tagName: 'INPUT', type: 'checkbox' },
+    { tagName: 'INPUT', type: 'radio' }, { tagName: 'TEXTAREA' }, { tagName: 'SELECT' },
+    { tagName: 'BUTTON' }, { tagName: 'SUMMARY' }, { tagName: 'DIV', isContentEditable: true }
+  ]) {
+    assert.equal(dispatch('keydown', { target }).defaultPrevented, false);
+    dispatch('keyup', { target });
+  }
+  dispatch('keydown', {}, event => event.preventDefault());
+  dispatch('keyup');
+  dispatch('keydown', {}, event => { event.preventDefault(); event.stopPropagation(); });
+  dispatch('keyup');
+  assert.deepEqual(calls, []);
+});
+
+test('the upstream Visualizer keeps Space for its hand tool without toggling host playback', async () => {
+  const { VisualizerEditor } = await assetModule('js/visualizer/visualizer-editor.js');
+  const { calls, dispatch } = await spaceKeyFixture();
+  const stage = { tagName: 'DIV' };
+  let handTool = false;
+  const editor = { open: true, view: { stage }, setHandTool(value) { handTool = value; } };
+  const event = dispatch('keydown', { target: stage }, value =>
+    VisualizerEditor.prototype.onStageKeyDown.call(editor, value));
+  assert.equal(handTool, true);
+  assert.equal(event.defaultPrevented, true);
+  dispatch('keyup', { target: stage });
+  assert.deepEqual(calls, []);
+});
+
+test('Space forwarding preserves Shift, ignores composition and modified shortcuts, and balances focus changes', async () => {
+  const { calls, dispatch } = await spaceKeyFixture();
+  for (const options of [{ ctrlKey: true }, { altKey: true }, { metaKey: true },
+    { isComposing: true }, { keyCode: 229 }, { key: 'Enter' }]) {
+    assert.equal(dispatch('keydown', options).defaultPrevented, false);
+    dispatch('keyup', options);
+  }
+  dispatch('keydown', { isTrusted: false });
+  dispatch('keyup', { isTrusted: false });
+  dispatch('keydown', { repeat: true });
+  dispatch('keyup');
+  assert.deepEqual(calls, []);
+  assert.equal(dispatch('keydown', { key: 'Spacebar', shiftKey: true }).defaultPrevented, true);
+  dispatch('keyup', { target: { tagName: 'INPUT', type: 'text' }, ctrlKey: true, shiftKey: true });
+  assert.deepEqual(calls, [{ down: true, shift: true }, { down: false, shift: true }]);
+  dispatch('keydown');
+  dispatch('blur');
+  dispatch('keyup');
+  assert.deepEqual(calls.slice(2), [{ down: true, shift: false }, { down: false, shift: false }]);
+});
+
 test('shared history snapshots and restoration retain native logical plugin IDs', async () => {
   const { HistoryManager } = await assetModule('js/ui/pipeline/history-manager.js');
   const previousWindow = globalThis.window;

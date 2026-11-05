@@ -68,6 +68,7 @@ if (!backupArchive.includes("new URL('../vendor/jszip-3.10.2.min.js', import.met
 const requiredFiles = [
   'vst-bootstrap.js',
   'vst-audio-manager.js',
+  'vst-space-key.js',
   'css/effetune.css',
   'css/effetune-theme.css',
   'css/effetune-library.css',
@@ -188,6 +189,10 @@ if (!bootstrap.includes('const needsHomeKeyForEditing = target => {') ||
 }
 if (!app.includes("../vst-audio-manager.js")) {
   throw new Error('The application module was not redirected to the VST audio adapter');
+}
+if (!app.includes("import { installVstSpaceKeyHandler } from '../vst-space-key.js';") ||
+    !app.includes('installVstSpaceKeyHandler();') || app.includes('installSpaceKeyGuard();')) {
+  throw new Error('The application must route unused Space through the VST host bridge');
 }
 if (!startup.includes("import('./app.js')")) {
   throw new Error('The startup module no longer loads the application entry');

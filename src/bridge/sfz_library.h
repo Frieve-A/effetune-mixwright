@@ -9,6 +9,8 @@
 
 namespace effetune::vst {
 
+struct RuntimeSamplePage;
+
 // Control-thread direct references. Samples remain in the user-selected folder.
 class SfzLibrary {
 public:
@@ -26,6 +28,9 @@ public:
                                     const std::filesystem::path &selectedFolder = {},
                                     const std::vector<std::filesystem::path> &selectedFiles = {});
   void closeReads();
+  [[nodiscard]] bool readSoundFontPages(std::string_view source,
+                                        std::size_t byteBudget,
+                                        std::vector<RuntimeSamplePage> &pages);
 
 private:
   struct Impl;

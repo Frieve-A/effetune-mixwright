@@ -229,9 +229,37 @@ struct ParentWindowContention {
   std::atomic_bool *childDestroyed = nullptr;
 };
 
+constexpr wchar_t kHostSpaceMessagesProperty[] = L"EffeTune.Smoke.HostSpaceMessages";
+struct HostSpaceMessages {
+  unsigned int downs = 0;
+  unsigned int ups = 0;
+  bool pressed = false;
+  bool playing = false;
+  bool valid = true;
+};
+
 LRESULT CALLBACK parentWindowProcedure(HWND window, const UINT message,
                                        const WPARAM wParam,
                                        const LPARAM lParam) {
+  if ((message == WM_KEYDOWN || message == WM_KEYUP) && wParam == VK_SPACE) {
+    auto *space = reinterpret_cast<HostSpaceMessages *>(GetPropW(window, kHostSpaceMessagesProperty));
+    if (space != nullptr) {
+      const auto down = message == WM_KEYDOWN;
+      const auto flags = static_cast<std::uint32_t>(lParam);
+      space->valid = space->valid && down != space->pressed &&
+          (flags & 0xffffu) == 1u &&
+          ((flags >> 16u) & 0xffu) == MapVirtualKeyW(VK_SPACE, MAPVK_VK_TO_VSC) &&
+          (flags >> 30u) == (down ? 0u : 3u);
+      space->pressed = down;
+      if (down) {
+        ++space->downs;
+        space->playing = !space->playing;
+      } else {
+        ++space->ups;
+      }
+      return 0;
+    }
+  }
   if (message == WM_PARENTNOTIFY && LOWORD(wParam) == WM_DESTROY) {
     auto *contention = reinterpret_cast<ParentWindowContention *>(
         GetWindowLongPtrW(window, GWLP_USERDATA));
@@ -1045,6 +1073,7 @@ int main(const int argc, char **argv) {
   bool hiddenTelemetryDiscarded = false;
   bool contextMenuDisabled = false;
   bool homeKeyReservedForHost = false;
+  bool spaceKeyRoutingValid = false;
   bool clipboardReachable = false;
   bool libraryEntriesDisabled = false;
   bool headerControlsAreVstSpecific = false;
@@ -1424,6 +1453,80 @@ int main(const int argc, char **argv) {
               return correct && downstreamCalls === 16;
             })())JS",
             ignored) && ignored == "true";
+
+        HostSpaceMessages hostSpace;
+        const auto observingHostSpace = SetPropW(parent, kHostSpaceMessagesProperty, &hostSpace) != FALSE;
+        const auto spaceBridgeStarted = observingHostSpace && evaluate(
+            R"JS((() => {
+              window.__vstSmokeSpaceBridge = { done: false, responses: [], error: '' };
+              void (async () => {
+                const result = window.__vstSmokeSpaceBridge;
+                try {
+                  result.responses.push(await window.vst_forwardHostSpace('down', false));
+                  result.responses.push(await window.vst_forwardHostSpace(true));
+                  for (let press = 0; press < 2; ++press) {
+                    result.responses.push(await window.vst_forwardHostSpace(true, false));
+                    result.responses.push(await window.vst_forwardHostSpace(false, false));
+                  }
+                } catch (error) {
+                  result.error = String(error);
+                } finally {
+                  result.done = true;
+                }
+              })();
+              return true;
+            })())JS", ignored) && ignored == "true";
+        const auto spaceBridgeCompleted = spaceBridgeStarted && waitForJavascript(
+            "(window.__vstSmokeSpaceBridge?.done === true)", kCompletionTimeout);
+        const auto spaceBridgeAccepted = evaluate(
+            "JSON.stringify(window.__vstSmokeSpaceBridge?.responses) === "
+            "'[false,false,true,true,true,true]'", ignored) && ignored == "true";
+        const auto spaceDefaultsValid = evaluate(
+            R"JS((() => {
+              let correct = true;
+              window.__vstSmokeSpaceDefaults = [];
+              for (const [tag, type, needsSpace] of [
+                ['div', '', false], ['input', 'range', false], ['input', 'text', true],
+                ['input', 'checkbox', true], ['button', '', true], ['textarea', '', true],
+                ['select', '', true], ['summary', '', true]
+              ]) {
+                const target = document.createElement(tag);
+                if (type) target.type = type;
+                if (tag === 'select') target.appendChild(new Option('Space key fixture', 'test'));
+                document.body.appendChild(target);
+                const event = new KeyboardEvent('keydown', {
+                  key: ' ', code: 'Space', bubbles: true, cancelable: true
+                });
+                target.dispatchEvent(event);
+                window.__vstSmokeSpaceDefaults.push({ tag, type, needsSpace, prevented: event.defaultPrevented });
+                // The shared select adapter consumes Space to open its list.
+                correct &&= tag === 'select'
+                  ? event.defaultPrevented && target.getAttribute('aria-expanded') === 'true'
+                  : event.defaultPrevented === !needsSpace;
+                if (tag === 'select') {
+                  target.dispatchEvent(new KeyboardEvent('keydown', {
+                    key: 'Escape', bubbles: true, cancelable: true
+                  }));
+                }
+                target.remove();
+              }
+              return correct;
+            })())JS", ignored) && ignored == "true";
+        pumpMessages();
+        spaceKeyRoutingValid = spaceBridgeCompleted && spaceBridgeAccepted && spaceDefaultsValid && hostSpace.valid &&
+            hostSpace.downs == 2 && hostSpace.ups == 2 && !hostSpace.pressed && !hostSpace.playing;
+        if (!spaceKeyRoutingValid) {
+          (void)evaluate("JSON.stringify(window.__vstSmokeSpaceBridge)", ignored);
+          std::cerr << "Host Space diagnostics: observing=" << observingHostSpace
+                    << ", started=" << spaceBridgeStarted << ", completed=" << spaceBridgeCompleted
+                    << ", accepted=" << spaceBridgeAccepted
+                    << ", defaults=" << spaceDefaultsValid << ", downs=" << hostSpace.downs
+                    << ", ups=" << hostSpace.ups << ", flags=" << hostSpace.valid
+                    << ", bridge=" << ignored << '\n';
+          (void)evaluate("JSON.stringify(window.__vstSmokeSpaceDefaults)", ignored);
+          std::cerr << "Host Space defaults: " << ignored << '\n';
+        }
+        (void)RemovePropW(parent, kHostSpaceMessagesProperty);
 
         clipboardReachable = evaluate(
             "(() => !!document.getElementById('pasteButton') && "
@@ -2753,6 +2856,10 @@ int main(const int argc, char **argv) {
     std::cerr << "Home remains reachable outside editable VST WebView controls\n";
     return 1;
   }
+  if (!spaceKeyRoutingValid) {
+    std::cerr << "Space did not retain UI defaults and deliver balanced host key messages\n";
+    return 1;
+  }
   if (!clipboardReachable) {
     std::cerr << "Normal pipeline clipboard paste is not reachable\n";
     return 1;
@@ -2874,7 +2981,7 @@ int main(const int argc, char **argv) {
   }
   std::cout << "EffeTune WebView exercised AM Radio HUD state, telemetry resume, history "
             "restore, A/B routing, "
-               "unavailable-state warning, host Home shortcut, clipboard, excluded library, "
+               "unavailable-state warning, host Home/Space shortcuts, clipboard, excluded library, "
                "context, language, "
                "Room EQ measurement import, About notices, external links, bypass, and editor "
                "reattachment\n";

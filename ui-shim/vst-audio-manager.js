@@ -745,20 +745,22 @@ class NativePort {
     const current = () => !this.spectrumClosed && this.owner.getCurrentPipeline().includes(plugin) &&
       plugin.getWasmAssetOperationRevision(target.slot) === target.operationRevision;
     let preload;
+    let nativeSf2;
     if (streamed) {
       if (!current()) throw new Error('The instrument selection changed.');
       const descriptor = plugin.getWasmAssetRevisionDescriptor(target.slot, target.operationRevision,
         message.replayEpoch, this.owner.nativeNode);
       if (!descriptor?.sampleProviderFactory) throw new Error('Instrument samples are unavailable. Reload the instrument.');
       metadata.streamGeneration = ++this.nextStreamGeneration;
+      nativeSf2 = tableVersion === SF2_TABLE_VERSION ? descriptor.sampleProviderFactory.nativeSf2 : null;
       preload = async () => {
-        await this.preloadPluginSamples(descriptor, target, metadata.streamGeneration,
+        if (!nativeSf2) await this.preloadPluginSamples(descriptor, target, metadata.streamGeneration,
           header.getUint32(88, true), current, progress => plugin.onSfzPreparationProgress?.({ ...progress,
             operationRevision: target.operationRevision, replayEpoch: message.replayEpoch ?? null }));
         if (!current()) throw new Error('The instrument selection changed.');
       };
     }
-    const result = await this.uploadPluginAsset(metadata, payload, target, preload);
+    const result = await this.uploadPluginAsset(metadata, payload, target, preload, nativeSf2, current);
     const resident = {
       pluginId: message.pluginId,
       slot: message.slot >>> 0,
@@ -772,7 +774,7 @@ class NativePort {
     if (plugin?._midiMeteringDesired) this.owner.setSoundFontMidiMetering?.(plugin, true);
   }
 
-  async uploadPluginAsset(metadata, payload, target, preload) {
+  async uploadPluginAsset(metadata, payload, target, preload, nativeSf2, current) {
     await window.__effetuneHostCall('pipeline/assetBegin', metadata);
     try {
       for (let offset = 0; offset < payload.byteLength; offset += ASSET_CHUNK_BYTES) {
@@ -780,7 +782,17 @@ class NativePort {
         await window.__effetuneHostCall('pipeline/assetChunk', { ...target, offset, data: encodeBase64(chunk) });
       }
       await preload?.();
-      return await window.__effetuneHostCall('pipeline/assetCommit', target);
+      if (!nativeSf2) return await window.__effetuneHostCall('pipeline/assetCommit', target);
+      const { samples, ...source } = nativeSf2;
+      const opened = await window.__effetuneHostCall('sfz/openRead', { ...source, maxBytes: 1024 ** 3 });
+      const readId = opened?.data?.readId;
+      if (!readId) throw new Error('The SoundFont source is unavailable or has changed. Reload the instrument.');
+      try {
+        if (!current()) throw new Error('The instrument selection changed.');
+        return await window.__effetuneHostCall('pipeline/assetCommit', { ...target, nativeSf2: { readId, samples } });
+      } finally {
+        await window.__effetuneHostCall('sfz/closeRead', { readId }).catch(noop);
+      }
     } catch (error) {
       await window.__effetuneHostCall('pipeline/assetCancel', target).catch(noop);
       throw error;

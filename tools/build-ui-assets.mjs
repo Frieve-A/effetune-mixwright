@@ -97,6 +97,8 @@ await cp(path.join(projectRoot, 'ui-shim', 'vst-bootstrap.js'),
          path.join(output, 'vst-bootstrap.js'));
 await cp(path.join(projectRoot, 'ui-shim', 'vst-audio-manager.js'),
          path.join(output, 'vst-audio-manager.js'));
+await cp(path.join(projectRoot, 'ui-shim', 'vst-space-key.js'),
+         path.join(output, 'vst-space-key.js'));
 await mkdir(path.join(output, 'features', 'measurement'), { recursive: true });
 await cp(path.join(source, 'features', 'measurement', 'dataStorage.js'),
          path.join(output, 'features', 'measurement', 'dataStorage.js'));
@@ -170,6 +172,16 @@ const remoteStartup = `            // LAN remote control (remote-v1); does nothi
 `;
 if (app.split(remoteStartup).length !== 2) throw new Error('Unable to locate excluded remote startup');
 app = app.replace(remoteStartup, '');
+const standaloneMidiStartup = /        const midiInputKey = window\.audioPreferences\?\.midiInputDeviceKey[\s\S]*?\n        \}\n/;
+if (!standaloneMidiStartup.test(app)) throw new Error('Unable to locate the standalone MIDI device startup');
+app = app.replace(standaloneMidiStartup, '');
+const spaceGuardImport = "import { installSpaceKeyGuard } from './utils/space-key-guard.js';";
+if (app.split(spaceGuardImport).length !== 2 || app.split('installSpaceKeyGuard();').length !== 2) {
+  throw new Error('Unable to locate the upstream Space key guard installation');
+}
+app = app.replace(spaceGuardImport,
+  "import { installVstSpaceKeyHandler } from '../vst-space-key.js';")
+  .replace('installSpaceKeyGuard();', 'installVstSpaceKeyHandler();');
 const libraryConstantsImport = `import { normalizeMusicLibraryStartupView } from './library/constants.js';`;
 if (!app.includes(libraryConstantsImport)) {
   throw new Error('Unable to locate the music-library constants import');
@@ -1194,7 +1206,8 @@ const requiredPages = `    const required = [];
         required.push(Object.freeze({ sample, pageIndex }));
     const minimum = storage ? maximumPlan.minimumSlots : required.length + 1;`;
 const providerPreload = '        await provider.preload(required);';
-for (const pattern of [residentRanges, buildStreamedBank, requiredPages, providerPreload]) {
+const providerReady = '    descriptor.materializeForContext = async (context, nextBudget, nextEstimate) => {';
+for (const pattern of [residentRanges, buildStreamedBank, requiredPages, providerPreload, providerReady]) {
   if (streamedBank.split(pattern).length !== 2) throw new Error('Unable to configure a fully resident native instrument');
 }
 streamedBank = streamedBank.replace(residentRanges, `    const ranges = storage ? sfzResidentRanges(parsed.regions, samples, new Set(paths))
@@ -1206,6 +1219,23 @@ ${buildStreamedBank}
     if (budget < 1) throw sfzError('too-large', 'The instrument exceeds the SoundFont memory limit.');`)
   .replace(requiredPages, `    const required = factory.samples.reduce((count, sample) => count + Math.ceil(sample.frames / 4096), 0);
     const minimum = storage ? maximumPlan.minimumSlots : required + 1;`)
-  .replace(providerPreload, '        // Mixwright uploads all resident pages in bounded batches before native commit.');
+  .replace(providerPreload, '        // Mixwright prepares the full resident bank before native commit.')
+  .replace(buildStreamedBank, `  // Reuse upstream's validated PCM offsets and source revision for native SF2 reads.
+  let nativeSf2 = null;
+  if (parsed.modulation?.format === 'sf2' && paths.every(path => readers.has(path))) {
+    const sources = await Promise.all(paths.map(path => readers.get(path)));
+    const source = sources[0]?.rangeSource;
+    if (source?.kind === 'protected' && /\\.sf2$/i.test(source.relativePath) && sources.every(reader =>
+      reader.pcm?.format === 'sf2-pcm' && reader.rangeSource === source)) {
+      nativeSf2 = {
+        id: source.bankId, relativePath: source.relativePath, revision: source.revision,
+        samples: sources.map(({ pcm }) => [pcm.dataOffset, pcm.frames, pcm.lowByteOffset])
+      };
+    }
+  }
+${buildStreamedBank}`)
+  .replace(providerReady, `    // Runtime factories survive PluginBase asset replay.
+    if (nativeSf2) descriptor.sampleProviderFactory.nativeSf2 = nativeSf2;
+${providerReady}`);
 await writeFile(streamedBankPath, streamedBank, 'utf8');
 await writeFile(path.join(output, '.stamp'), `${productName} WebView assets\n`, 'utf8');

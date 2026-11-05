@@ -898,6 +898,57 @@ struct WebViewGeneration : public std::enable_shared_from_this<WebViewGeneration
     replaceWebViewOnOwner();
   }
 
+  [[nodiscard]] bool forwardHostSpaceOnOwner(const bool down, const bool shift) noexcept {
+    if (!ownsCurrentThread() || owner == nullptr || parent == nullptr ||
+        retiring.load(std::memory_order_acquire)) {
+      return false;
+    }
+#if defined(_WIN32)
+    (void)shift; // The host reads modifiers from the thread's keyboard state.
+    const auto window = static_cast<HWND>(parent);
+    const auto scanCode = MapVirtualKeyW(VK_SPACE, MAPVK_VK_TO_VSC);
+    const auto flags = 1u | (scanCode << 16u) | (down ? 0u : 0xc0000000u);
+    // Posting through the host's message loop also reaches its accelerators.
+    return IsWindow(window) != FALSE &&
+           PostMessageW(window, down ? WM_KEYDOWN : WM_KEYUP, VK_SPACE,
+                        static_cast<LPARAM>(flags)) != FALSE;
+#elif defined(__APPLE__)
+    using SendId = id (*)(id, SEL);
+    using SendInteger = std::int64_t (*)(id, SEL);
+    using SendDouble = double (*)(id, SEL);
+    const auto window = reinterpret_cast<SendId>(objc_msgSend)(
+        static_cast<id>(parent), sel_registerName("window"));
+    if (window == nullptr) return false;
+    const auto windowNumber = reinterpret_cast<SendInteger>(objc_msgSend)(
+        window, sel_registerName("windowNumber"));
+    const auto processInfo = reinterpret_cast<SendId>(objc_msgSend)(
+        reinterpret_cast<id>(objc_getClass("NSProcessInfo")), sel_registerName("processInfo"));
+    const auto timestamp = reinterpret_cast<SendDouble>(objc_msgSend)(
+        processInfo, sel_registerName("systemUptime"));
+    using MakeString = id (*)(id, SEL, const char *);
+    const auto space = reinterpret_cast<MakeString>(objc_msgSend)(
+        reinterpret_cast<id>(objc_getClass("NSString")), sel_registerName("stringWithUTF8String:"), " ");
+    using MakeKeyEvent = id (*)(id, SEL, std::uint64_t, CGPoint, std::uint64_t,
+                               double, std::int64_t, id, id, id, bool, unsigned short);
+    const auto event = reinterpret_cast<MakeKeyEvent>(objc_msgSend)(
+        reinterpret_cast<id>(objc_getClass("NSEvent")),
+        sel_registerName("keyEventWithType:location:modifierFlags:timestamp:windowNumber:"
+                         "context:characters:charactersIgnoringModifiers:isARepeat:keyCode:"),
+        down ? 10u : 11u, CGPoint{}, shift ? (1ull << 17u) : 0u,
+        timestamp, windowNumber, nullptr, space, space, false, 49);
+    if (event == nullptr) return false;
+    using SendEvent = void (*)(id, SEL, id);
+    // Resume the responder chain at the host view, beyond the WebView.
+    reinterpret_cast<SendEvent>(objc_msgSend)(
+        static_cast<id>(parent), sel_registerName(down ? "keyDown:" : "keyUp:"), event);
+    return true;
+#else
+    (void)down;
+    (void)shift;
+    return false;
+#endif
+  }
+
   [[nodiscard]] bool evaluateOnOwner(
       std::string script, WebViewHost::EvaluationHandler completion) {
     if (!ownsCurrentThread() || webView == nullptr || !webView->isReady() ||
@@ -1299,6 +1350,16 @@ namespace {
 void configureWebView(choc::ui::WebView &view,
                       const std::weak_ptr<WebViewHostState> &weakState,
                       const std::weak_ptr<WebViewGeneration> &weakGeneration) {
+  view.bind("vst_forwardHostSpace", [weakState, weakGeneration](
+                                      const choc::value::ValueView &arguments) {
+    const auto state = weakState.lock();
+    const auto generation = weakGeneration.lock();
+    const auto valid = state != nullptr && !state->stopping.load(std::memory_order_acquire) &&
+        generation != nullptr && arguments.isArray() && arguments.size() == 2 &&
+        arguments[0].isBool() && arguments[1].isBool();
+    return choc::value::Value(valid && generation->forwardHostSpaceOnOwner(
+        arguments[0].getBool(), arguments[1].getBool()));
+  });
   view.bind("vst_hostMessage", [weakState, weakGeneration](
                                    const choc::value::ValueView &arguments) {
     const auto state = weakState.lock();

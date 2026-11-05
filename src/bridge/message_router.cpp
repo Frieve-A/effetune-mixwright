@@ -669,6 +669,16 @@ bool MessageRouter::decode(const std::string_view json, RoutedUiMessage &message
       if (!decodeAssetIdentity(payload, decoded, error, true)) {
         return false;
       }
+      const auto nativeSf2 = payload["nativeSf2"];
+      if (!nativeSf2.isVoid()) {
+        const auto samples = nativeSf2["samples"];
+        if (!nativeSf2.isObject() || !samples.isArray() || samples.size() == 0 ||
+            samples.size() > 10000u) {
+          setError(error, "SoundFont source geometry is invalid");
+          return false;
+        }
+        decoded.content = choc::json::toString(nativeSf2);
+      }
     } else if (type == "pipeline/assetClear") {
       decoded.action = UiAction::clearPluginAsset;
       if (!decodeAssetIdentity(payload, decoded, error, false)) {

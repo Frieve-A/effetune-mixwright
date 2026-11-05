@@ -1,4 +1,5 @@
 #include "bridge/sfz_library.h"
+#include "engine/engine_host.h"
 #include <choc/memory/choc_Base64.h>
 #include <choc/text/choc_JSON.h>
 #include <algorithm>
@@ -222,6 +223,54 @@ void testSoundFontReadRevision(const fs::path &directory) {
   expect(!call(library, "openRead", request(id, "private.txt"))["ok"].getBool(),
          "a SoundFont reference cannot read a different file in the same folder");
 }
+void testNativeSoundFontPages(const fs::path &directory) {
+  using effetune::vst::EngineHost;
+  using effetune::vst::RuntimeSamplePage;
+  const auto root = directory / "native-soundfont";
+  const auto path = root / "bank.sf2";
+  constexpr auto frames = EngineHost::kSamplePageFrames + 1;
+  std::string pcm(frames * 3u, '\0');
+  pcm[1] = static_cast<char>(0x80);
+  pcm[2] = static_cast<char>(0xff);
+  pcm[3] = static_cast<char>(0x7f);
+  pcm[2u * frames - 1u] = 64;
+  pcm[2u * frames] = static_cast<char>(0xff);
+  write(path, pcm);
+  SfzLibrary library(directory / "native-soundfont-registry/references.json");
+  const auto bank = selectFolder(library, root);
+  auto open = request(bank[0]["id"].getString(), "bank.sf2");
+  const auto initial = call(library, "openRead", open);
+  open.addMember("revision", initial["data"]["revision"]);
+  const auto versioned = call(library, "openRead", open);
+  auto source = choc::value::createObject({});
+  source.addMember("readId", versioned["data"]["readId"]);
+  source.addMember("samples", choc::json::parse("[[0,4097,8194],[0,2,null]]"));
+  const auto payload = choc::json::toString(source);
+  std::vector<RuntimeSamplePage> pages;
+  expect(library.readSoundFontPages(payload, 65536, pages) && pages.size() == 3,
+         "read both SF2 PCM formats into resident pages");
+  expect(pages[0].sample == 0 && pages[0].index == 0 && pages[0].channels == 1 &&
+         pages[0].flags == 1 && pages[0].frames == frames - 1 &&
+         pages[0].pcm[0] == -1.0f + 255.0f / 8388608.0f &&
+         pages[0].pcm[1] == 32767.0f / 32768.0f,
+         "decode little-endian signed PCM and unsigned low byte");
+  expect(pages[1].sample == 0 && pages[1].index == 1 && pages[1].frames == 1 &&
+         pages[1].pcm[0] == 0.5f && pages[2].sample == 1 && pages[2].pcm[0] == -1.0f,
+         "retain sample indices and short final pages");
+  expect(!library.readSoundFontPages(payload, 100, pages) && pages.size() == 3,
+         "reject over-budget decode without replacing existing pages");
+  source.setMember("samples", choc::json::parse("[[0,4097,8195]]"));
+  expect(!library.readSoundFontPages(choc::json::toString(source), 65536, pages),
+         "reject low bytes beyond the admitted file");
+  source.setMember("readId", initial["data"]["readId"]);
+  source.setMember("samples", choc::json::parse("[[0,2,null]]"));
+  expect(!library.readSoundFontPages(choc::json::toString(source), 65536, pages),
+         "reject a read session without a pinned revision");
+  write(path, "changed");
+  expect(!library.readSoundFontPages(payload, 65536, pages) && pages.size() == 3,
+         "reject a changed source without replacing existing pages");
+}
+
 void testConcurrent(const fs::path &directory) {
   const auto registry = directory / "concurrent/sfz-references.json";
   const auto a = directory / "a", b = directory / "b";
@@ -383,7 +432,8 @@ int main(int argc, char **argv) {
       std::chrono::steady_clock::now().time_since_epoch().count()));
   try {
     fs::create_directories(directory); directory = fs::canonical(directory);
-    testLibrary(directory); testSelectedFilesAndLegacyMetadata(directory); testSoundFontReadRevision(directory); testConcurrent(directory);
+    testLibrary(directory); testSelectedFilesAndLegacyMetadata(directory); testSoundFontReadRevision(directory);
+    testNativeSoundFontPages(directory); testConcurrent(directory);
     testConcurrentProcesses(directory, fs::canonical(fs::absolute(argv[0])));
     fs::remove_all(directory);
     std::cout << "SFZ direct-reference tests passed\n"; return 0;

@@ -52,6 +52,14 @@ The main build artifacts are:
 - Headless host: `build/windows-release/src/tools/effetune-headless.exe`
 - WebView assets: `build/windows-release/webview-assets`
 
+## Keyboard Shortcuts
+
+Space is passed to the host unless a focused control needs it or the UI handles
+it, such as the Visualizer's Space+drag hand tool. Browser page scrolling remains
+suppressed. Holding Space sends a single press to the host, followed by its
+release, so key repeat does not repeatedly toggle playback. Text entry, control
+activation, composition, and Ctrl/Alt/Meta shortcuts retain their UI behavior.
+
 ## Windows Editor Startup
 
 WebView resources retain extended path prefixes and use native path separators,

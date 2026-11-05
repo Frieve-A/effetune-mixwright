@@ -1,4 +1,5 @@
 #include "bridge/sfz_library.h"
+#include "engine/engine_host.h"
 
 #include <choc/memory/choc_Base64.h>
 #include <choc/text/choc_JSON.h>
@@ -16,6 +17,8 @@
 #include <cinttypes>
 #include <map>
 #include <mutex>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <vector>
 
@@ -275,6 +278,7 @@ struct ReadFile {
 #endif
   std::uint64_t size = 0;
   std::string expectedRevision;
+  bool soundFontPcm = false;
 
   std::string revision() const {
     std::uint64_t device = 0, identity = 0, modified = 0, bytes = 0;
@@ -353,28 +357,50 @@ struct ReadFile {
 #endif
     return true;
   }
-  std::string read(std::uint64_t offset, std::size_t length) {
-    verifyRevision();
-    std::vector<char> bytes(length);
+  void readBytes(std::uint64_t offset, std::span<std::uint8_t> bytes) {
     std::size_t done = 0;
 #if defined(_WIN32)
     LARGE_INTEGER position{}; position.QuadPart = static_cast<LONGLONG>(offset);
     require(SetFilePointerEx(handle, position, nullptr, FILE_BEGIN) != 0, "SFZ source seek failed");
 #endif
-    while (done < length) {
+    while (done < bytes.size()) {
 #if defined(_WIN32)
       DWORD count = 0;
-      require(::ReadFile(handle, bytes.data() + done, static_cast<DWORD>(length - done),
+      require(::ReadFile(handle, bytes.data() + done, static_cast<DWORD>(bytes.size() - done),
                        &count, nullptr) != 0 && count > 0, "SFZ source changed while reading");
 #else
-      const auto count = pread(handle, bytes.data() + done, length - done,
+      const auto count = pread(handle, bytes.data() + done, bytes.size() - done,
                                static_cast<off_t>(offset + done));
       require(count > 0, "SFZ source changed while reading");
 #endif
       done += static_cast<std::size_t>(count);
     }
+  }
+
+  std::string read(std::uint64_t offset, std::size_t length) {
+    verifyRevision();
+    std::vector<std::uint8_t> bytes(length);
+    readBytes(offset, bytes);
     verifyRevision();
     return choc::base64::encodeToString(bytes);
+  }
+};
+
+struct PcmReadWindow {
+  std::vector<std::uint8_t> bytes;
+  std::uint64_t start = 0;
+
+  std::span<const std::uint8_t> read(ReadFile &file, std::uint64_t offset, std::size_t length) {
+    if (offset < start || offset - start > bytes.size() ||
+        length > bytes.size() - (offset - start)) {
+      // One window covers many adjacent sample pages and amortizes system calls.
+      constexpr std::size_t readAhead = 256u * 1024u;
+      start = offset;
+      bytes.resize(static_cast<std::size_t>(
+          std::min<std::uint64_t>(file.size - offset, readAhead)));
+      file.readBytes(start, bytes);
+    }
+    return std::span(bytes).subspan(static_cast<std::size_t>(offset - start), length);
   }
 };
 } // namespace
@@ -506,6 +532,7 @@ struct SfzLibrary::Impl {
     auto file = std::make_unique<ReadFile>();
     if (!file->open(path, root)) return {};
     if (file->size > limit) throw TooLarge();
+    file->soundFontPcm = instrumentExtension(found->path) == ".sf2";
     const auto revision = file->revision();
     const auto requestedRevision = payload["revision"];
     if (!requestedRevision.isVoid()) {
@@ -524,6 +551,88 @@ struct SfzLibrary::Impl {
 SfzLibrary::SfzLibrary(fs::path registryPath) : impl_(std::make_unique<Impl>(std::move(registryPath))) {}
 SfzLibrary::~SfzLibrary() = default;
 void SfzLibrary::closeReads() { std::scoped_lock lock(impl_->mutex); impl_->reads.clear(); }
+bool SfzLibrary::readSoundFontPages(std::string_view source, std::size_t byteBudget,
+                                    std::vector<RuntimeSamplePage> &pages) {
+  try {
+    const auto request = choc::json::parse(source);
+    const auto readId = identifier(request, "readId");
+    const auto samples = request["samples"];
+    require(samples.isArray() && samples.size() > 0 && samples.size() <= entryLimit,
+            "Invalid SoundFont sample list");
+    std::scoped_lock lock(impl_->mutex);
+    const auto found = impl_->reads.find(readId);
+    require(found != impl_->reads.end() && found->second->soundFontPcm &&
+            !found->second->expectedRevision.empty(), "Invalid SoundFont read session");
+    auto &file = *found->second;
+    file.verifyRevision();
+
+    struct Range {
+      std::uint64_t high;
+      std::uint64_t frames;
+      std::optional<std::uint64_t> low;
+    };
+    std::vector<Range> ranges;
+    ranges.reserve(samples.size());
+    constexpr auto pageFrames = EngineHost::kSamplePageFrames;
+    std::uint64_t pageCount = 0, pcmBytes = 0;
+    for (std::uint32_t i = 0; i < samples.size(); ++i) {
+      const auto row = samples[i];
+      require(row.isArray() && row.size() == 3 && row[0].isInt() && row[1].isInt(),
+              "Invalid SoundFont sample range");
+      const auto high = row[0].getInt64();
+      const auto frames = row[1].getInt64();
+      require(high >= 0 && frames > 0 && static_cast<std::uint64_t>(high) <= file.size &&
+              static_cast<std::uint64_t>(frames) <= (file.size - high) / 2u,
+              "SoundFont sample exceeds source");
+      Range range{static_cast<std::uint64_t>(high), static_cast<std::uint64_t>(frames), {}};
+      if (!row[2].isVoid()) {
+        const auto low = row[2].getWithDefault<std::int64_t>(-1);
+        require(row[2].isInt() && low >= 0 && static_cast<std::uint64_t>(low) <= file.size &&
+                range.frames <= file.size - low, "SoundFont low bytes exceed source");
+        range.low = static_cast<std::uint64_t>(low);
+      }
+      ranges.push_back(range);
+      pageCount += (range.frames + pageFrames - 1u) / pageFrames;
+      pcmBytes += range.frames * sizeof(float);
+      if (pageCount > EngineHost::kMaxSamplePages ||
+          pcmBytes + pageCount * sizeof(RuntimeSamplePage) > byteBudget) throw TooLarge();
+    }
+
+    std::vector<RuntimeSamplePage> prepared;
+    prepared.reserve(static_cast<std::size_t>(pageCount));
+    PcmReadWindow highWindow, lowWindow;
+    for (std::uint32_t sample = 0; sample < ranges.size(); ++sample) {
+      const auto &range = ranges[sample];
+      for (std::uint64_t first = 0; first < range.frames; first += pageFrames) {
+        const auto frames = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(pageFrames, range.frames - first));
+        const auto high = highWindow.read(file, range.high + first * 2u, frames * 2u);
+        const auto low = range.low ? lowWindow.read(file, *range.low + first, frames)
+                                   : std::span<const std::uint8_t>{};
+        auto &page = prepared.emplace_back();
+        page.index = first / pageFrames;
+        page.sample = sample;
+        page.frames = frames;
+        page.channels = 1;
+        page.flags = 1;
+        page.pcm.resize(frames);
+        for (std::size_t i = 0; i < frames; ++i) {
+          const auto upper = static_cast<std::int8_t>(high[2u * i + 1u]);
+          const auto value = static_cast<int>(upper) * 256 + high[2u * i];
+          page.pcm[i] = low.empty() ? static_cast<float>(value) * (1.0f / 32768.0f)
+                                    : static_cast<float>(value * 256 + low[i]) * (1.0f / 8388608.0f);
+        }
+      }
+    }
+    file.verifyRevision();
+    pages = std::move(prepared);
+    return true;
+  } catch (const std::exception &error) {
+    std::fprintf(stderr, "Native SoundFont sample diagnostic: %s\n", error.what());
+    return false;
+  }
+}
+
 std::string SfzLibrary::request(std::string_view operation, std::string_view payload,
                                 const fs::path &selectedFolder,
                                 const std::vector<fs::path> &selectedFiles) {

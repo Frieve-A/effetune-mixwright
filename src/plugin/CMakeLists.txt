@@ -46,6 +46,7 @@ add_custom_command(
     "${PROJECT_SOURCE_DIR}/tools/build-ui-assets.mjs"
     "${PROJECT_SOURCE_DIR}/ui-shim/vst-bootstrap.js"
     "${PROJECT_SOURCE_DIR}/ui-shim/vst-audio-manager.js"
+    "${PROJECT_SOURCE_DIR}/ui-shim/vst-space-key.js"
     "${PROJECT_SOURCE_DIR}/ui-shim/vendor/jszip-3.10.2.min.js"
     "${PROJECT_SOURCE_DIR}/THIRD-PARTY-NOTICES.txt"
     ${effetune_ui_source_files}

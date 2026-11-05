@@ -255,6 +255,53 @@ test('streamed instruments pin every sample page before commit and cancel reject
   assert.equal(closed, 2);
 });
 
+test('native SF2 loads the pinned source in one commit and closes the session on failure', async () => {
+  const { context, hostCalls, node, port } = createNativePort();
+  const payload = new ArrayBuffer(104);
+  const header = new DataView(payload);
+  header.setUint32(0, 0x31415445, true);
+  header.setUint32(32, 0x53465a, true);
+  header.setUint32(36, SF2_TABLE_VERSION, true);
+  const source = { id: 'a'.repeat(24), relativePath: 'Bank.sf2', revision: 'pinned',
+    samples: [[256, 100000, null], [200256, 200, 300000]] };
+  const sampleProviderFactory = Object.assign(() => assert.fail('PCM must stay native'), { nativeSf2: source });
+  vm.runInNewContext(`${pluginBaseSource}
+    this.plugin = new (class extends PluginBase {}); this.plugin.id = 17;`, context);
+  const { plugin } = context;
+  port.owner.pipelineA = [plugin];
+  port.owner.nativeNode = node;
+  plugin.setWasmAssetTargetResolver(() => [node]);
+  let fail = false;
+  const readId = 'b'.repeat(24);
+  context.window.__effetuneHostCall = async (type, payload) => {
+    hostCalls.push({ type, payload });
+    if (type === 'sfz/openRead') return { ok: true, data: { readId } };
+    if (type === 'pipeline/assetCommit') {
+      if (fail) throw new Error('The source changed');
+      return { ok: true, state: 3 };
+    }
+    return { ok: true };
+  };
+  const send = async () => {
+    plugin.setWasmAsset(0, { payload, footprintBytes: 4096, sampleProviderFactory });
+    await new Promise(resolve => setImmediate(resolve));
+    await Promise.all(port.assetOperations.values());
+  };
+  await send();
+  assert.deepEqual(hostCalls.map(({ type }) => type),
+    ['pipeline/assetBegin', 'pipeline/assetChunk', 'sfz/openRead', 'pipeline/assetCommit', 'sfz/closeRead']);
+  const { samples, ...grant } = source;
+  assert.deepEqual(JSON.parse(JSON.stringify(hostCalls[2].payload)), { ...grant, maxBytes: 1024 ** 3 });
+  assert.deepEqual(JSON.parse(JSON.stringify(hostCalls[3].payload.nativeSf2)), { readId, samples });
+  assert.equal(plugin._wasmAssetStates.get(0) & 255, 3);
+  fail = true;
+  await send();
+  assert.deepEqual(hostCalls.map(({ type }) => type).filter(type => type !== 'pipeline/assetState').slice(-2),
+    ['sfz/closeRead', 'pipeline/assetCancel']);
+  port.close();
+  plugin.cleanup();
+});
+
 function installSpectrumPolling({ context, port }) {
   const start = source.indexOf('  async pollNativeTelemetryOnce()');
   const end = source.indexOf('\n  async initAudio()', start);

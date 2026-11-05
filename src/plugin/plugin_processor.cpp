@@ -4938,6 +4938,24 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
           found->second.receivedBytes != found->second.asset.payload.size()) {
         return bridgeResult(false, "DSP asset transfer is incomplete");
       }
+      if (!message.content.empty()) {
+        auto &transfer = found->second;
+        if (transfer.asset.streamGeneration == 0 || !transfer.asset.initialPages.empty())
+          return bridgeResult(false, "SoundFont source geometry is invalid.");
+        std::vector<std::uint64_t> replacedKeys;
+        std::uint64_t occupied = 0;
+        for (const auto &[pendingKey, pending] : pendingAssetTransfers_) {
+          if (pending.budget == transfer.budget) {
+            replacedKeys.push_back(pendingKey);
+            occupied += pending.asset.footprintBytes + pending.receivedPageBytes;
+          }
+        }
+        occupied += engine_.assetFootprint(transfer.budget, replacedKeys);
+        if (occupied >= transfer.budget ||
+            !sfzLibrary_.readSoundFontPages(message.content, transfer.budget - occupied,
+                                            transfer.asset.initialPages))
+          return bridgeResult(false, "The SoundFont samples could not be read. Reload the instrument.");
+      }
       asset = std::move(found->second.asset);
       requestRevision = found->second.requestRevision;
       pendingAssetTransfers_.erase(found);
