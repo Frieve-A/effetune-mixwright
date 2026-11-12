@@ -1013,6 +1013,9 @@ class NativePort {
     this.stopFrequencyPreview();
     this.spectrumClosed = true;
     this.owner.nativeSfzEffectCost?.close();
+    for (const complete of this.owner.pendingSoundFontControls?.values() ?? []) {
+      complete(undefined, new Error('The SoundFont editor closed.'));
+    }
     this.synchronizeSpectrumTaps();
     void this.postMessage({ type: 'setVisualizerSources', sources: [] });
     // The port is the only route the close itself can leave through, and the
@@ -1067,6 +1070,8 @@ export class AudioManager extends BrowserAudioManager {
     this.nowPlayingRevision = 0;
     this.nowPlayingMetadata = null;
     this.hostTransport = null;
+    this.nextSoundFontControlRequestId = 0;
+    this.pendingSoundFontControls = new Map();
     this.telemetryTimer = setInterval(() => this.pollNativeTelemetry(), 1000 / 60);
     this.nativeContextGeneration = 0;
     this.nativeExecutionStateGeneration = 0;
@@ -1142,6 +1147,11 @@ export class AudioManager extends BrowserAudioManager {
         nowPlayingRevision: this.nowPlayingRevision,
         ...(hidden && { midiTelemetry: true })
       });
+      for (const { requestId, appliedFrame } of result.soundFontControlResults ?? []) {
+        const complete = this.pendingSoundFontControls.get(requestId);
+        if (Number.isSafeInteger(appliedFrame)) complete?.(appliedFrame);
+        else complete?.(undefined, new Error('The SoundFont control could not be applied. Try again.'));
+      }
       this.applyNativeNowPlaying(result);
       this.applyNativeHostTransport(result);
       this.applyNativeMidiInput?.(result);
@@ -1171,7 +1181,8 @@ export class AudioManager extends BrowserAudioManager {
         type: 'dspTelemetry',
         packet: bytes.buffer,
         bytes: result.bytes,
-        droppedFrames: result.droppedFrames || 0
+        droppedFrames: result.droppedFrames || 0,
+        mixerEndFrame: result.mixerEndFrame
       });
     } catch (_) {
       // Transient bridge failures are retried on the next polling interval.
@@ -1307,7 +1318,7 @@ export class AudioManager extends BrowserAudioManager {
       .catch(error => console.error('[EffeTune Mixwright] SoundFont meters could not be updated', error));
   }
 
-  async sendSoundFontMixerAction(plugin, { type, channel, value, bank, program, controller }) {
+  async sendSoundFontMixerAction(plugin, { type, channel, value, bank, program, controller }, reportAppliedFrame = false) {
     if (!this.getCurrentPipeline().includes(plugin) || !plugin.sf ||
         !Number.isInteger(channel) || channel < 0 || channel > 15) {
       throw new Error('The SoundFont channel is unavailable.');
@@ -1324,8 +1335,22 @@ export class AudioManager extends BrowserAudioManager {
     } else if (type === 'control' && [7, 10, 11, 91, 93].includes(controller) && byte(value)) {
       payload = { ...target, kind: 'channel', messages: [midi(0xb0, controller, value)] };
     } else throw new Error('The SoundFont channel control is invalid.');
-    await window.__effetuneHostCall('soundFont/control', payload);
-    return true;
+    if (!reportAppliedFrame) {
+      await window.__effetuneHostCall('soundFont/control', payload);
+      return true;
+    }
+    const requestId = ++this.nextSoundFontControlRequestId;
+    return new Promise((resolve, reject) => {
+      const complete = (appliedFrame, error) => {
+        this.pendingSoundFontControls.delete(requestId);
+        if (error) reject(error);
+        else resolve(appliedFrame);
+      };
+      // A stopped host can leave the accepted edit queued until it renders again.
+      this.pendingSoundFontControls.set(requestId, complete);
+      void window.__effetuneHostCall('soundFont/control', { ...payload, requestId })
+        .catch(error => complete(undefined, error));
+    });
   }
 
   updateExposedProperties() {

@@ -100,6 +100,7 @@ public:
   static constexpr std::uint32_t kMaxMidiEvents = 4096u;
   static constexpr std::uint32_t kMaxSamplePages = 32768u;
   static constexpr std::uint32_t kSamplePageFrames = 4096u;
+  [[nodiscard]] static std::size_t maximumSoundFontSamples() noexcept;
   [[nodiscard]] static std::uint32_t samplePlayerProcessingChannels(
       std::int8_t channelSpec, std::uint32_t channels) noexcept;
   struct AssetLimits {
@@ -265,6 +266,16 @@ public:
   void retainAssets(std::span<const std::uint32_t> logicalIds);
   [[nodiscard]] std::optional<SoundFontMixerState> soundFontMixerState(
       std::uint32_t logicalId) const;
+  [[nodiscard]] std::uint64_t soundFontControlTargetRevision(std::uint32_t logicalId) const;
+  struct SoundFontControlResult {
+    std::uint64_t requestId = 0;
+    std::uint64_t pageGeneration = 0;
+    std::optional<std::uint64_t> appliedFrame;
+  };
+  static constexpr std::size_t kMaxPendingSoundFontControls = AudioCommandQueue::kUsableCapacity;
+  [[nodiscard]] bool popSoundFontControlResult(SoundFontControlResult &result) noexcept {
+    return soundFontControlResults_.pop(result);
+  }
   // A complete project replacement owns the engine while installing its state.
   void replaceSoundFontMixerStates(const std::map<std::uint32_t, SoundFontMixerState> &states);
 
@@ -300,7 +311,8 @@ public:
   // Control-side snapshot: source identities and bytes share the same lifetime.
   [[nodiscard]] std::uint32_t readTelemetry(std::span<std::uint8_t> destination,
                                             std::uint32_t &droppedFrames,
-                                            std::map<std::uint32_t, std::uint64_t> *sources = nullptr);
+                                            std::map<std::uint32_t, std::uint64_t> *sources = nullptr,
+                                            std::optional<std::uint64_t> *mixerEndFrame = nullptr);
   void discardTelemetry() noexcept;
   [[nodiscard]] SpectrumCapture &spectrumCapture() noexcept { return spectrumCapture_; }
   [[nodiscard]] std::uint64_t latencyRevision() const noexcept {
@@ -368,7 +380,8 @@ private:
                                                           std::uint32_t budget) const noexcept;
   void resetSoundFontInputUnlocked(InstanceEntry &entry) noexcept;
   void restoreSoundFontMixerUnlocked(InstanceEntry &entry) noexcept;
-  void updateSoundFontMixerTelemetryUnlocked(std::span<const std::uint8_t> bytes) noexcept;
+  [[nodiscard]] bool updateSoundFontMixerTelemetryUnlocked(
+      std::span<const std::uint8_t> bytes) noexcept;
   void stageMidiUnlocked(std::span<const et_midi_event> events, std::uint32_t channels,
                          bool masterBypass) noexcept;
   [[nodiscard]] bool applySoundFontControlUnlocked(const AudioCommand &command) noexcept;
@@ -392,6 +405,9 @@ private:
   float *combined_ = nullptr;
   double sampleRate_ = 0.0;
   double processedFrames_ = 0.0;
+  // Acknowledgements and buffered mixer telemetry use the same frame count
+  // across engine prepares and resets.
+  std::uint64_t mixerProcessedFrames_ = 0;
   std::uint32_t channels_ = 0;
   std::uint32_t maxProcessFrames_ = 0;
   bool prepared_ = false;
@@ -422,6 +438,7 @@ private:
   std::unordered_map<std::uint64_t, AssetEntry> assets_;
   std::map<std::uint32_t, std::unique_ptr<SoundFontMixerProjection>> soundFontMixers_;
   std::unordered_map<std::uint32_t, InstanceEntry *> soundFontMixerTaps_;
+  SpscQueue<SoundFontControlResult, kMaxPendingSoundFontControls + 1u> soundFontControlResults_;
   bool assetPreparationLatencyPolling_ = false;
   struct TelemetryStorage;
   std::unique_ptr<TelemetryStorage> telemetry_;

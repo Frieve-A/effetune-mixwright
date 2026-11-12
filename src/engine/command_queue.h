@@ -21,6 +21,8 @@ template <typename Item, std::size_t Capacity> class SpscQueue {
   static_assert(std::is_default_constructible_v<Item>);
 
 public:
+  static constexpr std::size_t kUsableCapacity = Capacity - 1u;
+
   [[nodiscard]] bool push(const Item &item) noexcept {
     const auto write = writeIndex_.load(std::memory_order_relaxed);
     const auto next = increment(write);
@@ -75,6 +77,9 @@ struct SoundFontControl {
   std::uint32_t value = 0;
   std::uint32_t messageCount = 0;
   std::array<std::uint32_t, 3> messages{};
+  std::uint64_t requestId = 0;
+  std::uint64_t pageGeneration = 0;
+  std::uint64_t targetRevision = 0;
 };
 
 struct AudioCommand {

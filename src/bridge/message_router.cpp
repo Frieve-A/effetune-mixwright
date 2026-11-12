@@ -181,10 +181,15 @@ void setError(std::string *destination, std::string value) {
   command.type = AudioCommandType::soundFontMidiControl;
   command.logicalId = static_cast<std::uint32_t>(id);
   auto &control = command.soundFontControl;
+  if (!payload["requestId"].isVoid()) {
+    const auto requestId = integerField(payload, "requestId");
+    if (requestId <= 0 || requestId > kMaximumSafeInteger) return false;
+    control.requestId = static_cast<std::uint64_t>(requestId);
+  }
   const auto kind = payload["kind"].getWithDefault<std::string>({});
   if (kind == "metering") {
     const auto enabled = payload["enabled"];
-    if (!enabled.isBool()) return false;
+    if (!enabled.isBool() || control.requestId != 0) return false;
     control.kind = SoundFontControlKind::metering;
     control.value = enabled.getWithDefault<bool>(false) ? 1u : 0u;
     return true;
@@ -673,7 +678,7 @@ bool MessageRouter::decode(const std::string_view json, RoutedUiMessage &message
       if (!nativeSf2.isVoid()) {
         const auto samples = nativeSf2["samples"];
         if (!nativeSf2.isObject() || !samples.isArray() || samples.size() == 0 ||
-            samples.size() > 10000u) {
+            samples.size() > EngineHost::maximumSoundFontSamples()) {
           setError(error, "SoundFont source geometry is invalid");
           return false;
         }

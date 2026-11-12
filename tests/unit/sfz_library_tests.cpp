@@ -1,4 +1,5 @@
 #include "bridge/sfz_library.h"
+#include "bridge/message_router.h"
 #include "engine/engine_host.h"
 #include <choc/memory/choc_Base64.h>
 #include <choc/text/choc_JSON.h>
@@ -259,6 +260,31 @@ void testNativeSoundFontPages(const fs::path &directory) {
          "retain sample indices and short final pages");
   expect(!library.readSoundFontPages(payload, 100, pages) && pages.size() == 3,
          "reject over-budget decode without replacing existing pages");
+
+  const auto row = choc::json::parse("[0,1,null]");
+  auto samples = choc::value::createEmptyArray();
+  constexpr std::uint32_t sampleCount = 10001;
+  for (std::uint32_t sample = 0; sample < sampleCount; ++sample) samples.addArrayElement(row);
+  source.setMember("samples", samples);
+  const auto largeSource = choc::json::toString(source);
+  const auto routeCommit = [&](const std::string &geometry) {
+    effetune::vst::RoutedUiMessage message;
+    return effetune::vst::MessageRouter::decode(
+        R"({"type":"pipeline/assetCommit","payload":{"pluginId":1,"slot":0,"operationRevision":1,"nativeSf2":)" +
+            geometry + "}}", message);
+  };
+  std::vector<RuntimeSamplePage> largePages;
+  expect(routeCommit(largeSource) && library.readSoundFontPages(largeSource, 1024u * 1024u, largePages) &&
+         largePages.size() == sampleCount && largePages.back().sample == sampleCount - 1u,
+         "route and read a native SF2 source above the old 10,000-sample limit");
+  for (std::size_t sample = sampleCount; sample < EngineHost::maximumSoundFontSamples(); ++sample)
+    samples.addArrayElement(row);
+  source.setMember("samples", samples);
+  expect(routeCommit(choc::json::toString(source)), "route the upstream cache's full sample count");
+  samples.addArrayElement(row);
+  source.setMember("samples", std::move(samples));
+  expect(!routeCommit(choc::json::toString(source)), "reject a source above the upstream sample limit");
+
   source.setMember("samples", choc::json::parse("[[0,4097,8195]]"));
   expect(!library.readSoundFontPages(choc::json::toString(source), 65536, pages),
          "reject low bytes beyond the admitted file");

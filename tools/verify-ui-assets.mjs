@@ -128,6 +128,14 @@ for (const fragment of requiredHtml) {
     throw new Error(`Generated UI is missing required HTML fragment: ${fragment}`);
   }
 }
+for (const [link] of html.matchAll(/<link\b[^>]*\brel=['"]modulepreload['"][^>]*>/gi)) {
+  const href = link.match(/\bhref=['"]([^'"]+)['"]/i)?.[1];
+  const preload = href && path.resolve(assets, href);
+  if (!preload || !preload.startsWith(assets + path.sep)) {
+    throw new Error(`Generated module preload must reference a bundled asset: ${link}`);
+  }
+  await access(preload);
+}
 
 const forbiddenHtml = [
   'Frieve EffeTune',
@@ -189,6 +197,9 @@ if (!bootstrap.includes('const needsHomeKeyForEditing = target => {') ||
 }
 if (!app.includes("../vst-audio-manager.js")) {
   throw new Error('The application module was not redirected to the VST audio adapter');
+}
+if (app.includes('this.audioManager.prefetchDspModule()')) {
+  throw new Error('VST startup must leave browser DSP loading to asset preparation');
 }
 if (!app.includes("import { installVstSpaceKeyHandler } from '../vst-space-key.js';") ||
     !app.includes('installVstSpaceKeyHandler();') || app.includes('installSpaceKeyGuard();')) {
@@ -278,6 +289,9 @@ if (!pluginList.includes(
     !dspMetadata.includes('"name": "VinylSimulatorPlugin"')) {
   throw new Error('Vinyl Simulator UI or native DSP metadata is missing');
 }
+if (/\b(?:NetworkSendPlugin|NetworkReceivePlugin)\b/.test(pluginList)) {
+  throw new Error('The VST effect catalog exposes desktop-only Live Audio Send/Receive');
+}
 if (!bootstrap.includes('window.electronAPI = {') ||
     html.indexOf('vst-bootstrap.js') > html.indexOf('type="module"') ||
     !bootstrap.includes("/\\.(?:mp3|wav|ogg|flac|opus|m4a|aac|webm|mp4)$/i") ||
@@ -288,7 +302,7 @@ if (!bootstrap.includes('window.electronAPI = {') ||
 if (!bootstrap.includes('const maximumMeasurementImportBytes = 128 * 1024 * 1024;') ||
     !bootstrap.includes("import('./features/measurement/dataStorage.js')") ||
     !bootstrap.includes("input.accept = '.json,application/json';") ||
-    !bootstrap.includes('storage.importMeasurementFromJSON(jsonText)') ||
+    !bootstrap.includes('storage.importMeasurementFromJSON(jsonText,') ||
     !bootstrap.includes('storage.deleteMeasurement(measurementId)') ||
     !bootstrap.includes('measurement?.imported !== true') ||
     !bootstrap.includes('confirmImportedMeasurementDeletion(measurement)') ||
@@ -299,8 +313,10 @@ if (!bootstrap.includes('const maximumMeasurementImportBytes = 128 * 1024 * 1024
     !bootstrap.includes("parameters[`mn${index}`] = ''") ||
     !bootstrap.includes('targetPlugin.setParameters({') ||
     !bootstrap.includes('window.__effetuneMeasurementImport = {') ||
-    !measurementStorage.includes('async importMeasurementFromJSON(jsonString)') ||
+    !measurementStorage.includes('async importMeasurementFromJSON(jsonString,') ||
     !measurementStorage.includes('data.id = this.generateId();') ||
+    !englishLocale.includes('"roomEq.import.corrected"') ||
+    !japaneseLocale.includes('"roomEq.import.corrected"') ||
     !englishLocale.includes('"roomEq.delete.confirm"') ||
     !japaneseLocale.includes('"roomEq.delete.confirm"')) {
   throw new Error(

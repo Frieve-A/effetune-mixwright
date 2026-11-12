@@ -551,7 +551,12 @@
       throw new Error('Measurement files must be at most 128 MB.');
     }
     const storage = await getMeasurementStorage();
-    const measurementId = await storage.importMeasurementFromJSON(jsonText);
+    const measurementId = await storage.importMeasurementFromJSON(jsonText, measurement => {
+      if (measurement.effectPipeline !== undefined) {
+        throw new Error(translatedText('roomEq.import.corrected',
+          'Room EQ needs an uncorrected measurement. Export the original measurement from the desktop app and try again.'));
+      }
+    });
     if (!measurementId) {
       throw new Error('The selected file is not a valid measurement export.');
     }

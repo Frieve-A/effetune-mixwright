@@ -4503,11 +4503,43 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
         uiPageGeneration_.load(std::memory_order_acquire) != requestPageGeneration) {
       return bridgeResult(false, "The pipeline changed. Try the MIDI control again.");
     }
-    return instanceCommands_.push(message.audioCommand)
-               ? bridgeResult(true)
-               : bridgeResult(false, "The MIDI control could not be queued. Try again.");
+    auto &control = message.audioCommand.soundFontControl;
+    if (control.requestId == 0) {
+      return instanceCommands_.push(message.audioCommand)
+                 ? bridgeResult(true)
+                 : bridgeResult(false, "The MIDI control could not be queued. Try again.");
+    }
+    control.pageGeneration = requestPageGeneration;
+    control.targetRevision = engine_.soundFontControlTargetRevision(message.audioCommand.logicalId);
+    if (control.targetRevision == 0)
+      return bridgeResult(false, "The SoundFont is no longer ready. Try the control again.");
+
+    std::scoped_lock results(soundFontControlResultsMutex_);
+    if (pendingSoundFontControlCount_ == EngineHost::kMaxPendingSoundFontControls ||
+        !instanceCommands_.push(message.audioCommand))
+      return bridgeResult(false, "The MIDI control could not be queued. Try again.");
+    ++pendingSoundFontControlCount_;
+    return bridgeResult(true);
   }
   drainAutomationValues();
+
+  const auto appendSoundFontControlResults = [&](choc::value::Value &result) {
+    std::scoped_lock lock(soundFontControlResultsMutex_);
+    if (requestPageGeneration != uiPageGeneration_.load(std::memory_order_acquire) ||
+        pendingSoundFontControlCount_ == 0) return;
+    auto results = choc::value::createEmptyArray();
+    EngineHost::SoundFontControlResult applied;
+    while (engine_.popSoundFontControlResult(applied)) {
+      --pendingSoundFontControlCount_;
+      if (applied.pageGeneration != requestPageGeneration) continue;
+      auto entry = choc::value::createObject({});
+      entry.addMember("requestId", static_cast<std::int64_t>(applied.requestId));
+      if (applied.appliedFrame)
+        entry.addMember("appliedFrame", static_cast<std::int64_t>(*applied.appliedFrame));
+      results.addArrayElement(std::move(entry));
+    }
+    if (results.size() != 0) result.addMember("soundFontControlResults", std::move(results));
+  };
 
   const auto pauseBulkRequestBeforeCommitForTesting = [&] {
 #if defined(EFFETUNE_PROCESSOR_TEST_HOOKS)
@@ -4589,7 +4621,10 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     result.addMember("ok", true);
     result.addMember("sampleRate", context.sampleRate);
     appendHostTransport(result);
-    if (message.includeMidiTelemetry) appendMidiTelemetry(result);
+    if (message.includeMidiTelemetry) {
+      appendMidiTelemetry(result);
+      appendSoundFontControlResults(result);
+    }
     result.addMember("engineSampleRate", context.engineSampleRate);
     result.addMember("maxEngineFrames",
                      static_cast<std::int64_t>(maxHostFrames_.load(std::memory_order_acquire)) *
@@ -4685,9 +4720,10 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     const auto context = readHostContext();
     std::uint32_t droppedFrames = 0;
     std::map<std::uint32_t, std::uint64_t> pipelineSources;
+    std::optional<std::uint64_t> mixerEndFrame;
     const auto pipelineBytes = engine_.readTelemetry(
         std::span<std::uint8_t>(telemetryScratch_).first(EngineHost::kDefaultTelemetryBytes), droppedFrames,
-        &pipelineSources);
+        &pipelineSources, &mixerEndFrame);
     std::uint32_t analyzerDropped = 0;
     std::map<std::uint32_t, std::uint64_t> analyzerSources;
     const auto analyzerBytes = outputAnalyzers_.readTelemetry(
@@ -4701,8 +4737,10 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     result.addMember("ok", true);
     result.addMember("bytes", static_cast<std::int64_t>(bytes));
     result.addMember("droppedFrames", static_cast<std::int64_t>(droppedFrames));
+    if (mixerEndFrame) result.addMember("mixerEndFrame", static_cast<std::int64_t>(*mixerEndFrame));
     appendHostTransport(result);
     appendMidiTelemetry(result);
+    appendSoundFontControlResults(result);
     auto telemetrySources = choc::value::createObject({});
     for (const auto &[tap, source] : pipelineSources) {
       auto identity = choc::value::createObject({});

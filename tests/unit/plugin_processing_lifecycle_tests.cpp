@@ -4,6 +4,7 @@
 #include "../../external/effetune/dsp/generated/cpp/TubeSimulatorPluginParams.h"
 #include "../../external/effetune/dsp/generated/cpp/AdaptivePredictionEffectPluginParams.h"
 #include "../../external/effetune/dsp/generated/cpp/SFZNotePlayerPluginParams.h"
+#include "../../external/effetune/dsp/generated/cpp/SoundFontPlayerPluginParams.h"
 #include "../../external/effetune/dsp/generated/cpp/IRReverbPluginParams.h"
 #include "../../external/effetune/dsp/plugins/others/sfz_note_player/bank.h"
 
@@ -11822,6 +11823,20 @@ void testSoundFontMixerProjectState() {
   effetune::vst::PluginStateDocument project;
   project.pipelineA.plugins.push_back({1u, "SoundFont Player"});
   project.pipelineA.plugins.front().extraJson = choc::json::toString(extras);
+  using Params = effetune::generated::SoundFontPlayerPluginParams;
+  Params params{};
+  params.maxVoices = 256;
+  params.automaticFallback = 1;
+  params.previewMidi = -1;
+  std::array<float, Params::kFloatCount> packed{};
+  std::memcpy(packed.data(), &params, sizeof(params));
+  auto values = choc::value::createEmptyArray();
+  for (const auto value : packed) values.addArrayElement(value);
+  const auto rebuildRequest = std::string{
+      R"({"type":"pipeline/rebuild","payload":{"pipeline":"A","plugins":[)"
+      R"({"id":1,"name":"SoundFont Player","type":"SoundFontPlayerPlugin","enabled":true,)"
+      R"("parameters":{},"wasmParams":)"} + choc::json::toString(values) +
+      R"(,"wasmParamsHash":)" + std::to_string(Params::kHash) + "}]}}";
   const auto load = [&] {
     const auto json = effetune::vst::StateCodec::encode(project);
     ResizableMemoryIBStream stream;
@@ -11830,10 +11845,7 @@ void testSoundFontMixerProjectState() {
     stream.rewind();
     expect(processor->setState(&stream) == kResultOk, "load SoundFont project state");
     (void)processor->handleUiMessage(R"({"type":"host/getInfo","payload":{"startup":true}})");
-    const auto result = choc::json::parse(processor->handleUiMessage(
-        R"({"type":"pipeline/rebuild","payload":{"pipeline":"A","plugins":[)"
-        R"({"id":1,"name":"SoundFont Player","type":"SoundFontPlayerPlugin","enabled":true,)"
-        R"("parameters":{},"wasmParams":[0,64,0,1],"wasmParamsHash":2219444632}]}})"));
+    const auto result = choc::json::parse(processor->handleUiMessage(rebuildRequest));
     expect(result["ok"].getBool(), "accept headless SoundFont replacement");
   };
   load();

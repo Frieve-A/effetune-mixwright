@@ -24,9 +24,59 @@ const vstTourLocales = {
     'tour.step.help.body': '設定のHelpからガイドを開けます。各エフェクトの?ボタンでも説明を読めます。設定のツアー項目から、このツアーを再度開けます。'
   }
 };
+// Preserve Mixwright's existing translations for labels the standalone UI now leaves in English.
+const effectLabelKeys = [
+  'ui.effectsAvailable', 'ui.effectsFound', 'ui.pipelineLatency', 'ui.pipelineCpuUsage', 'ui.dragPluginsHere'
+];
+const effectLabelLocales = {
+  ar: [
+    '{count} تأثيرات متاحة', '{count} تأثيرات تم العثور عليها',
+    'إجمالي التأخير: {samples} عينة', 'CPU: المتوسط {average}%', 'اسحب التأثيرات هنا لبناء سلسلة تأثيرات'
+  ],
+  en: [
+    '{count} effects available', '{count} effects found',
+    'Total Delay: {samples} samples', 'CPU: Avg {average}%', 'Drag effects here to build your effect pipeline'
+  ],
+  es: [
+    '{count} efectos disponibles', '{count} efectos encontrados',
+    'Retardo total: {samples} muestras', 'CPU: prom. {average}%', 'Arrastra efectos aquí para crear tu cadena de efectos'
+  ],
+  fr: [
+    '{count} effets disponibles', '{count} effets trouvés',
+    'Délai total : {samples} échantillons', 'CPU : moy. {average}%',
+    "Faites glisser les effets ici pour créer votre chaîne d'effets"
+  ],
+  hi: [
+    '{count} प्रभाव उपलब्ध', '{count} प्रभाव मिले',
+    'कुल विलंब: {samples} सैंपल', 'CPU: औसत {average}%', 'अपनी प्रभाव पाइपलाइन बनाने के लिए प्रभावों को यहां खींचें'
+  ],
+  ja: [
+    '{count}種類のエフェクトが利用可能', '{count}種類のエフェクトが見つかりました',
+    '総遅延: {samples} サンプル', 'CPU: 平均 {average}%', 'エフェクトをここにドラッグしてエフェクトパイプラインを構築'
+  ],
+  ko: [
+    '{count}개의 효과 사용 가능', '{count}개의 효과 검색됨',
+    '총 지연: {samples} 샘플', 'CPU: 평균 {average}%', '효과 파이프라인을 구축하려면 여기로 효과를 끌어다 놓으세요'
+  ],
+  pt: [
+    '{count} efeitos disponíveis', '{count} efeitos encontrados',
+    'Atraso total: {samples} amostras', 'CPU: méd. {average}%', 'Arraste efeitos aqui para montar sua cadeia de efeitos'
+  ],
+  ru: [
+    '{count} доступных эффектов', '{count} эффектов найдено',
+    'Общая задержка: {samples} отсчётов', 'CPU: сред. {average}%',
+    'Перетащите эффекты сюда, чтобы создать свой конвейер эффектов'
+  ],
+  zh: [
+    '{count} 个效果可用', '找到 {count} 个效果',
+    '总延迟：{samples} 个采样', 'CPU：平均 {average}%', '将效果拖到此处以构建效果管道'
+  ]
+};
 const vstLocaleAdditions = {
   en: {
     'roomEq.action.import': 'Import\u2026',
+    'roomEq.import.corrected':
+      'Room EQ needs an uncorrected measurement. Export the original measurement from the desktop app and try again.',
     'roomEq.delete.title': 'Delete imported measurement',
     'roomEq.delete.confirm':
       'Delete imported measurement \u201c{name}\u201d? This cannot be undone.',
@@ -34,6 +84,8 @@ const vstLocaleAdditions = {
   },
   ja: {
     'roomEq.action.import': '測定をインポート\u2026',
+    'roomEq.import.corrected':
+      'Room EQには補正前の測定が必要です。デスクトップアプリで元の測定をエクスポートしてから、もう一度お試しください。',
     'roomEq.delete.title': 'インポートした測定を削除',
     'roomEq.delete.confirm':
       'インポートした測定「{name}」を削除しますか？この操作は元に戻せません。',
@@ -79,6 +131,11 @@ await mkdir(output, { recursive: true });
 for (const entry of ['js', 'plugins', 'presets', 'images', 'css']) {
   await cp(path.join(source, entry), path.join(output, entry), { recursive: true });
 }
+// Live Audio Send/Receive require the standalone desktop network transport.
+const pluginListPath = path.join(output, 'plugins', 'plugins.txt');
+const pluginList = await readText(pluginListPath);
+await writeFile(pluginListPath, pluginList.replace(/^control\/network_(?:send|receive):[^\n]*\n/gm, ''), 'utf8');
+
 // Omit the player-lyrics system preset without touching saved or imported layouts.
 const visualizerPresetsDirectory = path.join(output, 'presets', 'visualizer');
 for (const entry of await readdir(visualizerPresetsDirectory)) {
@@ -100,8 +157,17 @@ await cp(path.join(projectRoot, 'ui-shim', 'vst-audio-manager.js'),
 await cp(path.join(projectRoot, 'ui-shim', 'vst-space-key.js'),
          path.join(output, 'vst-space-key.js'));
 await mkdir(path.join(output, 'features', 'measurement'), { recursive: true });
-await cp(path.join(source, 'features', 'measurement', 'dataStorage.js'),
-         path.join(output, 'features', 'measurement', 'dataStorage.js'));
+// Let Room EQ check the parsed export before storage assigns an ID or writes it.
+const measurementStorage = await readText(path.join(source, 'features', 'measurement', 'dataStorage.js'));
+const measurementImport = '    async importMeasurementFromJSON(jsonString) {';
+const measurementImportId = '        // Give the imported measurement a new ID.';
+if (measurementStorage.split(measurementImport).length !== 2 ||
+    measurementStorage.split(measurementImportId).length !== 2) {
+  throw new Error('Unable to locate the upstream measurement import validation');
+}
+await writeFile(path.join(output, 'features', 'measurement', 'dataStorage.js'), measurementStorage
+  .replace(measurementImport, '    async importMeasurementFromJSON(jsonString, validateMeasurement) {')
+  .replace(measurementImportId, `        validateMeasurement?.(data);\n\n${measurementImportId}`), 'utf8');
 await cp(path.join(source, 'features', 'measurement', 'measurement-model.js'),
          path.join(output, 'features', 'measurement', 'measurement-model.js'));
 await mkdir(path.join(output, 'features', 'measurement', 'audio-utils'), { recursive: true });
@@ -117,11 +183,13 @@ const upstreamDocumentTitle = '<title>EffeTune</title>';
 const upstreamHeaderTitle = '<h1>Frieve EffeTune<img';
 const upstreamFooterTitle = 'EffeTune version <span id="app-version"></span>';
 const upstreamIconAlt = 'alt="EffeTune Icon"';
+const standaloneModulePreloads = /\n    <!-- Module preloads generated by npm run assets:web from the static import graph of js\/app\.js\. -->\n[\s\S]*?    <!-- End of generated module preloads\. -->\n/;
 if (!html.includes(upstreamDocumentTitle) || !html.includes(upstreamHeaderTitle) ||
     !html.includes(upstreamFooterTitle) || !html.includes(upstreamIconAlt)) {
   throw new Error('Unable to locate the upstream EffeTune branding');
 }
 html = applyProductBranding(html)
+  .replace(standaloneModulePreloads, '\n')
   .replace(/\s*<link rel="stylesheet" href="css\/effetune-mobile\.css">/g, '')
   .replace('</head>', '    <link rel="stylesheet" href="css/effetune-library.css">\n</head>')
   .replace(/\s*<link rel="manifest" href="manifest\.json">/g, '')
@@ -172,9 +240,26 @@ const remoteStartup = `            // LAN remote control (remote-v1); does nothi
 `;
 if (app.split(remoteStartup).length !== 2) throw new Error('Unable to locate excluded remote startup');
 app = app.replace(remoteStartup, '');
-const standaloneMidiStartup = /        const midiInputKey = window\.audioPreferences\?\.midiInputDeviceKey[\s\S]*?\n        \}\n/;
+const standaloneMidiStartup = /        const midiPreference = name => window\.audioPreferences\?\.\[name\][\s\S]*?        const midiOutputKey = midiPreference\('midiOutputDeviceKey'\);[\s\S]*?\n        \}\n/;
 if (!standaloneMidiStartup.test(app)) throw new Error('Unable to locate the standalone MIDI device startup');
 app = app.replace(standaloneMidiStartup, '');
+const startupDspPrefetch = `        // Fetch and compile the WASM DSP while plugins load so worklet startup
+        // does not wait for it on a cold visit.
+        void this.audioManager.prefetchDspModule();
+`;
+if (app.split(startupDspPrefetch).length !== 2) throw new Error('Unable to locate the standalone DSP prefetch');
+app = app.replace(startupDspPrefetch, '');
+// The standalone measurement page and its pipeline handoff are not bundled.
+const saveMeasurementHandoff = /\/\/ A suspended or monitoring context[^\n]*\n\/\/ default wait[^\n]*\nconst MEASUREMENT_HANDOFF_ASSET_TIMEOUT_MS = \d+;\n\nasync function saveMeasurementPipelineHandoff\([^\n]*\) \{[\s\S]*?\n\}\n\n/;
+const configureMeasurementHandoff = /        this\.savePipelineHandoff = dependencies\.savePipelineHandoff \|\|\n[\s\S]*?\n            \)\);\n/;
+const measurementHandoffMethod = /    \/\/ Runs while the live pipeline is still intact\.[\s\S]*?\n    async handOffPipelineToMeasurement\(\) \{[\s\S]*?\n    \}\n\n/;
+const runMeasurementHandoff = /^ +await this\.handOffPipelineToMeasurement\(\);\n/gm;
+if (!saveMeasurementHandoff.test(app) || !configureMeasurementHandoff.test(app) ||
+    !measurementHandoffMethod.test(app) || [...app.matchAll(runMeasurementHandoff)].length !== 2) {
+  throw new Error('Unable to locate the standalone measurement pipeline handoff');
+}
+app = app.replace(saveMeasurementHandoff, '').replace(configureMeasurementHandoff, '')
+  .replace(measurementHandoffMethod, '').replace(runMeasurementHandoff, '');
 const spaceGuardImport = "import { installSpaceKeyGuard } from './utils/space-key-guard.js';";
 if (app.split(spaceGuardImport).length !== 2 || app.split('installSpaceKeyGuard();').length !== 2) {
   throw new Error('Unable to locate the upstream Space key guard installation');
@@ -794,6 +879,17 @@ if (uiManager.split(pipelinePerformanceRefresh).length - 1 !== 1) {
 uiManager = uiManager.replace(pipelinePerformanceRefresh, `        this.updatePipelineCpuUsage(
             this.audioManager?.pipelineCpuAveragePercent ?? this.pipelineCpuAveragePercent
         );`);
+for (const [original, localized] of [
+  ['this.pipelineLatency.textContent = `Total Delay: ${normalizedSamples} samples`;',
+    "this.pipelineLatency.textContent = this.t('ui.pipelineLatency', { samples: normalizedSamples });"],
+  ['const label = `CPU: Avg ${averageLabel}%`;',
+    "const label = this.t('ui.pipelineCpuUsage', { average: averageLabel });"],
+  ["message.textContent = 'Drag effects here to build your effect pipeline';",
+    "message.textContent = this.t('ui.dragPluginsHere');"]
+]) {
+  if (uiManager.split(original).length !== 2) throw new Error(`Unable to locate the effect label: ${original}`);
+  uiManager = uiManager.replace(original, localized);
+}
 const pipelineAnalyzerInitialization = `        this.initPipelineAnalyzerBootstrap();
         this.initPipelineAnalyzerMenuIntegration();`;
 if (uiManager.split(pipelineAnalyzerInitialization).length - 1 !== 1) {
@@ -1041,24 +1137,49 @@ for (const relativePath of [
   await writeFile(assetPath, applyProductBranding(assetSource), 'utf8');
 }
 
+for (const [relativePath, original, localized] of [
+  ['plugin-list-manager.js',
+    'effectCountDiv.textContent = `${totalEffects} effects available`;',
+    `const key = 'ui.effectsAvailable';
+        const translated = window.uiManager?.t?.(key, { count: totalEffects });
+        effectCountDiv.textContent = translated && translated !== key ? translated : \`\${totalEffects} effects available\`;`],
+  ['plugin-list/search-manager.js',
+    `effectCountDiv.textContent = normalizedSearch ?
+                \`\${totalVisibleEffects} effects found\` :
+                \`\${totalVisibleEffects} effects available\`;`,
+    `const key = normalizedSearch ? 'ui.effectsFound' : 'ui.effectsAvailable';
+            const translated = window.uiManager?.t?.(key, { count: totalVisibleEffects });
+            const fallback = normalizedSearch ? \`\${totalVisibleEffects} effects found\` : \`\${totalVisibleEffects} effects available\`;
+            effectCountDiv.textContent = translated && translated !== key ? translated : fallback;`]
+]) {
+  const assetPath = path.join(output, 'js', 'ui', relativePath);
+  const assetSource = await readText(assetPath);
+  if (assetSource.split(original).length !== 2) throw new Error(`Unable to locate the effect count in ${relativePath}`);
+  await writeFile(assetPath, assetSource.replace(original, localized), 'utf8');
+}
+
 const localesPath = path.join(output, 'js', 'locales');
 for (const localeFile of await readdir(localesPath)) {
   if (!localeFile.endsWith('.json5')) continue;
   const localePath = path.join(localesPath, localeFile);
   const localeSource = await readText(localePath);
+  const language = path.basename(localeFile, '.json5');
   let localized = applyProductBranding(localeSource);
   // Other locales use the supported English workflow until translated here.
-  for (const [key, value] of Object.entries(vstTourLocales[path.basename(localeFile, '.json5')] || vstTourLocales.en)) {
+  for (const [key, value] of Object.entries(vstTourLocales[language] || vstTourLocales.en)) {
     const field = `${JSON.stringify(key)}:`;
     const expression = new RegExp(`(${field.replaceAll('.', '\\.')}\\s*)"(?:[^"\\\\]|\\\\.)*"`);
     if (!expression.test(localized)) throw new Error(`Unable to adapt tour locale: ${localeFile}: ${key}`);
     localized = localized.replace(expression, (_match, prefix) => prefix + JSON.stringify(value));
   }
-  const additions = vstLocaleAdditions[path.basename(localeFile, '.json5')];
-  if (additions) {
+  const additions = Object.entries(vstLocaleAdditions[language] || {});
+  if (effectLabelLocales[language]) {
+    additions.push(...effectLabelKeys.map((key, index) => [key, effectLabelLocales[language][index]]));
+  }
+  if (additions.length) {
     const closing = localized.match(/\s*}\s*$/);
     if (!closing) throw new Error(`Unable to extend VST locale: ${localeFile}`);
-    const fields = Object.entries(additions)
+    const fields = additions
       .map(([key, value]) => `  ${JSON.stringify(key)}: ${JSON.stringify(value)}`)
       .join(',\n');
     localized = `${localized.slice(0, closing.index).trimEnd()},\n${fields}\n}\n`;
@@ -1106,7 +1227,7 @@ const networkSettingsConstruction = `  const networkSettings = isElectron ? new 
     root: document.getElementById('config-panel-network'), api: networkMusicAPI, remoteSettings: remoteControlSettings, translate: t
   }) : null;
   await networkSettings?.mount();`;
-const networkSettingsRefresh = 'await Promise.all([refreshOpenHomeStatus(), refreshAirPlayStatus(), refreshLibrarySharing()]);';
+const networkSettingsRefresh = 'await Promise.all([refreshOpenHomeStatus(), refreshAirPlayStatus(), refreshNetworkOutputStatus(), refreshLibrarySharing()]);';
 const browserRulesImport = "import { validateRules } from '../browser/url-rules.js';\n";
 const browserRulesSave = /  document.getElementById\('browser-rules-save'\)\?\.addEventListener\('click', async \(\) => \{[\s\S]*?\n  \}\);\n/;
 if (configIntegration.split(networkSettingsImport).length !== 2 ||

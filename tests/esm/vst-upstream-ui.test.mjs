@@ -504,6 +504,23 @@ test('VST config loads supported startup views and normal PCM quality without lo
   }
 });
 
+test('deferred VST startup opens MIDI controllers but ignores standalone audio device preferences', async () => {
+  const source = await assetText('js/app.js');
+  const deferredStartup = source.match(/    runDeferredStartupTasks\(\) \{[\s\S]*?\n    \}/)?.[0];
+  assert.ok(deferredStartup);
+  const window = { audioPreferences: { midiInputDeviceKey: 'input', midiOutputDeviceKey: 'output' } };
+  const App = vm.runInNewContext(`(class { ${deferredStartup} })`, { window, isAndroidHost: () => false });
+  const calls = [];
+  const app = Object.assign(new App(), {
+    startupConfig: { midiController: { mappings: [{}] } },
+    async ensureMidiControllerManager() { calls.push('controller'); },
+    async applyMidiInputPreference() { calls.push('input'); },
+    async applyMidiOutputPreference() { calls.push('output'); }
+  });
+  app.runDeferredStartupTasks();
+  assert.deepEqual(calls, ['controller']);
+});
+
 test('Visualizer startup preference opens once without changing host pipeline state', async () => {
   const source = await assetText('js/app.js');
   const methods = ['applyStartupViewPreference', 'openConfiguredStartupView'].map(name => {
@@ -588,6 +605,7 @@ test('startup navigation waits for native readiness and settles before revealing
       clearInterval(audioManager.telemetryTimer);
       Object.assign(audioManager, { pipelineA, pipelineB, currentPipeline: 'B',
         pipelineProcessor: { setPipeline() {}, setMasterBypass() {} },
+        prefetchDspModule() { assert.fail('startup must not prefetch browser DSP'); },
         applyNativeBypass() {}, applyHostAutomationDeltas() {}
       });
       const sources = new VisualizerSources(audioManager);
@@ -1065,8 +1083,10 @@ test('bundled tour teaches DAW workflows, persists first run and supports manual
   context.document.createElement = tag => Object.assign(new Element(tag), {
     style: {}, getBoundingClientRect: () => ({ width: 300, height: 200 })
   });
+  const targetRect = { left: 24, top: 48, bottom: 80, width: 100, height: 32 };
   const targets = new Map(TOUR_STEPS.filter(step => step.target).map(step => [step.target,
-    Object.assign(new Element('button'), { scrollIntoView() {}, getClientRects: () => [] })]));
+    Object.assign(new Element('button'), { scrollIntoView() {},
+      getClientRects: () => [targetRect], getBoundingClientRect: () => targetRect })]));
   context.document.querySelector = selector => targets.get(selector);
   const locale = vm.runInNewContext(`(${await assetText('js/locales/en.json5')})`);
   const saved = [];
@@ -1191,6 +1211,69 @@ class Element {
 
 const flatten = node => [node, ...node.children.flatMap(flatten)];
 const byClass = (node, name) => flatten(node).find(item => item.classList.contains(name));
+
+test('effect counts follow the current language when listing, searching, and clearing search', async () => {
+  const { PluginListManager } = await assetModule('js/ui/plugin-list-manager.js');
+  const { SearchManager } = await assetModule('js/ui/plugin-list/search-manager.js');
+  class PluginListElement extends Element {
+    style = {};
+    dataset = {};
+    get childNodes() { return this.children; }
+    querySelectorAll(selector) {
+      return this.children.flatMap(flatten).filter(item => selector.startsWith('.')
+        ? item.classList.contains(selector.slice(1))
+        : selector.startsWith('#') ? item.id === selector.slice(1) : item.tagName === selector.toUpperCase());
+    }
+    querySelector(selector) { return this.querySelectorAll(selector)[0]; }
+  }
+  const makeElement = tag => new PluginListElement(tag);
+  const document = { createElement: makeElement,
+    createTextNode: text => Object.assign(makeElement('text'), { textContent: text }) };
+  const pluginList = makeElement('div');
+  const list = Object.assign(Object.create(PluginListManager.prototype), {
+    pluginManager: {
+      effectCategories: { Test: { plugins: ['Gain', 'Delay'] } },
+      pluginClasses: Object.fromEntries(['Gain', 'Delay'].map(name => [name,
+        class { name = name; cleanup() {} }]))
+    },
+    pluginList,
+    collapseManager: { collapsedCategories: {}, updateCategoryVisibility() {} },
+    createPluginItem(plugin) {
+      const item = makeElement('div');
+      item.className = 'plugin-item';
+      item.appendChild(document.createTextNode(plugin.name));
+      return item;
+    }
+  });
+  const search = Object.assign(Object.create(SearchManager.prototype), { pluginList, pluginListManager: list });
+  const window = {};
+  const previous = { document: globalThis.document, window: globalThis.window };
+  const count = () => pluginList.querySelector('#effectCount').textContent;
+  try {
+    Object.assign(globalThis, { document, window });
+    list.initPluginList();
+    assert.equal(count(), '2 effects available');
+    search.filterPlugins('Gain');
+    assert.equal(count(), '1 effects found');
+
+    for (const [language, available, found] of [
+      ['ja', '2種類のエフェクトが利用可能', '1種類のエフェクトが見つかりました'],
+      ['fr', '2 effets disponibles', '1 effets trouvés']
+    ]) {
+      const locale = vm.runInNewContext(`(${await assetText(`js/locales/${language}.json5`)})`);
+      window.uiManager = { t: (key, { count }) => locale[key]?.replace('{count}', count) || key };
+      list.initPluginList();
+      assert.equal(count(), available);
+      search.filterPlugins('Gain');
+      assert.equal(count(), found);
+      search.filterPlugins('');
+      assert.equal(count(), available);
+    }
+  } finally {
+    Object.assign(globalThis, previous);
+  }
+});
+
 const until = async predicate => {
   const deadline = Date.now() + 5000;
   while (!predicate()) {
@@ -1216,6 +1299,34 @@ async function bootstrap(hostMessage) {
   });
   return context;
 }
+
+test('Room EQ imports the original measurement and rejects corrected exports before storage or selection', async t => {
+  const { default: storage } = await assetModule('features/measurement/dataStorage.js');
+  const stored = [];
+  t.mock.method(storage, 'initialize', async () => {});
+  t.mock.method(storage, 'addMeasurement', async measurement => {
+    stored.push(measurement);
+    return measurement.id;
+  });
+  t.mock.method(storage, 'getMeasurementById', id => stored.find(measurement => measurement.id === id));
+  const { window } = await bootstrap(async () => ({ ok: true }));
+  window.RoomEqPlugin = class {
+    async _refreshMeasurements() {}
+    async _renderMeasurement() {}
+    setParameters({ ms }) { this.measurementId = ms; }
+  };
+  const plugin = new window.RoomEqPlugin();
+  window.audioManager = { pipelineA: [plugin] };
+  const measurement = { name: 'Original', sampleRate: 48000,
+    points: [{ pointId: 0, frequencyResponse: [[20, -1], [1000, 0]] }] };
+  const { importText } = window.__effetuneMeasurementImport;
+  const id = await importText(JSON.stringify(measurement), plugin);
+  assert.equal(plugin.measurementId, id);
+  await assert.rejects(importText(JSON.stringify({ ...measurement, name: 'Corrected',
+    effectPipeline: { pluginNames: ['Room EQ'] } }), plugin), /Export the original measurement/);
+  assert.equal(plugin.measurementId, id);
+  assert.deepEqual(stored.map(entry => entry.name), ['Original']);
+});
 
 test('bundled ElectronIntegration constructs with the VST subscription surface', async () => {
   const context = await bootstrap(async () => ({ ok: true }));

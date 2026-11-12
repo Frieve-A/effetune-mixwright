@@ -313,6 +313,49 @@ function installSpectrumPolling({ context, port }) {
   return () => context.poll.call(port.owner);
 }
 
+test('SoundFont drag waits for its native application receipt and receives mixer frame timing', async () => {
+  const fixture = createNativePort();
+  const { context, hostCalls, port } = fixture;
+  const poll = installSpectrumPolling(fixture);
+  const start = source.indexOf('  async sendSoundFontMixerAction(');
+  const end = source.indexOf('\n  updateExposedProperties()', start);
+  vm.runInNewContext(`this.MixerManager = class { ${source.slice(start, end)} };`, context);
+  const plugin = { id: 7, sf: 'bank' };
+  const packets = [];
+  Object.assign(port.owner, {
+    pipelineA: [plugin], nextSoundFontControlRequestId: 0, pendingSoundFontControls: new Map(),
+    telemetryHub: { handleMessage: message => packets.push(message) }
+  });
+  const send = () => context.MixerManager.prototype.sendSoundFontMixerAction.call(port.owner, plugin,
+    { type: 'control', channel: 0, controller: 10, value: 51 }, true);
+  const setTimeout = context.setTimeout;
+  const callbacks = [];
+  context.setTimeout = callback => callbacks.push(callback);
+  let appliedFrame;
+  const pending = send().then(frame => { appliedFrame = frame; });
+  context.setTimeout = setTimeout;
+  assert.deepEqual(callbacks, [], 'an accepted edit waits indefinitely while the DAW is idle');
+  const { type, payload } = hostCalls.at(-1);
+  assert.equal(type, 'soundFont/control');
+  let reply = { soundFontControlResults: [{ requestId: payload.requestId + 1, appliedFrame: 64 }],
+    packet: 'AA==', bytes: 1, mixerEndFrame: 64 };
+  context.window.__effetuneHostCall = async () => reply;
+  await poll();
+  assert.equal(appliedFrame, undefined, 'enqueue and unrelated receipts must not settle the drag');
+  assert.equal(port.owner.pendingSoundFontControls.size, 1);
+  reply = { soundFontControlResults: [{ requestId: payload.requestId, appliedFrame: 64 }],
+    packet: 'AA==', bytes: 1, mixerEndFrame: 128 };
+  await poll();
+  await pending;
+  assert.equal(appliedFrame, 64);
+  assert.deepEqual(packets.map(packet => packet.mixerEndFrame), [64, 128]);
+  assert.equal(port.owner.pendingSoundFontControls.size, 0);
+  const closing = assert.rejects(send(), /SoundFont editor closed/);
+  port.close();
+  await closing;
+  assert.equal(port.owner.pendingSoundFontControls.size, 0);
+});
+
 test('native telemetry preserves Note history within a source and accepts restarted instances', async () => {
   const fixture = createNativePort();
   const { context, port } = fixture;

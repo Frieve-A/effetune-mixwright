@@ -100,7 +100,7 @@ struct AutomationState {
 
 struct PluginStateDocument {
   std::uint32_t formatVersion = 1;
-  std::string appVersion = "0.17.0";
+  std::string appVersion = "0.18.1";
   PipelineState pipelineA;
   PipelineState pipelineB;
   bool pipelineBInitialized = false;

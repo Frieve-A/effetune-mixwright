@@ -953,6 +953,71 @@ void testSfzAssetAdmissionAndReplay() {
          "cleared SFZ never reappears on rebuild");
 }
 
+void testSoundFontMixerControlAcknowledgement(const PipelineState &pipeline,
+                                              const RuntimePlugin &player,
+                                              const RuntimeAsset &asset) {
+  constexpr std::uint32_t frames = 128;
+  constexpr double rate = 48000.0;
+  auto engine = std::make_unique<EngineHost>();
+  std::string error;
+  const auto soundFontId = player.logicalId;
+  expect(engine->prepare(rate, 2, frames, EngineHost::kDefaultTelemetryBytes, &error) &&
+         engine->rebuild(pipeline, {player}, &error) && engine->setAsset(asset, &error) &&
+         engine->assetState(soundFontId, 0) == ET_ASSET_STATE_ACTIVE,
+         "prepare a separate SoundFont host for mixer acknowledgements");
+
+  std::array<float, frames> left{}, right{};
+  float *audio[]{left.data(), right.data()};
+  double time = 0.0;
+  const auto render = [&](AudioCommandQueue *commands = nullptr) {
+    left.fill(0.0f);
+    right.fill(0.0f);
+    effetune::allocation_guard::Scope guard;
+    expect(engine->tryProcessBlock(audio, 2, frames, time, false, commands),
+           "render SoundFont mixer controls without allocations");
+    time += frames / rate;
+  };
+  auto commands = std::make_unique<AudioCommandQueue>();
+  for (int block = 0; block < 7; ++block) render();
+  AudioCommand edit;
+  edit.type = AudioCommandType::soundFontMidiControl;
+  edit.logicalId = soundFontId;
+  edit.soundFontControl.kind = SoundFontControlKind::channel;
+  edit.soundFontControl.messageCount = 1;
+  edit.soundFontControl.messages[0] = 0xb0u | (10u << 8u) | (51u << 16u);
+  edit.soundFontControl.requestId = 23;
+  edit.soundFontControl.pageGeneration = 4;
+  edit.soundFontControl.targetRevision = engine->soundFontControlTargetRevision(soundFontId);
+  EngineHost::SoundFontControlResult applied;
+  expect(commands->push(edit) && !engine->popSoundFontControlResult(applied),
+         "queueing a mixer edit does not acknowledge application");
+  render(commands.get());
+  expect(engine->popSoundFontControlResult(applied) && applied.requestId == 23 &&
+         applied.pageGeneration == 4 && applied.appliedFrame == 7 * frames,
+         "acknowledge an applied mixer edit at the start of its audio block");
+  for (int block = 0; block < 6; ++block) render();
+  {
+    std::vector<std::uint8_t> packet(EngineHost::kDefaultTelemetryBytes);
+    std::uint32_t dropped = 0;
+    std::optional<std::uint64_t> mixerEndFrame;
+    expect(engine->readTelemetry(packet, dropped, nullptr, &mixerEndFrame) >= 2u * (16u + 584u) &&
+           mixerEndFrame == applied.appliedFrame,
+           "a packet with pre-edit mixer telemetry keeps its oldest boundary");
+    for (int block = 0; block < 7; ++block) render();
+    const auto mixer = engine->soundFontMixerState(soundFontId);
+    expect(engine->readTelemetry(packet, dropped, nullptr, &mixerEndFrame) > 0 &&
+           mixerEndFrame && *mixerEndFrame > *applied.appliedFrame &&
+           mixer && mixer->channels[0].pan == 51,
+           "a post-edit mixer packet has a strictly newer boundary and the applied value");
+  }
+  ++edit.soundFontControl.requestId;
+  expect(engine->supersedeAssetRequest(soundFontId, 0) != edit.soundFontControl.targetRevision &&
+         commands->push(edit), "queue a mixer edit with a superseded bank revision");
+  render(commands.get());
+  expect(engine->popSoundFontControlResult(applied) && applied.requestId == 24 && !applied.appliedFrame,
+         "reject a stale mixer edit without rejecting audio");
+}
+
 void testSoundFontHostMidiAndReplay() {
   constexpr std::uint32_t soundFontId = 71;
   constexpr std::uint32_t frames = 128;
@@ -960,7 +1025,10 @@ void testSoundFontHostMidiAndReplay() {
   std::string error;
   expect(engine->prepare(48000, 2, frames, EngineHost::kDefaultTelemetryBytes, &error),
          "prepare SoundFont host");
-  const effetune::generated::SoundFontPlayerPluginParams params{0, 64, 0, 1};
+  effetune::generated::SoundFontPlayerPluginParams params{};
+  params.maxVoices = 64;
+  params.sampleQuality = 1;
+  params.previewMidi = -1;
   RuntimePlugin player;
   player.logicalId = soundFontId;
   player.type = "SoundFontPlayerPlugin";
@@ -988,6 +1056,7 @@ void testSoundFontHostMidiAndReplay() {
   asset.initialPages.push_back(std::move(page));
   expect(engine->setAsset(asset, &error) && engine->assetState(soundFontId, 0) == ET_ASSET_STATE_ACTIVE,
          "prepare all SoundFont pages before installing the bank");
+  testSoundFontMixerControlAcknowledgement(pipeline, player, asset);
 
   std::array<float, frames> left{}, right{};
   const float *input[]{left.data(), right.data()};
@@ -1007,6 +1076,7 @@ void testSoundFontHostMidiAndReplay() {
     }
     time += frames / rate;
   };
+
   const auto sounding = [](const auto samples) {
     return std::any_of(samples.begin(), samples.end(), [](float value) {
       return std::abs(value) > .001f;

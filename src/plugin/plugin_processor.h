@@ -562,6 +562,10 @@ private:
   OutputTransition outputTransition_;
   LatestParameterMailbox parameterMailbox_;
   AudioCommandQueue instanceCommands_;
+  // Serializes receipt admission and draining on control threads. Polling
+  // takes only this mutex, so it can drain while processing resources are held.
+  std::mutex soundFontControlResultsMutex_;
+  std::size_t pendingSoundFontControlCount_ = 0;
   std::optional<AudioCommand> pendingDescriptorCommand_;
   AutomationBindingRegistry automationBindings_;
   AutomationParameterBank automationParameters_;

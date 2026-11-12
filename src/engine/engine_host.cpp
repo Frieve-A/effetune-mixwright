@@ -105,6 +105,7 @@ struct EngineHost::TelemetryStorage {
     std::array<std::uint8_t, kDefaultTelemetryBytes> bytes{};
     std::uint32_t byteCount = 0;
     std::uint32_t droppedFrames = 0;
+    std::optional<std::uint64_t> mixerEndFrame;
   };
   static constexpr std::size_t kSlotCount = 4;
   std::array<Slot, kSlotCount> slots{};
@@ -1355,6 +1356,21 @@ std::optional<SoundFontMixerState> EngineHost::soundFontMixerState(
   return found == soundFontMixers_.end() ? std::nullopt : found->second->read();
 }
 
+std::size_t EngineHost::maximumSoundFontSamples() noexcept {
+  return effetune::plugins::others::sfz::SamplePageCache::kMaxSamples;
+}
+
+std::uint64_t EngineHost::soundFontControlTargetRevision(const std::uint32_t logicalId) const {
+  std::scoped_lock lock(engineMutex_);
+  const auto instance = instances_.find(logicalId);
+  const auto bank = assets_.find(static_cast<std::uint64_t>(logicalId) << 32u);
+  if (instance == instances_.end() || !instance->second.soundFont ||
+      instance->second.contextuallyBypassed || bank == assets_.end() ||
+      (bank->second.state.load(std::memory_order_acquire) & 0xffu) != ET_ASSET_STATE_ACTIVE)
+    return 0;
+  return bank->second.requestRevision.load(std::memory_order_acquire);
+}
+
 void EngineHost::replaceSoundFontMixerStates(
     const std::map<std::uint32_t, SoundFontMixerState> &states) {
   std::map<std::uint32_t, std::unique_ptr<SoundFontMixerProjection>> replacement;
@@ -1418,11 +1434,18 @@ bool EngineHost::applyCommandUnlocked(const AudioCommand &command,
 }
 
 bool EngineHost::applySoundFontControlUnlocked(const AudioCommand &command) noexcept {
+  const auto &control = command.soundFontControl;
   const auto found = instances_.find(command.logicalId);
   if (found == instances_.end() || !found->second.soundFont || found->second.contextuallyBypassed)
-    return true;
+    return control.requestId == 0;
   const auto instance = found->second.instance;
-  const auto &control = command.soundFontControl;
+  if (control.requestId != 0) {
+    const auto bank = assets_.find(static_cast<std::uint64_t>(command.logicalId) << 32u);
+    if (bank == assets_.end() || control.targetRevision == 0 ||
+        bank->second.requestRevision.load(std::memory_order_acquire) != control.targetRevision ||
+        (engine_->instanceAssetState(instance, 0) & 0xffu) != ET_ASSET_STATE_ACTIVE)
+      return false;
+  }
   switch (control.kind) {
   case SoundFontControlKind::metering:
     return engine_->setInstanceMidiMetering(instance, control.value) == ET_OK;
@@ -1437,9 +1460,9 @@ bool EngineHost::applySoundFontControlUnlocked(const AudioCommand &command) noex
     for (std::uint32_t index = 0; index < control.messageCount; ++index)
       edits[index].message = control.messages[index];
     // A bank can be cleared or exchanged after the UI queued this edit.
-    (void)engine_->setInstanceMidiEvents(instance, edits.data(), control.messageCount,
+    const auto status = engine_->setInstanceMidiEvents(instance, edits.data(), control.messageCount,
         engine_->instanceMidiGeneration(instance), ET_MIDI_CONTROL_ONLY);
-    return true;
+    return control.requestId == 0 || status == ET_OK;
   }
   }
   return false;
@@ -1712,6 +1735,7 @@ bool EngineHost::ProcessBatch::processChunk(const float *const *input, float *co
                 sizeof(float) * frameCount);
   }
   host_->processedFrames_ += frameCount;
+  host_->mixerProcessedFrames_ += frameCount;
   return true;
 }
 
@@ -1767,6 +1791,15 @@ bool EngineHost::beginProcessBatch(
   batch.failed_ = false;
 
   const auto apply = [this, &batch](const AudioCommand &command) noexcept {
+    if (command.type == AudioCommandType::soundFontMidiControl &&
+        command.soundFontControl.requestId != 0) {
+      const auto &control = command.soundFontControl;
+      SoundFontControlResult result{control.requestId, control.pageGeneration, std::nullopt};
+      if (applySoundFontControlUnlocked(command)) result.appliedFrame = mixerProcessedFrames_;
+      // The bridge reserves result capacity before enqueueing tracked controls.
+      (void)soundFontControlResults_.push(result);
+      return;
+    }
     if (applyCommandUnlocked(command, &batch.pipelinePlanDirty_)) {
       batch.latencyDirty_ = true;
     } else {
@@ -2082,9 +2115,10 @@ bool EngineHost::refreshLatencyUnlocked(bool *instanceLatencyChanged) noexcept {
   return previous != pipelineLatency;
 }
 
-void EngineHost::updateSoundFontMixerTelemetryUnlocked(
+bool EngineHost::updateSoundFontMixerTelemetryUnlocked(
     const std::span<const std::uint8_t> bytes) noexcept {
-  if (soundFontMixerTaps_.empty()) return;
+  if (soundFontMixerTaps_.empty()) return false;
+  auto hasMixerFrame = false;
   for (std::size_t offset = 0; bytes.size() - offset >= 16u;) {
     const auto *header = bytes.data() + offset;
     const auto size = readUint16(header + 12u);
@@ -2094,6 +2128,7 @@ void EngineHost::updateSoundFontMixerTelemetryUnlocked(
     if (readUint16(header) != 35u || readUint16(header + 2u) != 2u || size != 584u) continue;
     const auto found = soundFontMixerTaps_.find(readUint32(header + 4u));
     if (found == soundFontMixerTaps_.end()) continue;
+    hasMixerFrame = true;
     const auto &entry = *found->second;
     // An unloaded player emits default-looking rows. Keep a saved mixer
     // available for the bank that has yet to load.
@@ -2112,6 +2147,7 @@ void EngineHost::updateSoundFontMixerTelemetryUnlocked(
     }
     entry.soundFontMixer->publish(mixer);
   }
+  return hasMixerFrame;
 }
 
 void EngineHost::drainTelemetryUnlocked() noexcept {
@@ -2122,7 +2158,7 @@ void EngineHost::drainTelemetryUnlocked() noexcept {
     const auto bytes = engine_->readTelemetry(
         telemetry_->discard.data(), static_cast<std::uint32_t>(telemetry_->discard.size()),
         &dropped);
-    updateSoundFontMixerTelemetryUnlocked(std::span(telemetry_->discard).first(bytes));
+    (void)updateSoundFontMixerTelemetryUnlocked(std::span(telemetry_->discard).first(bytes));
     addDroppedFrames(telemetry_->producerDroppedFrames,
                      static_cast<std::uint64_t>(dropped) +
                          countTelemetryFrames(telemetry_->discard.data(), bytes));
@@ -2132,7 +2168,9 @@ void EngineHost::drainTelemetryUnlocked() noexcept {
   slot.byteCount = engine_->readTelemetry(slot.bytes.data(),
                                           static_cast<std::uint32_t>(slot.bytes.size()), &dropped);
   slot.droppedFrames = dropped;
-  updateSoundFontMixerTelemetryUnlocked(std::span(slot.bytes).first(slot.byteCount));
+  slot.mixerEndFrame.reset();
+  if (updateSoundFontMixerTelemetryUnlocked(std::span(slot.bytes).first(slot.byteCount)))
+    slot.mixerEndFrame = mixerProcessedFrames_;
   if (slot.byteCount != 0 || dropped != 0) {
     telemetry_->write.store(next, std::memory_order_release);
   }
@@ -2140,9 +2178,11 @@ void EngineHost::drainTelemetryUnlocked() noexcept {
 
 std::uint32_t EngineHost::readTelemetry(const std::span<std::uint8_t> destination,
                                         std::uint32_t &droppedFrames,
-                                        std::map<std::uint32_t, std::uint64_t> *sources) {
+                                        std::map<std::uint32_t, std::uint64_t> *sources,
+                                        std::optional<std::uint64_t> *mixerEndFrame) {
   std::scoped_lock lock(engineMutex_);
   if (sources) *sources = telemetrySources_;
+  if (mixerEndFrame) mixerEndFrame->reset();
   const auto read = telemetry_->read.load(std::memory_order_relaxed);
   const auto write = telemetry_->write.load(std::memory_order_acquire);
   if (read == write || destination.empty()) {
@@ -2162,6 +2202,10 @@ std::uint32_t EngineHost::readTelemetry(const std::span<std::uint8_t> destinatio
     std::memcpy(destination.data() + bytes, slot.bytes.data(), slot.byteCount);
     bytes += slot.byteCount;
     dropped += slot.droppedFrames;
+    // The bridge combines slots. Stamp them with the oldest mixer snapshot's
+    // boundary so a queued pre-edit snapshot cannot settle a new edit.
+    if (mixerEndFrame && !*mixerEndFrame && slot.mixerEndFrame)
+      *mixerEndFrame = slot.mixerEndFrame;
     index = (index + 1u) % TelemetryStorage::kSlotCount;
   }
   droppedFrames = static_cast<std::uint32_t>(std::min<std::uint64_t>(

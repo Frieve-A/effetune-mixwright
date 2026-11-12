@@ -557,7 +557,8 @@ bool SfzLibrary::readSoundFontPages(std::string_view source, std::size_t byteBud
     const auto request = choc::json::parse(source);
     const auto readId = identifier(request, "readId");
     const auto samples = request["samples"];
-    require(samples.isArray() && samples.size() > 0 && samples.size() <= entryLimit,
+    require(samples.isArray() && samples.size() > 0 &&
+            samples.size() <= EngineHost::maximumSoundFontSamples(),
             "Invalid SoundFont sample list");
     std::scoped_lock lock(impl_->mutex);
     const auto found = impl_->reads.find(readId);
