@@ -4528,7 +4528,7 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     if (requestPageGeneration != uiPageGeneration_.load(std::memory_order_acquire) ||
         pendingSoundFontControlCount_ == 0) return;
     auto results = choc::value::createEmptyArray();
-    EngineHost::SoundFontControlResult applied;
+    SoundFontControlResult applied;
     while (engine_.popSoundFontControlResult(applied)) {
       --pendingSoundFontControlCount_;
       if (applied.pageGeneration != requestPageGeneration) continue;

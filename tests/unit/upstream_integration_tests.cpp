@@ -988,7 +988,7 @@ void testSoundFontMixerControlAcknowledgement(const PipelineState &pipeline,
   edit.soundFontControl.requestId = 23;
   edit.soundFontControl.pageGeneration = 4;
   edit.soundFontControl.targetRevision = engine->soundFontControlTargetRevision(soundFontId);
-  EngineHost::SoundFontControlResult applied;
+  SoundFontControlResult applied;
   expect(commands->push(edit) && !engine->popSoundFontControlResult(applied),
          "queueing a mixer edit does not acknowledge application");
   render(commands.get());

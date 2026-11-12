@@ -87,6 +87,12 @@ struct SoundFontMixerState {
   SoundFontMixerState() noexcept { channels[9].selectedBank = 128; }
 };
 
+struct SoundFontControlResult {
+  std::uint64_t requestId = 0;
+  std::uint64_t pageGeneration = 0;
+  std::optional<std::uint64_t> appliedFrame;
+};
+
 class EngineHost {
 public:
   static constexpr std::uint32_t kMaxChannels = 8;
@@ -267,11 +273,6 @@ public:
   [[nodiscard]] std::optional<SoundFontMixerState> soundFontMixerState(
       std::uint32_t logicalId) const;
   [[nodiscard]] std::uint64_t soundFontControlTargetRevision(std::uint32_t logicalId) const;
-  struct SoundFontControlResult {
-    std::uint64_t requestId = 0;
-    std::uint64_t pageGeneration = 0;
-    std::optional<std::uint64_t> appliedFrame;
-  };
   static constexpr std::size_t kMaxPendingSoundFontControls = AudioCommandQueue::kUsableCapacity;
   [[nodiscard]] bool popSoundFontControlResult(SoundFontControlResult &result) noexcept {
     return soundFontControlResults_.pop(result);
