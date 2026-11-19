@@ -67,6 +67,7 @@ public:
   Steinberg::tresult PLUGIN_API setActive(Steinberg::TBool state) SMTG_OVERRIDE;
   Steinberg::tresult PLUGIN_API setupProcessing(
       Steinberg::Vst::ProcessSetup &setup) SMTG_OVERRIDE;
+  Steinberg::tresult PLUGIN_API setProcessing(Steinberg::TBool state) SMTG_OVERRIDE;
   Steinberg::tresult PLUGIN_API setBusArrangements(
       Steinberg::Vst::SpeakerArrangement *inputs, Steinberg::int32 numInputs,
       Steinberg::Vst::SpeakerArrangement *outputs, Steinberg::int32 numOutputs) SMTG_OVERRIDE;
@@ -176,8 +177,17 @@ private:
     std::string artworkDataUrl;
   };
 
+  struct NowPlayingLyrics {
+    std::string text;
+    std::string format;
+    double timeOffset = 0.0;
+    double duration = 0.0;
+  };
+
   void appendNowPlayingSnapshot(choc::value::Value &result,
-                                std::uint64_t knownRevision);
+                                std::optional<std::uint64_t> knownRevision);
+  void appendLyricsSnapshot(choc::value::Value &result,
+                            std::optional<std::uint64_t> knownRevision);
   void publishHostTransport(const Steinberg::Vst::ProcessContext *context,
                             Steinberg::int32 frames) noexcept;
   void publishMidiTelemetry(std::span<const et_midi_event> events,
@@ -723,9 +733,14 @@ private:
   static_assert(std::atomic<std::uint64_t>::is_always_lock_free &&
                 std::atomic<std::int64_t>::is_always_lock_free,
                 "Host transport publication must remain lock-free");
+  // Host processing lifecycle, with an odd epoch while stopped. It stays
+  // separate from the audio thread's snapshot so both have a single writer.
+  std::atomic<std::uint64_t> transportProcessingEpoch_{0};
   // The audio thread publishes a fixed-size snapshot; readers retry only a
   // bounded number of times and never hold up processing.
   std::atomic<std::uint64_t> transportSequence_{0};
+  std::atomic<std::uint64_t> transportSnapshotProcessingEpoch_{0};
+  std::atomic<std::uint64_t> transportDiscontinuityRevision_{0};
   std::atomic<std::int64_t> transportProjectTimeSamples_{0};
   std::atomic<double> transportTempo_{0.0};
   std::atomic<double> transportPpq_{0.0};
@@ -735,6 +750,7 @@ private:
   std::atomic<double> transportSampleRate_{0.0};
   std::atomic_bool transportPlaying_{false};
   std::atomic_bool transportAvailable_{false};
+  std::optional<std::int64_t> transportExpectedNextSample_; // Audio thread only.
   double engineFramesProcessed_ = 0.0;
   std::int64_t processedHostFrames_ = 0;
   std::int64_t previousProjectTimeSamples_ = 0;
@@ -924,6 +940,8 @@ private:
   std::mutex nowPlayingMutex_;
   NowPlayingMetadata nowPlaying_;
   std::uint64_t nowPlayingRevision_ = 1;
+  NowPlayingLyrics lyrics_;
+  std::uint64_t lyricsRevision_ = 1;
   std::mutex editorMutex_;
   std::mutex assetTransferMutex_;
   std::shared_ptr<WebViewHost> webView_;

@@ -306,13 +306,14 @@ test('Visualizer add-item choices omit player items while preserving imported it
     assert.ok(ITEM_TYPES.includes('lyrics'), 'Lyrics remains a supported saved item type');
     assert.ok(ITEM_TYPES.includes('video'), 'Video remains a supported saved item type');
     assert.ok(choices.includes('counter'));
-    const excluded = ['lyrics', 'video', 'playback-control', 'seek-bar', 'track-info'];
+    assert.ok(choices.includes('lyrics'));
+    const excluded = ['video', 'playback-control', 'seek-bar', 'track-info'];
     for (const type of excluded) assert.ok(ITEM_TYPES.includes(type));
     assert.deepEqual(choices.toSorted(), ITEM_TYPES.filter(type => !excluded.includes(type)).toSorted());
   } finally { globalThis.document = previousDocument; }
 });
 
-test('bundled Visualizer system presets omit only Lyric Stage across all aspects', async () => {
+test('bundled Visualizer system presets retain all upstream presets including Lyric Stage', async () => {
   const sourceDirectory = new URL('../../external/effetune/presets/visualizer/', import.meta.url);
   const { VisualizerPresetStore } = await assetModule('js/visualizer/visualizer-preset-store.js');
   const { ASPECT_FILES } = await assetModule('js/visualizer/visualizer-model.js');
@@ -325,9 +326,9 @@ test('bundled Visualizer system presets omit only Lyric Stage across all aspects
     .filter(file => file.endsWith('.json')).sort(), files);
   for (const file of files) {
     const expected = JSON.parse(await readFile(new URL(file, sourceDirectory), 'utf8'));
-    delete expected['Lyric Stage'];
     const actual = JSON.parse(await assetText(`presets/visualizer/${file}`));
-    assert.deepEqual(actual, expected, `${file} retains all other presets, including Cinema Strip`);
+    if (['16x9.json', '9x16.json'].includes(file)) assert.ok(Object.hasOwn(actual, 'Lyric Stage'));
+    assert.deepEqual(actual, expected, `${file} retains all presets, including Lyric Stage and Cinema Strip`);
     const aspect = Object.keys(ASPECT_FILES).find(aspect => ASPECT_FILES[aspect] === file);
     assert.deepEqual(bundled[aspect], expected);
   }
@@ -372,29 +373,147 @@ test('bundled Visualizer reads transient host metadata without an internal playe
   assert.equal(VisualizerView.prototype.metadata.call(view), null);
 });
 
-test('Visualizer Counter follows project transport and cannot reset on click or editor reopen', async () => {
+test('bundled Visualizer delegates host lyrics only when the layout uses them', async () => {
   const { VisualizerView } = await assetModule('js/visualizer/visualizer-view.js');
-  let transport = null;
+  const lyrics = { data: { synced: true, lines: [{ time: 1, text: 'First line' }] },
+    time: 1.5, duration: 30, isStopped: false };
+  const view = { hasLyrics: false, uiManager: { audioManager: {
+    getVisualizerLyrics: () => assert.fail('layouts without Lyrics must not parse the host payload')
+  } } };
+  assert.equal(VisualizerView.prototype.lyrics.call(view), null);
+  const manager = view.uiManager.audioManager;
+  view.hasLyrics = true;
+  manager.getVisualizerLyrics = () => lyrics;
+  assert.equal(VisualizerView.prototype.lyrics.call(view), lyrics);
+  manager.getVisualizerLyrics = () => null;
+  assert.equal(VisualizerView.prototype.lyrics.call(view), null);
+  delete manager.getVisualizerLyrics;
+  assert.equal(VisualizerView.prototype.lyrics.call(view), null);
+});
+
+test('bundled Visualizer lyrics never advertise click-to-seek', async () => {
+  const { VisualizerView } = await assetModule('js/visualizer/visualizer-view.js');
+  const view = { editor: { open: false }, hasLyrics: true,
+    canvas: { getBoundingClientRect: () => ({ left: 0, top: 0, width: 100, height: 100 }) },
+    renderer: { lyricsSeekTime: () => assert.fail('host project seeking is unavailable') } };
+  assert.equal(VisualizerView.prototype.lyricsSeekTime.call(view,
+    { clientX: 50, clientY: 50, target: {} }), null);
+});
+
+async function hostCounterFixture(t) {
+  const previous = { window: globalThis.window, document: globalThis.document };
+  Object.assign(globalThis, {
+    window: { location: { search: '' }, electronAPI: {}, addEventListener() {}, removeEventListener() {} },
+    document: { hidden: false, addEventListener() {}, removeEventListener() {} }
+  });
+  t.after(() => Object.assign(globalThis, previous));
+  let now = 0;
+  t.mock.method(performance, 'now', () => now);
+  const { AudioManager } = await assetModule('vst-audio-manager.js');
+  const { VisualizerView } = await assetModule('js/visualizer/visualizer-view.js');
+  const audioManager = new AudioManager();
+  clearInterval(audioManager.telemetryTimer);
   const createView = () => ({ layout: { items: [{ id: 'counter', type: 'counter' }] },
-    uiManager: { audioManager: { getHostTransport: () => transport } },
+    uiManager: { audioManager },
     counters: VisualizerView.prototype.counters });
+  return { audioManager, VisualizerView, createView, setNow: value => { now = value; },
+    transport: (samples, playing, sampleRate = 48000) => audioManager.applyNativeHostTransport({
+      hostTransport: { available: true, projectTimeSamples: samples, sampleRate, playing }
+    }) };
+}
+
+test('Visualizer Counter shares host display time and cannot reset on click or editor reopen', async t => {
+  const { audioManager, VisualizerView, createView, setNow, transport } = await hostCounterFixture(t);
   let view = createView();
   const descriptor = now => view.counters(now).get('counter');
   assert.deepEqual(descriptor(100), { time: 0, trackIndex: 0, external: false, playing: false,
     speed: 1, source: 'vst-host-project', stamp: .1 });
-  for (const [samples, playing] of [[96000, true], [144000, false], [480000, true], [48000, true], [-24000, false]]) {
-    transport = { projectTimeSamples: samples, sampleRate: 48000, playing };
-    assert.equal(descriptor(5000).time, Math.max(0, samples / 48000));
-    assert.equal(descriptor(9000).time, descriptor(5000).time, 'wall time never advances the project clock');
-    assert.equal(descriptor(9000).playing, playing);
-    assert.equal(VisualizerView.prototype.resetCounter.call(view, 'counter', 10000), false);
-    view = createView();
-    assert.equal(descriptor(11000).time, Math.max(0, samples / 48000), 'a reopened editor uses the same project position');
-  }
-  transport = null;
+  setNow(1000);
+  transport(96000, false);
+  assert.equal(descriptor(1000).time, 2);
+  assert.equal(descriptor(5000).time, 2, 'paused time never advances with wall time');
+  setNow(6000);
+  transport(96000, true);
+  assert.equal(descriptor(6000).time, 2);
+  const advancing = descriptor(6100);
+  assert.equal(advancing.time, 2.1);
+  assert.equal(advancing.stamp, 6.1, 'the display clock and stamp use the supplied now');
+  assert.equal(advancing.playing, true);
+  assert.equal(descriptor(9000).time, 2.2, 'unchanged playing positions advance only to the cap');
+  assert.equal(VisualizerView.prototype.resetCounter.call(view, 'counter', 9000), false);
+  view = createView();
+  assert.equal(descriptor(9000).time, 2.2, 'a reopened view shares the audio manager clock');
+  setNow(10000);
+  transport(48000, true);
+  assert.equal(descriptor(10000).time, 1, 'backward seeks reset exactly');
+  setNow(11000);
+  transport(-24000, false);
+  assert.equal(descriptor(11000).time, 0);
+  audioManager.applyNativeHostTransport({ hostTransport: null });
   assert.equal(descriptor(20000).time, 0);
   assert.equal(descriptor(20000).playing, false);
   assert.equal(VisualizerView.prototype.videoFrame.call(view), null);
+});
+
+test('Visualizer Counter remains continuous under jitter until a backward seek', async t => {
+  const { createView, setNow, transport } = await hostCounterFixture(t);
+  const view = createView();
+  const rate = 44100, block = 2048, blockMs = block / rate * 1000;
+  transport(rate, true, rate);
+  let previous = view.counters(0).get('counter');
+  let nextFrame = 1000 / 60;
+  let samples = rate;
+  const frame = now => {
+    setNow(now);
+    const current = view.counters(now).get('counter');
+    const advance = current.time - previous.time;
+    const elapsed = current.stamp - previous.stamp;
+    assert.ok(advance >= 0, 'animateCounterFrame requires nonnegative advance');
+    assert.ok(elapsed >= 0 && elapsed <= .5);
+    assert.ok(Math.abs(advance - elapsed) <= Math.max(.06, elapsed * .25),
+      'jitter remains within the upstream Counter continuity tolerance');
+    assert.ok(current.time <= samples / rate + .2);
+    previous = current;
+  };
+  for (let index = 1; index <= 12; index++) {
+    const observed = index * blockMs + (index % 2 ? 18 : -8);
+    while (nextFrame < observed) {
+      frame(nextFrame);
+      nextFrame += 1000 / 60;
+    }
+    setNow(observed);
+    samples = rate + index * block;
+    transport(samples, true, rate);
+    frame(observed);
+  }
+  setNow(1000);
+  transport(rate / 2, true, rate);
+  const sought = view.counters(1000).get('counter');
+  assert.equal(sought.time, .5);
+  assert.ok(sought.time - previous.time < 0, 'a real backward seek is a discontinuity');
+});
+
+test('Visualizer Counter and lyrics share compensated time with or without a lyrics snapshot', async t => {
+  const { audioManager, createView, setNow, transport } = await hostCounterFixture(t);
+  const view = createView();
+  audioManager.dspPipelineLatencySamples = 4800;
+  setNow(1000);
+  transport(480000, true);
+  setNow(1080);
+  const withoutLyrics = view.counters(1080).get('counter').time;
+  assert.equal(withoutLyrics, 9.98);
+  assert.equal(audioManager.getVisualizerLyrics(), null);
+  const timeOffset = 2;
+  audioManager.applyNativeLyrics({ lyricsRevision: 1,
+    lyrics: { format: 'lrc', text: '[00:01.00]First line', timeOffset, duration: 30 } });
+  const lyrics = audioManager.getVisualizerLyrics();
+  assert.ok(lyrics);
+  const counter = view.counters(1080).get('counter');
+  assert.equal(counter.time, lyrics.time + timeOffset);
+  assert.equal(counter.time, withoutLyrics);
+  assert.equal(counter.stamp, 1.08);
+  audioManager.applyNativeLyrics({ lyricsRevision: 2, lyrics: null });
+  assert.equal(view.counters(1080).get('counter').time, withoutLyrics);
 });
 
 test('excluded desktop entries leave ordinary A/B availability and imported player items intact', async () => {

@@ -16,6 +16,7 @@ import { SFZ_SAMPLE_PAGE_FRAMES } from './js/sfz/sample-stream.js';
 import { getSfzMaxBytes } from './js/sfz/limits.js';
 import { MidiInputState } from './js/midi/smf-timeline.js';
 import { getMidiEventList } from './js/midi/event-list.js';
+import { boundLyrics, parseLrc } from './js/library/metadata/lyrics.js';
 
 window.dspParamPackers = DSP_PARAM_PACKERS;
 
@@ -32,6 +33,13 @@ const HOST_DIAGNOSTIC_VISIBLE_MS = 3000;
 // Synthetic per-instance enable target. The native side exposes the same key so
 // effect ON/OFF can be automated without duplicating the generated catalog.
 const NODE_ENABLE_DESCRIPTOR = { key: '__enabled', element: 0 };
+// The project position advances once per host block and is observed by a 60 Hz
+// poll. Extrapolating at most this long hides that stepping (an 8192-frame block
+// at 44.1 kHz) without letting the display run far ahead of the host.
+const HOST_CLOCK_EXTRAPOLATION_SECONDS = 0.2;
+// Unsynced lyrics without a transport clock are shown fully faded in: this
+// lies beyond every legal Visualizer fade-in, and zero duration disables pacing.
+const UNCLOCKED_TIME = 1e9;
 
 function encodeBase64(bytes) {
   let binary = '';
@@ -162,6 +170,35 @@ function getPluginParameterOptions(owner, commitSampleRate = false) {
   };
   if (commitSampleRate) options.commitSampleRate = true;
   return options;
+}
+
+// Builds the upstream lyrics model from a host snapshot. The native side only
+// validates transport, so a payload that does not parse yields no model.
+function lyricsModelFromSnapshot(snapshot) {
+  if (typeof snapshot?.text !== 'string') return null;
+  if (snapshot.format === 'lrc') return boundLyrics(parseLrc(snapshot.text));
+  const text = snapshot.text.replace(/^\uFEFF/, '');
+  if (snapshot.format === 'text') {
+    return boundLyrics({ synced: false, lines: text.split(/\r\n|\n|\r/).map(line => ({ text: line })) });
+  }
+  if (snapshot.format !== 'json') return null;
+  let model;
+  try {
+    model = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (model?.synced === true && Array.isArray(model.lines)) {
+    // boundLyrics truncates in source order, so sort first to keep the earliest cues.
+    const byTime = (left, right) => left.time - right.time;
+    model.lines = model.lines.filter(line => Number.isFinite(line?.time)).sort(byTime);
+    for (const line of model.lines) {
+      if (Array.isArray(line.words)) {
+        line.words = line.words.filter(word => Number.isFinite(word?.time)).sort(byTime);
+      }
+    }
+  }
+  return boundLyrics(model);
 }
 
 class NativePort {
@@ -1069,7 +1106,13 @@ export class AudioManager extends BrowserAudioManager {
     this.ioManager.sourceNode = fakeNode({ postMessage: noop });
     this.nowPlayingRevision = 0;
     this.nowPlayingMetadata = null;
+    this.lyricsRevision = 0;
+    this.lyricsSnapshot = null;
+    this.lyricsModel = null;
+    this.lyricsModelRevision = null;
     this.hostTransport = null;
+    this.hostTransportAnchorTime = null;
+    this.hostDisplayFloor = null;
     this.nextSoundFontControlRequestId = 0;
     this.pendingSoundFontControls = new Map();
     this.telemetryTimer = setInterval(() => this.pollNativeTelemetry(), 1000 / 60);
@@ -1103,11 +1146,41 @@ export class AudioManager extends BrowserAudioManager {
   applyNativeHostTransport(info) {
     if (!Object.prototype.hasOwnProperty.call(info ?? {}, 'hostTransport')) return;
     const transport = info.hostTransport;
-    this.hostTransport = transport?.available === true &&
+    const previous = this.hostTransport ?? null;
+    const next = transport?.available === true &&
       Number.isFinite(transport.projectTimeSamples) &&
       Number.isFinite(transport.sampleRate) && transport.sampleRate > 0
       ? { ...transport, playing: transport.playing === true }
       : null;
+    this.hostTransport = next;
+    const sameClock = previous?.sampleRate === next?.sampleRate &&
+      previous?.playing === next?.playing &&
+      previous?.discontinuityRevision === next?.discontinuityRevision;
+    if (sameClock && previous?.projectTimeSamples === next?.projectTimeSamples) return;
+    // A regular forward block keeps the display floor. The native revision
+    // also catches jumps and play-state edges between polls at the same position.
+    if (!(sameClock && next?.playing &&
+          next.projectTimeSamples > previous.projectTimeSamples)) this.hostDisplayFloor = null;
+    this.hostTransportAnchorTime = performance.now();
+  }
+
+  // The latency-corrected audible project position shared by the lyrics and the
+  // Visualizer Counter, or null without a host transport.
+  getHostDisplaySeconds(now = performance.now()) {
+    const transport = this.getHostTransport();
+    if (!transport) return null;
+    // Pipeline latency is reported in host-rate samples, independent of oversampling.
+    const latency = this.dspPipelineLatencySamples ?? 0;
+    const base = (transport.projectTimeSamples - latency) / transport.sampleRate;
+    if (!transport.playing) return Math.max(0, base);
+    const elapsed = Math.max(0, (now - (this.hostTransportAnchorTime ?? now)) / 1000);
+    const fresh = Math.max(0, base + Math.min(elapsed, HOST_CLOCK_EXTRAPOLATION_SECONDS));
+    // The poll observes a block late, so an anchor reset could step the display
+    // back; hold the last value, but never more than the cap ahead of the host.
+    const floor = this.hostDisplayFloor?.latency === latency ? this.hostDisplayFloor.seconds : -Infinity;
+    const seconds = Math.max(fresh, Math.min(floor, base + HOST_CLOCK_EXTRAPOLATION_SECONDS));
+    this.hostDisplayFloor = { seconds, latency };
+    return seconds;
   }
 
   applyNativeNowPlaying(info) {
@@ -1118,6 +1191,34 @@ export class AudioManager extends BrowserAudioManager {
         !Object.prototype.hasOwnProperty.call(info, 'nowPlaying')) return;
     this.nowPlayingMetadata = info.nowPlaying;
     this.nowPlayingRevision = info.nowPlayingRevision;
+  }
+
+  applyNativeLyrics(info) {
+    // The same overlap rule as the track metadata above.
+    if (!Number.isSafeInteger(info?.lyricsRevision) ||
+        info.lyricsRevision <= (this.lyricsRevision ?? 0) ||
+        !Object.prototype.hasOwnProperty.call(info, 'lyrics')) return;
+    this.lyricsSnapshot = info.lyrics;
+    this.lyricsRevision = info.lyricsRevision;
+  }
+
+  getVisualizerLyrics() {
+    const revision = this.lyricsRevision ?? 0;
+    if (this.lyricsModelRevision !== revision) {
+      this.lyricsModel = lyricsModelFromSnapshot(this.lyricsSnapshot);
+      this.lyricsModelRevision = revision;
+    }
+    const data = this.lyricsModel;
+    if (!data) return null;
+    const seconds = this.getHostDisplaySeconds();
+    if (seconds === null) {
+      // Without a clock, synced lyrics stop; unsynced ones show statically.
+      return data.synced
+        ? { data, time: 0, duration: 0, isStopped: true }
+        : { data, time: UNCLOCKED_TIME, duration: 0, isStopped: false };
+    }
+    const { timeOffset = 0, duration = 0 } = this.lyricsSnapshot;
+    return { data, time: seconds - timeOffset, duration, isStopped: false };
   }
 
   pollNativeTelemetry() {
@@ -1145,6 +1246,7 @@ export class AudioManager extends BrowserAudioManager {
       const runtimePipeline = [...this.getCurrentPipeline()];
       const result = await window.__effetuneHostCall(hidden ? 'host/getInfo' : 'telemetry/read', {
         nowPlayingRevision: this.nowPlayingRevision,
+        lyricsRevision: this.lyricsRevision,
         ...(hidden && { midiTelemetry: true })
       });
       for (const { requestId, appliedFrame } of result.soundFontControlResults ?? []) {
@@ -1153,6 +1255,7 @@ export class AudioManager extends BrowserAudioManager {
         else complete?.(undefined, new Error('The SoundFont control could not be applied. Try again.'));
       }
       this.applyNativeNowPlaying(result);
+      this.applyNativeLyrics(result);
       this.applyNativeHostTransport(result);
       this.applyNativeMidiInput?.(result);
       this.applyNativePerformanceStatus(result);
@@ -1198,9 +1301,10 @@ export class AudioManager extends BrowserAudioManager {
       // page opened on its way out and can no longer release. Every other
       // host/getInfo is a poll and says nothing about which context sent it.
       const info = await window.__effetuneHostCall('host/getInfo', {
-        startup: true, nowPlayingRevision: 0
+        startup: true, nowPlayingRevision: 0, lyricsRevision: 0
       });
       this.applyNativeNowPlaying(info);
+      this.applyNativeLyrics(info);
       this.applyNativeHostTransport(info);
       this.contextManager.audioContext = fakeAudioContext(info.engineSampleRate, info.channels);
       this.nativeMaxEngineFrames = info.maxEngineFrames;

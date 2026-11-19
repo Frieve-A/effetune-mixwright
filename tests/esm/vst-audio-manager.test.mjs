@@ -18,6 +18,9 @@ import { SFZ_SAMPLE_PAGE_FRAMES } from '../../external/effetune/js/sfz/sample-st
 import { getSfzMaxBytes } from '../../external/effetune/js/sfz/limits.js';
 import { MidiInputState } from '../../external/effetune/js/midi/smf-timeline.js';
 import { getMidiEventList } from '../../external/effetune/js/midi/event-list.js';
+import { boundLyrics, parseLrc } from '../../external/effetune/js/library/metadata/lyrics.js';
+import { lyricsFrame, lyricsOpacity } from '../../external/effetune/js/visualizer/visualizer-lyrics.js';
+import { normalizeLayout } from '../../external/effetune/js/visualizer/visualizer-model.js';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const source = await readFile(path.join(projectRoot, 'ui-shim', 'vst-audio-manager.js'), 'utf8');
@@ -130,6 +133,8 @@ function createNativePort() {
     SFZ_SAMPLE_PAGE_FRAMES,
     getSfzMaxBytes,
     getPluginExecutionCapabilities,
+    boundLyrics,
+    parseLrc,
     performance,
     queueMicrotask,
     setTimeout,
@@ -166,8 +171,13 @@ function createNativePort() {
     scheduleLatencyService() {},
     nowPlayingRevision: 0,
     nowPlayingMetadata: null,
+    lyricsRevision: 0,
+    lyricsSnapshot: null,
     getNowPlayingMetadata: context.NowPlayingManager.prototype.getNowPlayingMetadata,
     applyNativeNowPlaying: context.NowPlayingManager.prototype.applyNativeNowPlaying,
+    applyNativeLyrics: context.NowPlayingManager.prototype.applyNativeLyrics,
+    getVisualizerLyrics: context.NowPlayingManager.prototype.getVisualizerLyrics,
+    getHostDisplaySeconds: context.NowPlayingManager.prototype.getHostDisplaySeconds,
     getHostTransport: context.NowPlayingManager.prototype.getHostTransport,
     applyNativeHostTransport: context.NowPlayingManager.prototype.applyNativeHostTransport
   };
@@ -514,6 +524,317 @@ test('native project transport is cached from visible and hidden polls without D
     assert.equal(calls.at(-1), 'telemetry/read');
     assert.equal(port.owner.getHostTransport(), null);
   } finally { port.close(); }
+});
+
+const lyricStageItem = normalizeLayout(JSON.parse(await readFile(path.join(projectRoot,
+  'external', 'effetune', 'presets', 'visualizer', '16x9.json'), 'utf8'))['Lyric Stage'])
+  .items.find(item => item.type === 'lyrics');
+assert.ok(lyricStageItem, 'the Lyric Stage preset has a lyrics item');
+
+// The shared display clock and lyrics accessor over a stubbed performance clock.
+function createLyricsManager({ latency = 0, parse = parseLrc } = {}) {
+  const clock = { now: 0 };
+  const context = { boundLyrics, parseLrc: parse, performance: { now: () => clock.now } };
+  vm.runInNewContext(`${source.slice(classStart, classEnd)}\n` +
+    `this.Manager = class { ${nowPlayingMethods} };\n` +
+    'this.cap = HOST_CLOCK_EXTRAPOLATION_SECONDS; this.unclocked = UNCLOCKED_TIME;', context);
+  const manager = new context.Manager();
+  manager.dspPipelineLatencySamples = latency;
+  const transport = (projectTimeSamples, playing, sampleRate = 48000, discontinuityRevision = 1) =>
+    manager.applyNativeHostTransport({
+      hostTransport: { available: true, projectTimeSamples, sampleRate, playing, discontinuityRevision }
+    });
+  let revision = 0;
+  const load = lyrics => manager.applyNativeLyrics({ lyricsRevision: ++revision, lyrics });
+  return { manager, clock, transport, load, cap: context.cap, unclocked: context.unclocked };
+}
+
+const near = (actual, expected, message) =>
+  assert.ok(Math.abs(actual - expected) < 1e-9, `${message ?? 'value'}: ${actual} !== ${expected}`);
+const plain = value => JSON.parse(JSON.stringify(value));
+
+test('host lyrics replace and clear by revision and ignore stale or incomplete replies', async () => {
+  const fixture = createNativePort();
+  const { context, port } = fixture;
+  vm.runInNewContext('Object.hasOwn = undefined;', context);
+  const poll = installSpectrumPolling(fixture);
+  const calls = [];
+  let revision = 0;
+  let lyrics = null;
+  context.window.__effetuneHostCall = async (type, payload) => {
+    calls.push({ type, payload });
+    return { bytes: 0, lyricsRevision: revision,
+      ...(payload.lyricsRevision !== revision && { lyrics }) };
+  };
+  const lines = () => port.owner.getVisualizerLyrics()?.data.lines.map(line => line.text) ?? null;
+  try {
+    await poll();
+    assert.equal(calls[0].payload.lyricsRevision, 0, 'the poll sends the cached revision explicitly');
+    assert.equal(lines(), null, 'ordinary hosts have no lyrics');
+    lyrics = { text: 'First\nSecond', format: 'text', timeOffset: 0, duration: 0 };
+    revision = 1;
+    await poll();
+    assert.deepEqual(lines(), ['First', 'Second']);
+    await poll();
+    assert.equal(calls.at(-1).payload.lyricsRevision, 1);
+    assert.deepEqual(lines(), ['First', 'Second'], 'unchanged replies retain the cached lyrics');
+    port.owner.applyNativeLyrics({ lyricsRevision: 5 });
+    port.owner.applyNativeLyrics({ lyricsRevision: 2.5, lyrics: { text: 'Bad', format: 'text' } });
+    assert.equal(port.owner.lyricsRevision, 1, 'a reply without a snapshot or an integer revision is ignored');
+    assert.deepEqual(lines(), ['First', 'Second']);
+    lyrics = null;
+    revision = 2;
+    context.document.hidden = true;
+    await poll();
+    assert.equal(calls.at(-1).type, 'host/getInfo');
+    assert.equal(calls.at(-1).payload.lyricsRevision, 1);
+    assert.equal(lines(), null, 'an empty snapshot clears while the editor is hidden');
+    port.owner.applyNativeLyrics({ lyricsRevision: 1,
+      lyrics: { text: 'Stale startup reply', format: 'text', timeOffset: 0, duration: 0 } });
+    assert.equal(lines(), null, 'an overlapping old reply cannot restore cleared lyrics');
+  } finally { port.close(); }
+});
+
+test('host lyrics are parsed once per revision', () => {
+  let parses = 0;
+  const { manager, load } = createLyricsManager({ parse: text => { parses++; return parseLrc(text); } });
+  assert.equal(manager.getVisualizerLyrics(), null);
+  load({ text: '[00:01.00]One', format: 'lrc', timeOffset: 0, duration: 0 });
+  const first = manager.getVisualizerLyrics().data;
+  assert.equal(manager.getVisualizerLyrics().data, first, 'every frame reuses the cached model');
+  assert.equal(parses, 1);
+  load({ text: '[00:02.00]Two', format: 'lrc', timeOffset: 0, duration: 0 });
+  assert.equal(manager.getVisualizerLyrics().data.lines[0].text, 'Two');
+  manager.getVisualizerLyrics();
+  assert.equal(parses, 2);
+});
+
+test('host lyrics formats map to the upstream model with the transport clock', () => {
+  const { manager, clock, transport, load } = createLyricsManager();
+  load({ text: '[offset:+500]\n[00:02.00]Two\n[00:01.00]One', format: 'lrc', timeOffset: 0, duration: 0 });
+  assert.deepEqual(plain(manager.getVisualizerLyrics().data),
+    { synced: true, lines: [{ time: 0.5, text: 'One' }, { time: 1.5, text: 'Two' }] });
+  load({ text: '[00:01.00]<00:01.00>Hel<00:01.50>lo', format: 'lrc', timeOffset: 0, duration: 0 });
+  assert.deepEqual(plain(manager.getVisualizerLyrics().data), { synced: true, lines: [{ time: 1, text: 'Hello',
+    words: [{ time: 1, text: 'Hel' }, { time: 1.5, text: 'lo' }] }] });
+  load({ text: 'Just words\nwithout tags', format: 'lrc', timeOffset: 0, duration: 0 });
+  assert.deepEqual(plain(manager.getVisualizerLyrics().data),
+    { synced: false, lines: [{ text: 'Just words' }, { text: 'without tags' }] });
+  load({ text: 'Plain', format: 'text', timeOffset: 0, duration: 0 });
+  assert.deepEqual(plain(manager.getVisualizerLyrics().data), { synced: false, lines: [{ text: 'Plain' }] });
+  load({ text: '{"synced":false,"lines":[{"text":"B"},{"text":"A"}],"extra":1}', format: 'json',
+    timeOffset: 0, duration: 0 });
+  assert.deepEqual(plain(manager.getVisualizerLyrics().data),
+    { synced: false, lines: [{ text: 'B' }, { text: 'A' }] }, 'unsynced JSON keeps source order');
+  load({ text: '{"synced":true,', format: 'json', timeOffset: 0, duration: 0 });
+  assert.equal(manager.getVisualizerLyrics(), null, 'malformed JSON renders no lyrics');
+
+  load({ text: '{"synced":true,"lines":[{"time":1,"text":"A"}]}', format: 'json', timeOffset: 0.5, duration: 180 });
+  assert.deepEqual(plain(manager.getVisualizerLyrics()),
+    { data: { synced: true, lines: [{ time: 1, text: 'A' }] }, time: 0, duration: 0, isStopped: true },
+    'synced lyrics without a transport stop at time zero');
+  transport(96000, false);
+  clock.now = 5000;
+  assert.deepEqual(plain(manager.getVisualizerLyrics()),
+    { data: { synced: true, lines: [{ time: 1, text: 'A' }] }, time: 1.5, duration: 180, isStopped: false },
+    'a paused transport keeps the frozen position, shifted by timeOffset');
+  transport(96000, true);
+  clock.now = 5100;
+  const playing = manager.getVisualizerLyrics();
+  near(playing.time, 1.6, 'playing time');
+  assert.equal(playing.isStopped, false);
+  assert.equal(playing.duration, 180);
+});
+
+test('host lyrics without a transport clock stay visible when unsynced and stop when synced', () => {
+  const { manager, load, unclocked } = createLyricsManager();
+  assert.equal(unclocked, 1e9);
+  manager.getHostTransport = () => null;
+  load({ text: 'First\nSecond', format: 'text', timeOffset: 2, duration: 120 });
+  const unsynced = manager.getVisualizerLyrics();
+  assert.deepEqual({ ...unsynced, data: undefined },
+    { data: undefined, time: 1e9, duration: 0, isStopped: false });
+  assert.ok(lyricsOpacity(lyricStageItem, unsynced, false) > 0, 'the fade-in head is complete');
+  const unsyncedFrame = lyricsFrame(lyricStageItem, unsynced, false);
+  assert.equal(unsyncedFrame.rows[0].text, 'First');
+  assert.equal(unsyncedFrame.p, 0, 'the static list starts at the first line');
+
+  load({ text: '[00:01.00]One\n[00:02.00]Two', format: 'lrc', timeOffset: 2, duration: 120 });
+  const synced = manager.getVisualizerLyrics();
+  assert.deepEqual({ ...synced, data: undefined }, { data: undefined, time: 0, duration: 0, isStopped: true });
+  const editFrame = lyricsFrame(lyricStageItem, synced, true);
+  assert.equal(editFrame.placeholder, undefined);
+  assert.deepEqual(editFrame.rows.map(row => row.text), ['One', 'Two'], 'edit mode renders the lines statically');
+  assert.equal(lyricsOpacity(lyricStageItem, synced, false), 0, 'the playback view hides stopped lyrics');
+});
+
+test('host lyrics time is shifted back by the pipeline latency at the host rate', () => {
+  const { manager, transport, load } = createLyricsManager({ latency: 4800 });
+  load({ text: 'Line', format: 'text', timeOffset: 0, duration: 0 });
+  // An oversampled engine reports a higher context rate; latency stays in host-rate samples.
+  manager.audioContext = { sampleRate: 192000 };
+  manager.contextManager = { audioContext: { sampleRate: 192000 } };
+  transport(96000, false);
+  near(manager.getVisualizerLyrics().time, 1.9);
+  near(manager.getHostDisplaySeconds(), 1.9);
+  manager.dspPipelineLatencySamples = 200000;
+  assert.equal(manager.getVisualizerLyrics().time, 0, 'positions inside the latency clamp to zero');
+});
+
+test('text host lyrics stay literal and one leading BOM is ignored for every format', () => {
+  const { manager, load } = createLyricsManager();
+  const model = lyrics => {
+    load({ timeOffset: 0, duration: 0, ...lyrics });
+    return plain(manager.getVisualizerLyrics()?.data ?? null);
+  };
+  assert.deepEqual(model({ text: '[Chorus: X]\n\n[00:01.00]Tag\r\nEnd\rLast', format: 'text' }), {
+    synced: false,
+    lines: ['[Chorus: X]', '', '[00:01.00]Tag', 'End', 'Last'].map(text => ({ text }))
+  });
+  const json = '{"synced":true,"lines":[{"time":1,"text":"A"}]}';
+  for (const [text, format] of [['A\nB', 'text'], [json, 'json'], ['[00:01.00]A', 'lrc']]) {
+    assert.deepEqual(model({ text: `\uFEFF${text}`, format }), model({ text, format }), format);
+  }
+  assert.equal(model({ text: '\uFEFF\uFEFFA', format: 'text' }).lines[0].text, '\uFEFFA',
+    'only one leading BOM is stripped from plain text');
+  assert.deepEqual(model({ text: '\uFEFF\uFEFF[00:01.00]A', format: 'lrc' }), {
+    synced: false, lines: [{ text: '\uFEFF[00:01.00]A' }]
+  }, 'the LRC parser alone strips one BOM');
+});
+
+test('synced JSON host lyrics are filtered and sorted before the upstream budgets', () => {
+  const { manager, load } = createLyricsManager();
+  load({ format: 'json', timeOffset: 0, duration: 0, text: JSON.stringify({ synced: true, lines: [
+    { time: 3, text: 'Three' },
+    { time: 1, text: 'One', words: [{ time: 1.5, text: 'ne' }, 'bad', { text: 'x' }, { time: 1, text: 'O' }] },
+    { text: 'untimed' }, null, { time: 'soon', text: 'string time' }, { time: 2, text: 'Two' }
+  ] }) });
+  assert.deepEqual(plain(manager.getVisualizerLyrics().data), { synced: true, lines: [
+    { time: 1, text: 'One', words: [{ time: 1, text: 'O' }, { time: 1.5, text: 'ne' }] },
+    { time: 2, text: 'Two' }, { time: 3, text: 'Three' }
+  ] });
+  const lines = Array.from({ length: 2100 }, (_, index) => ({ time: 2099 - index, text: 'x' }));
+  load({ format: 'json', timeOffset: 0, duration: 0, text: JSON.stringify({ synced: true, lines }) });
+  const kept = manager.getVisualizerLyrics().data.lines;
+  assert.equal(kept.length, 2048, 'the upstream line budget applies');
+  assert.equal(kept[0].time, 0);
+  assert.equal(kept.at(-1).time, 2047, 'an over-budget payload keeps the earliest cues');
+});
+
+test('the host display clock extrapolates within the cap and re-anchors on every change', () => {
+  const { manager, clock, transport, load, cap } = createLyricsManager();
+  assert.equal(cap, 0.2);
+  load({ text: '[00:00.00]A', format: 'lrc', timeOffset: 0, duration: 0 });
+  const time = now => { clock.now = now; return manager.getVisualizerLyrics().time; };
+  clock.now = 1000;
+  transport(48000, true);
+  near(time(1000), 1);
+  near(time(1100), 1.1);
+  near(time(1500), 1.2, 'extrapolation is capped');
+  clock.now = 2000;
+  transport(48000 + 4800, true);
+  near(time(2000), 1.2, 'a new value below the held display waits at the floor');
+  near(time(2050), 1.2);
+  near(time(2150), 1.25);
+  clock.now = 2160;
+  transport(48000 + 19200, true);
+  near(time(2160), 1.4, 'a new forward value observed before extrapolation reaches it re-anchors exactly');
+  near(time(2200), 1.44);
+  clock.now = 3100;
+  transport(24000, true);
+  near(time(3100), 0.5, 'a backward seek resets exactly');
+  near(time(3150), 0.55);
+  clock.now = 3200;
+  transport(24000, false);
+  near(time(3200), 0.5, 'pausing returns the exact host position');
+  near(time(3900), 0.5, 'a paused transport does not advance');
+  clock.now = 3900;
+  transport(24000, true);
+  near(time(3900), 0.5, 'play start at a paused position restarts extrapolation from zero');
+  near(time(3950), 0.55);
+});
+
+test('the host display clock resets for short forward seeks and same-position rate changes', () => {
+  const { manager, clock, transport } = createLyricsManager();
+  transport(48000, true);
+  clock.now = 180;
+  near(manager.getHostDisplaySeconds(), 1.18);
+  transport(50400, true, 48000, 2);
+  near(manager.getHostDisplaySeconds(), 1.05, 'a short forward seek discards the previous display floor');
+  clock.now = 280;
+  near(manager.getHostDisplaySeconds(), 1.15);
+  transport(50400, true, 96000, 3);
+  near(manager.getHostDisplaySeconds(), 0.525, 'a rate change re-anchors at the same project sample');
+  clock.now = 380;
+  near(manager.getHostDisplaySeconds(), 0.625);
+  transport(50400, true, 96000, 4);
+  near(manager.getHostDisplaySeconds(), 0.525, 'a discontinuity can return to the last observed sample');
+});
+
+test('jittered transport observations never step the display clock backward', () => {
+  const sampleRate = 44100;
+  const block = 2048;
+  const latency = 512;
+  const lyricsManager = createLyricsManager({ latency });
+  const { manager, clock, cap } = lyricsManager;
+  const transport = (samples, playing) => lyricsManager.transport(samples, playing, sampleRate);
+  const blockMs = block / sampleRate * 1000;
+  let position = 0;
+  let anchor = 0;
+  let previous = -Infinity;
+  let held = 0;
+  let frame = 0;
+  clock.now = 0;
+  transport(position, true);
+  for (let index = 1; index <= 60; index++) {
+    // Alternate late and early observations around the true block boundary.
+    const observed = index * blockMs + (index % 2 ? 40 : 2);
+    for (; frame * 1000 / 60 < observed; frame++) {
+      const now = frame * 1000 / 60;
+      const seconds = manager.getHostDisplaySeconds(now);
+      const base = (position - latency) / sampleRate;
+      const fresh = Math.max(0, base + Math.min(cap, (now - anchor) / 1000));
+      if (seconds > fresh + 1e-9) held++;
+      assert.ok(seconds >= previous, `frame ${frame} moved backward`);
+      assert.ok(seconds <= Math.max(0, base) + cap + 1e-9, `frame ${frame} ran ahead of the host`);
+      assert.equal(manager.getHostDisplaySeconds(now), seconds, 'a repeated frame time is idempotent');
+      previous = seconds;
+    }
+    position += block;
+    anchor = clock.now = observed;
+    transport(position, true);
+  }
+  assert.ok(held > 0, 'the jittered sequence exercises the floor');
+  const exact = () => Math.max(0, (position - latency) / sampleRate);
+  position = 4 * block;
+  clock.now += 5;
+  transport(position, true);
+  near(manager.getHostDisplaySeconds(clock.now), exact(), 'a backward seek is exact');
+  near(manager.getHostDisplaySeconds(clock.now + 100), exact() + 0.1);
+  clock.now += 100;
+  transport(position, false);
+  near(manager.getHostDisplaySeconds(clock.now), exact(), 'a play-to-pause edge is exact');
+  transport(position, true);
+  near(manager.getHostDisplaySeconds(clock.now + 100), exact() + 0.1);
+  manager.dspPipelineLatencySamples = latency + sampleRate / 10;
+  near(manager.getHostDisplaySeconds(clock.now + 100), exact() - 0.1 + 0.1,
+    'a latency change applies its shift exactly');
+});
+
+test('lyrics and the Counter read one display clock with or without lyrics loaded', () => {
+  const withLyrics = createLyricsManager({ latency: 960 });
+  const withoutLyrics = createLyricsManager({ latency: 960 });
+  withLyrics.load({ text: '[00:01.00]A', format: 'lrc', timeOffset: 0.25, duration: 30 });
+  for (const { manager } of [withLyrics, withoutLyrics]) assert.equal(manager.getHostDisplaySeconds(70), null);
+  for (const { clock, transport } of [withLyrics, withoutLyrics]) {
+    clock.now = 0;
+    transport(96000, true);
+    clock.now = 70;
+  }
+  const display = withoutLyrics.manager.getHostDisplaySeconds(70);
+  near(display, (96000 - 960) / 48000 + 0.07);
+  assert.equal(withLyrics.manager.getHostDisplaySeconds(70), display);
+  near(withLyrics.manager.getVisualizerLyrics().time, display - 0.25);
 });
 
 test('real upstream spectrum button renders native After and Compare PCM with no DSP packet', async () => {
@@ -1211,7 +1532,9 @@ test('startup rebuilds a pending state replacement but preserves an ordinary rea
         pluginType: 'AMRadioSimulatorPlugin',
         state: 'active'
       }];
+      const lyrics = { text: 'Host line', format: 'text', timeOffset: 0, duration: 0 };
       const context = {
+        performance,
         getPluginParameterOptions: () => ({}),
         noop() {},
         fakeAudioContext: (sampleRate, channels) => ({ sampleRate, channels }),
@@ -1230,6 +1553,8 @@ test('startup rebuilds a pending state replacement but preserves an ordinary rea
               masterBypass: false,
               nowPlayingRevision: 5,
               nowPlaying,
+              lyricsRevision: 3,
+              lyrics,
               hostTransport,
               executionStates
             };
@@ -1282,6 +1607,8 @@ test('startup rebuilds a pending state replacement but preserves an ordinary rea
       assert.deepEqual({ ...manager.getHostTransport() }, hostTransport,
         'every fresh editor receives the retained project transport in its startup handshake');
       assert.equal(manager.nowPlayingRevision, 5, 'each fresh editor receives the retained host track at startup');
+      assert.equal(manager.lyricsSnapshot, lyrics, 'each fresh editor receives the retained host lyrics at startup');
+      assert.equal(manager.lyricsRevision, 3);
       assert.equal(await manager.rebuildPipeline(), '');
       return { calls, appliedExecutionStates, executionStates, preparedPipelines };
     };
@@ -1291,7 +1618,8 @@ test('startup rebuilds a pending state replacement but preserves an ordinary rea
     assert.deepEqual(pendingCalls.map(call => call.type),
       ['host/getInfo', 'updatePlugins'],
       'a ready retained DSP with pending restored state receives one startup rebuild');
-    assert.deepEqual({ ...pendingCalls[0].payload }, { startup: true, nowPlayingRevision: 0 },
+    assert.deepEqual({ ...pendingCalls[0].payload },
+      { startup: true, nowPlayingRevision: 0, lyricsRevision: 0 },
       'the pending decision comes from the page startup handshake');
 
     assert.deepEqual(pendingStartup.appliedExecutionStates, [],

@@ -136,16 +136,6 @@ const pluginListPath = path.join(output, 'plugins', 'plugins.txt');
 const pluginList = await readText(pluginListPath);
 await writeFile(pluginListPath, pluginList.replace(/^control\/network_(?:send|receive):[^\n]*\n/gm, ''), 'utf8');
 
-// Omit the player-lyrics system preset without touching saved or imported layouts.
-const visualizerPresetsDirectory = path.join(output, 'presets', 'visualizer');
-for (const entry of await readdir(visualizerPresetsDirectory)) {
-  if (!entry.endsWith('.json')) continue;
-  const presetPath = path.join(visualizerPresetsDirectory, entry);
-  const presets = JSON.parse(await readText(presetPath));
-  if (!Object.hasOwn(presets, 'Lyric Stage')) continue;
-  delete presets['Lyric Stage'];
-  await writeFile(presetPath, JSON.stringify(presets, null, 2) + '\n', 'utf8');
-}
 // Shared modal/controller styling lives in the upstream library stylesheet.
 for (const entry of ['effetune-mobile.css', 'pipeline-analyzer.css', 'effetune-network-music.css']) {
   await rm(path.join(output, 'css', entry), { force: true });
@@ -473,9 +463,17 @@ if (!playerMetadata.test(visualizerView) || !playerLyrics.test(visualizerView)) 
 }
 visualizerView = visualizerView.replace(playerMetadata, `    metadata() {
         return this.uiManager.audioManager.getNowPlayingMetadata();
-    }`).replace(playerLyrics, '    lyrics() { return null; }');
-// The native host owns project transport. Neither the excluded player nor an
-// editor-local wall clock can represent stopped playback, seeks, or loops.
+    }`).replace(playerLyrics, `    lyrics() {
+        if (!this.hasLyrics) return null;
+        return this.uiManager.audioManager.getVisualizerLyrics?.() ?? null;
+    }`);
+const lyricsSeekTime = /    lyricsSeekTime\(event\) \{[\s\S]*?\n    \}(?=\n    seekToLyrics\()/;
+if (!lyricsSeekTime.test(visualizerView)) {
+  throw new Error('Unable to locate the Visualizer lyrics seek provider');
+}
+visualizerView = visualizerView.replace(lyricsSeekTime, '    lyricsSeekTime(event) { return null; }');
+// Counters share the latency-corrected, bounded host display clock with lyrics,
+// including its forward-playback floor and exact resets on seeks and play-state edges.
 const counterProvider = /    counters\(now = performance\.now\(\)\) \{[\s\S]*?\n    \}\n(?=    resetCounter)/;
 const videoProvider = /    videoFrame\(\) \{[\s\S]*?\n    \}\n(?=    async openPresets)/;
 if (!counterProvider.test(visualizerView) || !videoProvider.test(visualizerView)) {
@@ -484,7 +482,7 @@ if (!counterProvider.test(visualizerView) || !videoProvider.test(visualizerView)
 visualizerView = visualizerView.replace(counterProvider, `    counters(now = performance.now()) {
         const transport = this.uiManager.audioManager.getHostTransport();
         return new Map(this.layout.items.filter(item => item.type === 'counter').map(item => [item.id, {
-            time: transport ? Math.max(0, transport.projectTimeSamples / transport.sampleRate) : 0,
+            time: this.uiManager.audioManager.getHostDisplaySeconds(now) ?? 0,
             trackIndex: 0, external: false, playing: transport?.playing === true,
             speed: 1, source: 'vst-host-project', stamp: now / 1000
         }]));
@@ -592,7 +590,7 @@ if (visualizerEditor.split(visualizerAddChoices).length - 1 !== 1) {
   throw new Error('Unable to locate Visualizer add-item choices');
 }
 visualizerEditor = visualizerEditor.replace(visualizerAddChoices,
-  "byLabel(ITEM_TYPES.filter(type => !['lyrics', 'video', 'playback-control', 'seek-bar', 'track-info'].includes(type)).map(type =>");
+  "byLabel(ITEM_TYPES.filter(type => !['video', 'playback-control', 'seek-bar', 'track-info'].includes(type)).map(type =>");
 const visualizerChannels = /^            const channels = \[.*?\];\n(?=[\s\S]*?this\.field\(properties, this\.t\('visualizer\.channel')/gm;
 if ([...visualizerEditor.matchAll(visualizerChannels)].length !== 1) {
   throw new Error('Unable to locate Visualizer channel choices');

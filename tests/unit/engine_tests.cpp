@@ -627,6 +627,32 @@ void testStateCodec() {
 }
 
 void testMessageRouter() {
+  for (const auto *route : {"host/getInfo", "telemetry/read"}) {
+    RoutedUiMessage decoded;
+    std::string revisionError;
+    const auto request = [&](const std::string &payload) {
+      return MessageRouter::decode("{\"type\":\"" + std::string(route) +
+                                       "\",\"payload\":" + payload + "}",
+                                   decoded, &revisionError);
+    };
+    for (const auto *field : {"nowPlayingRevision", "lyricsRevision"}) {
+      for (const auto value : {0ull, 42ull, 9007199254740991ull}) {
+        expect(request("{\"" + std::string(field) + "\":" + std::to_string(value) + "}"),
+               "snapshot revision accepts safe nonnegative integers");
+        const auto revision = std::string_view(field) == "lyricsRevision"
+                                  ? decoded.lyricsRevision : decoded.nowPlayingRevision;
+        expect(revision.has_value() && *revision == value,
+               "explicit revision, including zero, stays engaged");
+      }
+      for (const auto *invalid : {"-1", "1.5", "9007199254740992", "1e100",
+                                  "9223372036854775808", "\"1\"", "true"}) {
+        expect(!request("{\"" + std::string(field) + "\":" + invalid + "}"),
+               "snapshot revision rejects negative, non-integer and unsafe values");
+      }
+    }
+    expect(request("{}") && !decoded.nowPlayingRevision && !decoded.lyricsRevision,
+           "absent revisions remain disengaged, including when reusing a decoded message");
+  }
   constexpr auto rebuild = R"({
     "type":"pipeline/rebuild",
     "payload":{"pipeline":"B","masterBypass":true,"plugins":[

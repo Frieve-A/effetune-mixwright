@@ -4,6 +4,7 @@
 #include "engine/frequency_preview.h"
 #include "engine/output_analyzers.h"
 
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -97,7 +98,8 @@ struct RoutedUiMessage {
   RuntimeSamplePage assetPage;
   AudioCommand audioCommand;
   std::uint64_t operationRevision = 0;
-  std::uint64_t nowPlayingRevision = 0;
+  std::optional<std::uint64_t> nowPlayingRevision;
+  std::optional<std::uint64_t> lyricsRevision;
   std::size_t assetByteSize = 0;
   std::size_t assetOffset = 0;
   char pipeline = 'A';

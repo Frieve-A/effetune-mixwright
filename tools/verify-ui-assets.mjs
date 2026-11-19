@@ -414,10 +414,15 @@ const visualizerView = await readFile(path.join(assets, 'js', 'visualizer', 'vis
 const visualizerEditor = await readFile(path.join(assets, 'js', 'visualizer', 'visualizer-editor.js'), 'utf8');
 if (visualizerView.includes('ui/audio-player/') || visualizerView.includes('this.video.') ||
     !visualizerView.includes('this.uiManager.audioManager.getHostTransport()') ||
+    !visualizerView.includes(`    lyrics() {
+        if (!this.hasLyrics) return null;
+        return this.uiManager.audioManager.getVisualizerLyrics?.() ?? null;
+    }`) ||
+    !visualizerView.includes('time: this.uiManager.audioManager.getHostDisplaySeconds(now) ?? 0') ||
     !visualizerView.includes("source: 'vst-host-project'") ||
     !visualizerView.includes('trackIndex: 0, external: false') ||
-    !visualizerEditor.includes("!['lyrics', 'video', 'playback-control', 'seek-bar', 'track-info'].includes(type)")) {
-  throw new Error('Visualizer does not use native project transport or still exposes excluded Video');
+    !visualizerEditor.includes("!['video', 'playback-control', 'seek-bar', 'track-info'].includes(type)")) {
+  throw new Error('Visualizer does not use host lyrics and display time or still exposes excluded player items');
 }
 if (uiManager.includes('initializeNetworkMusic') || uiManager.includes('network-music/')) {
   throw new Error('Excluded network music initialization remains reachable');

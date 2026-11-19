@@ -218,6 +218,7 @@ void assignString128(TChar *destination, const std::string &value) noexcept {
 
 inline constexpr std::size_t kMaximumNowPlayingTextUnits = 4096;
 inline constexpr std::uint32_t kMaximumNowPlayingArtworkBytes = 8u * 1024u * 1024u;
+inline constexpr std::uint32_t kMaximumLyricsBytes = 3u * 1024u * 1024u;
 
 [[nodiscard]] bool readNowPlayingString(IAttributeList &attributes,
                                        const char *key, std::string &value) {
@@ -250,6 +251,73 @@ inline constexpr std::uint32_t kMaximumNowPlayingArtworkBytes = 8u * 1024u * 102
     }
   }
   value = utf8FromTChars(characters.data());
+  return true;
+}
+
+[[nodiscard]] bool readLyricsFloat(IAttributeList &attributes, const char *key,
+                                    double &value) {
+  if (attributes.getFloat(key, value) == kResultOk) {
+    return std::isfinite(value);
+  }
+  TChar string = 0;
+  int64 integer = 0;
+  const void *binary = nullptr;
+  uint32 bytes = 0;
+  return attributes.getString(key, &string, sizeof(string)) != kResultOk &&
+         attributes.getInt(key, integer) != kResultOk &&
+         attributes.getBinary(key, binary, bytes) != kResultOk;
+}
+
+[[nodiscard]] bool validateLyricsText(const void *data, const std::size_t size) {
+  const auto *bytes = static_cast<const unsigned char *>(data);
+  for (std::size_t offset = 0; offset < size;) {
+    const auto first = bytes[offset];
+    if (first < 0x80u) {
+      if (first < 0x20u && first != '\t' && first != '\n' && first != '\r') {
+        std::fprintf(stderr,
+                     "EffeTune lyrics rejected: control character U+%04X at byte offset %zu\n",
+                     static_cast<unsigned int>(first), offset);
+        return false;
+      }
+      ++offset;
+      continue;
+    }
+    // Validate scalar values explicitly: the shared UTF-8 checker does not
+    // reject overlong encodings or encoded surrogates.
+    std::size_t length = 0;
+    std::uint32_t codePoint = 0;
+    std::uint32_t minimum = 0;
+    if (first >= 0xc2u && first <= 0xdfu) {
+      length = 2;
+      codePoint = first & 0x1fu;
+      minimum = 0x80u;
+    } else if (first >= 0xe0u && first <= 0xefu) {
+      length = 3;
+      codePoint = first & 0x0fu;
+      minimum = 0x800u;
+    } else if (first >= 0xf0u && first <= 0xf4u) {
+      length = 4;
+      codePoint = first & 0x07u;
+      minimum = 0x10000u;
+    } else {
+      return false;
+    }
+    if (length > size - offset) {
+      return false;
+    }
+    for (std::size_t index = 1; index < length; ++index) {
+      const auto next = bytes[offset + index];
+      if ((next & 0xc0u) != 0x80u) {
+        return false;
+      }
+      codePoint = (codePoint << 6u) | (next & 0x3fu);
+    }
+    if (codePoint < minimum || codePoint > 0x10ffffu ||
+        (codePoint >= 0xd800u && codePoint <= 0xdfffu)) {
+      return false;
+    }
+    offset += length;
+  }
   return true;
 }
 
@@ -635,6 +703,8 @@ tresult PLUGIN_API EffeTuneProcessor::terminate() {
     std::scoped_lock metadataLock(nowPlayingMutex_);
     nowPlaying_ = {};
     ++nowPlayingRevision_;
+    lyrics_ = {};
+    ++lyricsRevision_;
   }
   std::scoped_lock resources(processingResourcesMutex_);
   engineOutputBuffer_.clear();
@@ -648,6 +718,49 @@ tresult PLUGIN_API EffeTuneProcessor::terminate() {
 tresult PLUGIN_API EffeTuneProcessor::notify(IMessage *message) {
   if (message == nullptr || message->getMessageID() == nullptr) {
     return kInvalidArgument;
+  }
+  if (FIDStringsEqual(message->getMessageID(), "EffeTune.NowPlayingLyrics")) {
+    try {
+      NowPlayingLyrics replacement;
+      if (auto *attributes = message->getAttributes(); attributes != nullptr) {
+        if (!readNowPlayingString(*attributes, "format", replacement.format) ||
+            !readLyricsFloat(*attributes, "timeOffset", replacement.timeOffset) ||
+            !readLyricsFloat(*attributes, "duration", replacement.duration) ||
+            replacement.duration < 0.0) {
+          return kInvalidArgument;
+        }
+        const void *lyrics = nullptr;
+        uint32 lyricsBytes = 0;
+        if (attributes->getBinary("lyrics", lyrics, lyricsBytes) != kResultOk) {
+          TChar string = 0;
+          int64 integer = 0;
+          double floating = 0.0;
+          if (attributes->getString("lyrics", &string, sizeof(string)) == kResultOk ||
+              attributes->getInt("lyrics", integer) == kResultOk ||
+              attributes->getFloat("lyrics", floating) == kResultOk) {
+            return kInvalidArgument;
+          }
+          lyricsBytes = 0;
+        }
+        if (lyricsBytes > kMaximumLyricsBytes ||
+            (lyricsBytes != 0 && lyrics == nullptr)) {
+          return kInvalidArgument;
+        }
+        if (lyricsBytes != 0) {
+          if ((replacement.format != "text" && replacement.format != "lrc" &&
+               replacement.format != "json") || !validateLyricsText(lyrics, lyricsBytes)) {
+            return kInvalidArgument;
+          }
+          replacement.text.assign(static_cast<const char *>(lyrics), lyricsBytes);
+        }
+      }
+      std::scoped_lock metadataLock(nowPlayingMutex_);
+      lyrics_ = std::move(replacement);
+      ++lyricsRevision_;
+      return kResultOk;
+    } catch (const std::exception &) {
+      return kResultFalse;
+    }
   }
   if (!FIDStringsEqual(message->getMessageID(), "EffeTune.NowPlaying")) {
     if (FIDStringsEqual(message->getMessageID(), "TextMessage") &&
@@ -705,10 +818,10 @@ tresult PLUGIN_API EffeTuneProcessor::notify(IMessage *message) {
 }
 
 void EffeTuneProcessor::appendNowPlayingSnapshot(
-    choc::value::Value &result, const std::uint64_t knownRevision) {
+    choc::value::Value &result, const std::optional<std::uint64_t> knownRevision) {
   std::scoped_lock metadataLock(nowPlayingMutex_);
   result.addMember("nowPlayingRevision", static_cast<std::int64_t>(nowPlayingRevision_));
-  if (knownRevision == nowPlayingRevision_) {
+  if (!knownRevision || *knownRevision == nowPlayingRevision_) {
     return;
   }
   if (nowPlaying_.title.empty() && nowPlaying_.album.empty() &&
@@ -728,6 +841,25 @@ void EffeTuneProcessor::appendNowPlayingSnapshot(
   }
   metadata.addMember("artwork", std::move(artwork));
   result.addMember("nowPlaying", std::move(metadata));
+}
+
+void EffeTuneProcessor::appendLyricsSnapshot(
+    choc::value::Value &result, const std::optional<std::uint64_t> knownRevision) {
+  std::scoped_lock metadataLock(nowPlayingMutex_);
+  result.addMember("lyricsRevision", static_cast<std::int64_t>(lyricsRevision_));
+  if (!knownRevision || *knownRevision == lyricsRevision_) {
+    return;
+  }
+  if (lyrics_.text.empty()) {
+    result.addMember("lyrics", choc::value::Value{});
+    return;
+  }
+  auto lyrics = choc::value::createObject({});
+  lyrics.addMember("text", lyrics_.text);
+  lyrics.addMember("format", lyrics_.format);
+  lyrics.addMember("timeOffset", lyrics_.timeOffset);
+  lyrics.addMember("duration", lyrics_.duration);
+  result.addMember("lyrics", std::move(lyrics));
 }
 
 tresult PLUGIN_API EffeTuneProcessor::setActive(const TBool state) {
@@ -2719,6 +2851,15 @@ tresult PLUGIN_API EffeTuneProcessor::setupProcessing(ProcessSetup &setup) {
   return SingleComponentEffect::setupProcessing(setup);
 }
 
+tresult PLUGIN_API EffeTuneProcessor::setProcessing(const TBool state) {
+  const auto epoch = transportProcessingEpoch_.load();
+  const auto stopping = state == 0;
+  if (stopping != ((epoch & 1u) != 0)) {
+    transportProcessingEpoch_.store(epoch + 1u);
+  }
+  return kResultOk;
+}
+
 tresult PLUGIN_API EffeTuneProcessor::setBusArrangements(SpeakerArrangement *inputs,
                                                          const int32 numInputs,
                                                          SpeakerArrangement *outputs,
@@ -2806,12 +2947,30 @@ void EffeTuneProcessor::restoreDryFromScratch(AudioBusBuffers &output, const int
 }
 
 void EffeTuneProcessor::publishHostTransport(const ProcessContext *context, const int32 frames) noexcept {
+  const auto processingEpoch = transportProcessingEpoch_.load();
+  if ((processingEpoch & 1u) != 0) return;
   transportSequence_.fetch_add(1);
   const auto available = context != nullptr && std::isfinite(context->sampleRate) &&
                          context->sampleRate > 0.0;
-  transportProjectTimeSamples_.store(available ? context->projectTimeSamples : 0);
-  transportSampleRate_.store(available ? context->sampleRate : 0.0);
-  transportPlaying_.store(available && (context->state & ProcessContext::kPlaying) != 0);
+  const auto samples = available ? context->projectTimeSamples : 0;
+  const auto sampleRate = available ? context->sampleRate : 0.0;
+  const auto playing = available && (context->state & ProcessContext::kPlaying) != 0;
+  // Keep the edge visible even when several more audio blocks pass before a poll.
+  if (processingEpoch != transportSnapshotProcessingEpoch_.load(std::memory_order_relaxed) ||
+      sampleRate != transportSampleRate_.load(std::memory_order_relaxed) ||
+      playing != transportPlaying_.load(std::memory_order_relaxed) ||
+      (playing && transportExpectedNextSample_ != samples)) {
+    transportDiscontinuityRevision_.fetch_add(1);
+  }
+  const auto blockFrames = std::max<int32>(frames, 0);
+  if (samples <= std::numeric_limits<std::int64_t>::max() - blockFrames) {
+    transportExpectedNextSample_ = samples + blockFrames;
+  } else {
+    transportExpectedNextSample_.reset();
+  }
+  transportProjectTimeSamples_.store(samples);
+  transportSampleRate_.store(sampleRate);
+  transportPlaying_.store(playing);
   const auto validTempo = available && (context->state & ProcessContext::kTempoValid) != 0 &&
                           std::isfinite(context->tempo) && context->tempo > 0.0;
   const auto validPpq = available && (context->state & ProcessContext::kProjectTimeMusicValid) != 0 &&
@@ -2829,6 +2988,7 @@ void EffeTuneProcessor::publishHostTransport(const ProcessContext *context, cons
   transportNumerator_.store(validSignature ? context->timeSigNumerator : 0);
   transportDenominator_.store(validSignature ? context->timeSigDenominator : 0);
   transportAvailable_.store(available);
+  transportSnapshotProcessingEpoch_.store(processingEpoch);
   transportSequence_.fetch_add(1);
 }
 
@@ -2837,12 +2997,14 @@ void EffeTuneProcessor::appendHostTransport(choc::value::Value &result) const {
   bool available = false, playing = false;
   bool captured = false;
   std::int64_t samples = 0;
+  std::uint64_t discontinuityRevision = 0;
   double sampleRate = 0.0;
   double tempo = 0.0, ppq = 0.0, barStart = 0.0;
   int32 numerator = 0, denominator = 0;
   for (int attempt = 0; attempt < 3; ++attempt) {
     const auto sequence = transportSequence_.load();
     if ((sequence & 1u) != 0) continue;
+    discontinuityRevision = transportDiscontinuityRevision_.load();
     samples = transportProjectTimeSamples_.load();
     sampleRate = transportSampleRate_.load();
     playing = transportPlaying_.load();
@@ -2852,6 +3014,9 @@ void EffeTuneProcessor::appendHostTransport(choc::value::Value &result) const {
     barStart = transportBarStart_.load();
     numerator = transportNumerator_.load();
     denominator = transportDenominator_.load();
+    // A host may stop callbacks altogether. Keep the last position but wait
+    // for a snapshot from the current processing epoch before playing again.
+    playing = playing && transportSnapshotProcessingEpoch_.load() == transportProcessingEpoch_.load();
     if (sequence == transportSequence_.load()) {
       available = valid;
       captured = true;
@@ -2862,6 +3027,7 @@ void EffeTuneProcessor::appendHostTransport(choc::value::Value &result) const {
   // open editor retains its last coherent position until the next poll.
   if (!captured) return;
   transport.addMember("available", available);
+  transport.addMember("discontinuityRevision", static_cast<std::int64_t>(discontinuityRevision));
   transport.addMember("projectTimeSamples", available ? samples : std::int64_t{0});
   transport.addMember("sampleRate", available ? sampleRate : 0.0);
   transport.addMember("playing", available && playing);
@@ -4666,6 +4832,7 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     appendAutomationDeltas(result);
     appendDeferredDiagnostics(result);
     appendNowPlayingSnapshot(result, message.nowPlayingRevision);
+    appendLyricsSnapshot(result, message.lyricsRevision);
     return choc::json::toString(result);
   }
 
@@ -4830,6 +4997,7 @@ std::string EffeTuneProcessor::handleUiMessage(const std::string_view request) {
     appendAutomationDeltas(result);
     appendDeferredDiagnostics(result);
     appendNowPlayingSnapshot(result, message.nowPlayingRevision);
+    appendLyricsSnapshot(result, message.lyricsRevision);
     return choc::json::toString(result);
   }
 

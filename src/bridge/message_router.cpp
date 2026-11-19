@@ -491,6 +491,16 @@ void setError(std::string *destination, std::string value) {
   return true;
 }
 
+[[nodiscard]] bool decodeSnapshotRevision(const ValueView revision,
+                                          std::optional<std::uint64_t> &target) {
+  if (revision.isVoid()) return true;
+  if (!revision.isInt()) return false;
+  const auto value = revision.isInt64() ? revision.getInt64() : revision.getInt32();
+  if (value < 0 || value > kMaximumSafeInteger) return false;
+  target = static_cast<std::uint64_t>(value);
+  return true;
+}
+
 void decodeOversampling(const ValueView payload, OversamplingSettings &settings) {
   const auto factor = payload["factor"].getWithDefault<std::int64_t>(1);
   if (factor == 1 || factor == 2 || factor == 4 || factor == 8) {
@@ -526,14 +536,13 @@ bool MessageRouter::decode(const std::string_view json, RoutedUiMessage &message
     RoutedUiMessage decoded;
 
     if (type == "host/getInfo" || type == "telemetry/read") {
-      const auto revision = payload["nowPlayingRevision"];
-      if (!revision.isVoid()) {
-        const auto value = revision.getWithDefault<std::int64_t>(-1);
-        if (!revision.isInt() || value < 0 || value > 9007199254740991ll) {
-          setError(error, "Invalid Now Playing revision");
-          return false;
-        }
-        decoded.nowPlayingRevision = static_cast<std::uint64_t>(value);
+      if (!decodeSnapshotRevision(payload["nowPlayingRevision"], decoded.nowPlayingRevision)) {
+        setError(error, "Invalid Now Playing revision");
+        return false;
+      }
+      if (!decodeSnapshotRevision(payload["lyricsRevision"], decoded.lyricsRevision)) {
+        setError(error, "Invalid lyrics revision");
+        return false;
       }
     }
 
