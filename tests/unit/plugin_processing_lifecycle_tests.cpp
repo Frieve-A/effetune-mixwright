@@ -3083,6 +3083,36 @@ void testControlOwnedRuntimeImageKeepsProcessedAudio() {
          "terminate the owned runtime-image test");
 }
 
+struct ConcurrentRenderResult {
+  std::uint64_t blocks = 0;
+  bool succeeded = true;
+  bool observedControl = false;
+};
+
+template <typename RenderBlock>
+ConcurrentRenderResult renderWhileControlRuns(
+    const std::uint64_t minimumBlocks, const std::uint64_t requiredUpdates,
+    const std::atomic<std::uint64_t> &updates, const std::atomic_bool &accepted,
+    RenderBlock renderBlock) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+  ConcurrentRenderResult result;
+  // Count work between completed callbacks. On a single CPU the control
+  // thread may not receive a timeslice during the initial render burst.
+  result.succeeded = renderBlock();
+  ++result.blocks;
+  const auto target = updates.load(std::memory_order_acquire) + requiredUpdates;
+  while (result.succeeded && accepted.load(std::memory_order_acquire)) {
+    const auto updatesBeforeBlock = updates.load(std::memory_order_acquire);
+    result.succeeded = renderBlock();
+    ++result.blocks;
+    if (result.blocks < minimumBlocks) continue;
+    result.observedControl = updatesBeforeBlock >= target;
+    if (result.observedControl || std::chrono::steady_clock::now() >= deadline) break;
+    std::this_thread::yield();
+  }
+  return result;
+}
+
 // Dragging a slider during playback reaches the native control service as a
 // stream of parameter images while the transport keeps calling process(). None
 // of that work may cost a block: every block has to reach the engine, complete
@@ -3168,23 +3198,24 @@ void testControlServiceEditsNeverCostAProcessedBlock() {
     }
   });
 
-  constexpr std::uint64_t blocks = 1500;
   auto wetBlocks = std::uint64_t{0};
-  for (std::uint64_t block = 0; block < blocks; ++block) {
+  const auto rendered = renderWhileControlRuns(1500, 1, serviceTicks, published, [&] {
     outputLeft.fill(0.0f);
     outputRight.fill(0.0f);
-    expect(processor->process(data) == kResultOk,
-           "process a block while the control service edits parameters");
+    const auto status = processor->process(data);
     wetBlocks += outputLeft[0] > 1.0f + 1.0e-4f ? 1u : 0u;
-  }
+    return status == kResultOk;
+  });
   running.store(false, std::memory_order_release);
   control.join();
 
+  const auto blocks = rendered.blocks;
   const auto after = PluginProcessorTestAccess::processCounters(*processor);
+  expect(rendered.succeeded, "process a block while the control service edits parameters");
   expect(published.load(std::memory_order_acquire),
          "every parameter image reached the mailbox");
-  expect(serviceTicks.load(std::memory_order_acquire) != 0,
-         "the control service really ran alongside the audio callback");
+  expect(rendered.observedControl,
+         "the parameter control service completed a tick between rendered blocks");
   expect(after.batchAttempts - before.batchAttempts == blocks,
          "every block entered the engine instead of falling back to the input");
   expect(after.completedBatches - before.completedBatches == blocks,
@@ -5110,23 +5141,24 @@ void testUiPacedControlServiceKeepsEveryBlockWet() {
     }
   });
 
-  constexpr std::uint64_t blocks = 1500;
   auto wetBlocks = std::uint64_t{0};
-  for (std::uint64_t block = 0; block < blocks; ++block) {
+  const auto rendered = renderWhileControlRuns(1500, 1, serviceTicks, published, [&] {
     outputLeft.fill(0.0f);
     outputRight.fill(0.0f);
-    expect(processor->process(data) == kResultOk,
-           "process a block while the service runs faster than blocks arrive");
+    const auto status = processor->process(data);
     wetBlocks += outputLeft[0] > 1.0f + 1.0e-4f ? 1u : 0u;
-  }
+    return status == kResultOk;
+  });
   running.store(false, std::memory_order_release);
   control.join();
 
+  const auto blocks = rendered.blocks;
   const auto after = PluginProcessorTestAccess::processCounters(*processor);
+  expect(rendered.succeeded, "process a block while the service runs faster than blocks arrive");
   expect(published.load(std::memory_order_acquire),
          "every parameter image reached the mailbox");
-  expect(serviceTicks.load(std::memory_order_acquire) != 0,
-         "the control service really ran alongside the audio callback");
+  expect(rendered.observedControl,
+         "the UI-paced control service completed a tick between rendered blocks");
   expect(after.batchAttempts - before.batchAttempts == blocks &&
              after.completedBatches - before.completedBatches == blocks,
          "every block entered and completed inside the engine");
@@ -5751,19 +5783,19 @@ void testDelayBearingEditsDuringPlaybackKeepEveryBlockWet() {
     }
   });
 
-  constexpr std::uint64_t blocks = 1500;
-  for (std::uint64_t block = 0; block < blocks; ++block) {
-    expect(processor->process(data) == kResultOk,
-           "process a block while a delay-bearing parameter is dragged");
-  }
+  const auto rendered = renderWhileControlRuns(1500, 1, serviceTicks, published, [&] {
+    return processor->process(data) == kResultOk;
+  });
   running.store(false, std::memory_order_release);
   control.join();
 
+  const auto blocks = rendered.blocks;
   const auto after = PluginProcessorTestAccess::processCounters(*processor);
+  expect(rendered.succeeded, "process a block while a delay-bearing parameter is dragged");
   expect(published.load(std::memory_order_acquire),
          "every delay-bearing image reached the mailbox");
-  expect(serviceTicks.load(std::memory_order_acquire) != 0,
-         "the control service really ran alongside the audio callback");
+  expect(rendered.observedControl,
+         "the delay-bearing control service completed a tick between rendered blocks");
   expect(after.batchAttempts - before.batchAttempts == blocks &&
              after.completedBatches - before.completedBatches == blocks,
          "a delay-bearing drag turns no block into dry audio");
@@ -6670,18 +6702,17 @@ void testTopologyEditsDuringPlaybackRaiseNoDiagnostic() {
 
   // Nothing is asserted while the editor thread runs: an assertion that throws
   // here would leave it joinable.
-  auto rendered = true;
-  for (int block = 0; block < 3000; ++block) {
-    rendered = rendered && processor->process(rig.data) == kResultOk;
-  }
+  const auto rendered = renderWhileControlRuns(3000, 3, edits, accepted, [&] {
+    return processor->process(rig.data) == kResultOk;
+  });
   running.store(false, std::memory_order_release);
   editor.join();
   effetune::allocation_guard::setAbortOnViolationForTesting(true);
 
-  expect(rendered, "process a block while the pipeline topology is edited");
+  expect(rendered.succeeded, "process a block while the pipeline topology is edited");
   expect(accepted.load(std::memory_order_acquire),
          "every topology edit is accepted");
-  expect(edits.load(std::memory_order_acquire) >= 3u,
+  expect(rendered.observedControl,
          "the editor really ran all three topology routes alongside the blocks");
   const auto reported = hostInfo(*processor);
   std::string reportedMessages;
@@ -6893,23 +6924,23 @@ void testDelayBearingEditsWithAStoppedTransportKeepEveryBlockWet() {
 
   // Nothing is asserted while the control thread runs: an assertion that threw
   // here would leave it joinable.
-  constexpr std::uint64_t blocks = 1500;
-  auto rendered = true;
-  for (std::uint64_t block = 0; block < blocks; ++block) {
-    rendered = rendered && processor->process(rig.data) == kResultOk;
+  const auto rendered = renderWhileControlRuns(1500, 1, serviceTicks, published, [&] {
+    const auto status = processor->process(rig.data);
     context.projectTimeSamples += rig.data.numSamples;
-  }
+    return status == kResultOk;
+  });
   running.store(false, std::memory_order_release);
   control.join();
 
+  const auto blocks = rendered.blocks;
   const auto after = PluginProcessorTestAccess::processCounters(*processor);
-  expect(rendered,
+  expect(rendered.succeeded,
          "process a block while a delay-bearing parameter is dragged with the "
          "transport stopped");
   expect(published.load(std::memory_order_acquire),
          "every delay-bearing image reached the mailbox");
-  expect(serviceTicks.load(std::memory_order_acquire) != 0,
-         "the control service really ran alongside the audio callback");
+  expect(rendered.observedControl,
+         "the stopped-transport control service completed a tick between rendered blocks");
   expect(after.batchAttempts - before.batchAttempts == blocks &&
              after.completedBatches - before.completedBatches == blocks,
          "a drag with the transport stopped and the device running turns no "
