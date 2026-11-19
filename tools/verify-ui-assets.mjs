@@ -91,6 +91,8 @@ const requiredFiles = [
   'presets/presets.txt',
   'features/measurement/dataStorage.js',
   'features/measurement/measurement-model.js',
+  'features/measurement/speaker-distortion-chart.js',
+  'features/measurement/speaker-distortion-figures.js',
   'features/measurement/audio-utils/channel-selection.js',
   'features/measurement/audio-utils/output-routing.js',
   'js/locales/en.json5',
@@ -291,6 +293,10 @@ if (!pluginList.includes(
 }
 if (/\b(?:NetworkSendPlugin|NetworkReceivePlugin)\b/.test(pluginList)) {
   throw new Error('The VST effect catalog exposes desktop-only Live Audio Send/Receive');
+}
+if (!html.includes("connect-src 'self' blob: https://raw.githubusercontent.com/jaakkopasanen/AutoEq/;") ||
+    !pluginList.includes('| HeadphoneEQPlugin |') || !pluginList.includes('| SpeakerDistortionCorrectionPlugin |')) {
+  throw new Error('Headphone EQ model lookup or distortion correction is missing from the packaged UI');
 }
 if (!bootstrap.includes('window.electronAPI = {') ||
     html.indexOf('vst-bootstrap.js') > html.indexOf('type="module"') ||

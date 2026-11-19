@@ -336,6 +336,15 @@ test('SoundFont drag waits for its native application receipt and receives mixer
     pipelineA: [plugin], nextSoundFontControlRequestId: 0, pendingSoundFontControls: new Map(),
     telemetryHub: { handleMessage: message => packets.push(message) }
   });
+  for (const [channel, bank, xg, messages] of [
+    [9, 4, false, [0x0400b9, 0x0020b9, 0x0005c9]],
+    [0, 4, true, [0x0000b0, 0x0420b0, 0x0005c0]],
+    [2, 128, true, [0x0005c2]]
+  ]) {
+    await context.MixerManager.prototype.sendSoundFontMixerAction.call(port.owner, plugin,
+      { type: 'program', channel, bank, xg, program: 5 });
+    assert.deepEqual(Array.from(hostCalls.at(-1).payload.messages), messages);
+  }
   const send = () => context.MixerManager.prototype.sendSoundFontMixerAction.call(port.owner, plugin,
     { type: 'control', channel: 0, controller: 10, value: 51 }, true);
   const setTimeout = context.setTimeout;

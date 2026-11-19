@@ -1441,6 +1441,110 @@ void testEngineAssetTransferAndReplay() {
          "cleared asset latency is published after applying its plan");
 }
 
+void testMeasurementCorrectionAssets() {
+  struct CorrectionCase {
+    const char *type;
+    std::vector<float> parameters;
+    std::uint32_t assetChannels;
+    std::uint32_t assetFrames;
+    std::uint32_t topology;
+    std::uint32_t headBlock;
+    std::uint32_t latency;
+    std::size_t coefficientIndex;
+    float coefficient;
+  };
+  // A delayed half-gain headphone FIR and a short speaker model with one
+  // quadratic coefficient for its 580 Hz band on channel 1.
+  const CorrectionCase cases[] = {
+      {"HeadphoneEQPlugin", {1.0f, 32.0f}, 1, 64, 1, 128, 160, 32, 0.5f},
+      {"SpeakerDistortionCorrectionPlugin", {0.0f, 0.0f, 0.0f, 2.0f},
+       16, 1247, 2, 0, 30, 912, 0.1f},
+  };
+  for (const auto &test : cases) {
+    constexpr std::uint32_t logicalId = 91;
+    constexpr std::uint32_t sampleRate = 48000;
+    constexpr std::size_t testBlocks = 16;
+    const std::string type = test.type;
+    const bool headphone = test.assetChannels == 1;
+    EngineHost engine;
+    std::string error;
+    expect(engine.prepare(sampleRate, 2, kTestBlockFrames, EngineHost::kDefaultTelemetryBytes,
+                          &error), type + " engine prepare");
+    const auto kernel = engine.kernels().find(type);
+    expect(kernel != engine.kernels().end(), type + " kernel registration");
+    PipelineState pipeline;
+    pipeline.plugins = {PluginState{logicalId, type, true}};
+    RuntimePlugin runtime;
+    runtime.logicalId = logicalId;
+    runtime.type = type;
+    runtime.packedParameters = test.parameters;
+    runtime.paramsHash = kernel->second.paramsHash;
+    expect(engine.rebuild(pipeline, {runtime}, &error), type + " initial pipeline");
+    expect(engine.pipelineLatency() == 0u, type + " has no delay before its asset is staged");
+
+    RuntimeAsset asset;
+    asset.logicalId = logicalId;
+    asset.formatTag = ET_ASSET_F32_MULTICH;
+    asset.channels = test.assetChannels;
+    asset.frames = test.assetFrames;
+    asset.topology = test.topology;
+    asset.headBlock = test.headBlock;
+    asset.rateDivider = 1;
+    asset.processingChannels = 2;
+    asset.footprintBytes = 4u * 1024u * 1024u;
+    const std::array<std::uint32_t, 8> header{
+        0x31415445u, asset.channels, asset.frames, headphone ? sampleRate : 0u, asset.topology};
+    asset.payload.resize(sizeof(header) +
+                         static_cast<std::size_t>(asset.channels) * asset.frames * sizeof(float));
+    std::memcpy(asset.payload.data(), header.data(), sizeof(header));
+    std::memcpy(asset.payload.data() + sizeof(header) + test.coefficientIndex * sizeof(float),
+                &test.coefficient, sizeof(test.coefficient));
+    expect(engine.setAsset(asset, &error), type + " measurement asset stages");
+    std::uint64_t revision = 0;
+    expect(engine.refreshPipelinePlan(revision, &error), type + " publishes asset delay");
+
+    std::array<float, kTestBlockFrames> left{};
+    std::array<float, kTestBlockFrames> right{};
+    float *channels[] = {left.data(), right.data()};
+    for (std::uint32_t block = 0;
+         block < 128 && (engine.assetState(logicalId, 0) & 0xffu) == ET_ASSET_STATE_PREPARING;
+         ++block) {
+      expect(engine.tryProcessBlock(channels, 2, kTestBlockFrames, 0.0, false),
+             type + " prepares the asset during processing");
+    }
+    expect((engine.assetState(logicalId, 0) & 0xffu) == ET_ASSET_STATE_ACTIVE &&
+               engine.pipelineLatency() == test.latency,
+           type + " measurement asset is active with its reported delay");
+
+    constexpr float radiansPerFrame = 2.0f * 3.14159265f * 580.0f / sampleRate;
+    std::array<float, testBlocks * kTestBlockFrames> input{};
+    for (std::size_t index = 0; index < input.size(); ++index) {
+      input[index] = 0.2f * std::sin(static_cast<float>(index) * radiansPerFrame);
+    }
+    float maximumError = 0.0f;
+    float correction = 0.0f;
+    for (std::size_t start = 0; start < input.size(); start += kTestBlockFrames) {
+      std::copy_n(input.data() + start, kTestBlockFrames, left.data());
+      right = left;
+      expect(engine.tryProcessBlock(channels, 2, kTestBlockFrames, 0.0, false),
+             type + " processes the measurement correction");
+      for (std::size_t index = 0; index < kTestBlockFrames; ++index) {
+        const auto frame = start + index;
+        const auto dry = frame < test.latency ? 0.0f : input[frame - test.latency];
+        const auto expectedRight = headphone ? dry * 0.5f : dry;
+        maximumError = std::max(maximumError, std::abs(right[index] - expectedRight));
+        if (headphone) {
+          maximumError = std::max(maximumError, std::abs(left[index] - expectedRight));
+        }
+        correction = std::max(correction, std::abs(left[index] - dry));
+      }
+    }
+    expect(maximumError < 2e-4f && correction > 1e-4f,
+           type + " changes the signal and preserves expected channel alignment (error " +
+               std::to_string(maximumError) + ", correction " + std::to_string(correction) + ")");
+  }
+}
+
 void testRuntimeLatencyAndTelemetryPublication() {
   EngineHost engine;
   std::string error;
@@ -1723,6 +1827,7 @@ int main() {
     testEngineHost();
     testContextualBypassPreservesCrossBusRouting();
     testEngineAssetTransferAndReplay();
+    testMeasurementCorrectionAssets();
     testRuntimeLatencyAndTelemetryPublication();
     testMasterBypassLatencyAlignment();
     std::cout << "All EffeTune VST unit tests passed\n";

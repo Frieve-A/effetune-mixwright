@@ -153,21 +153,28 @@ note ranges, Mixwright reuses their note analysis where routing and timing allow
 Changing the input, note range or an intervening audio effect restores independent
 SFZ analysis.
 
-## Room EQ Measurements
+## Measurement-Based Correction
 
 Electron and VST WebViews intentionally keep separate browser-storage profiles and origins.
 To reuse a measurement, export the original, uncorrected measurement as JSON from EffeTune,
 open Room EQ in EffeTune Mixwright, and choose **Import...** beside the measurement list.
-The imported copy receives a new local identifier and remains available to other Room EQ
-instances in the same VST WebView profile.
-Select an imported measurement and choose **Delete** to remove that local copy and its stored
-impulse responses after confirmation. Room EQ instances that reference the selected copy switch
-to **No measurement** and aligned bypass before the local data is removed.
+The imported copy receives a new local identifier and stays available in the same VST WebView
+profile. Select it and choose **Delete** to remove the local copy and its stored impulse responses
+after confirmation. Effects that reference the deleted copy in the current A/B pipelines clear
+the selection and return to bypass.
 
 Enable **Include impulse responses in measurement JSON exports** before exporting when Room EQ's
 phase-correction mode needs impulse-response data. Minimum- and linear-phase magnitude correction
 can use exports without impulse responses. Import is limited to explicitly selected JSON files of
 at most 128 MB.
+
+For **Distortion Correction**, perform or recheck the speaker distortion measurement in the
+EffeTune desktop app and export the result as JSON. In Mixwright, add Distortion Correction and
+choose **Import...** beside its measurement list. The effect selects the imported speaker model.
+
+For **Headphone EQ**, search the official AutoEQ catalog, paste an official AutoEQ link, or use
+**Load Measurement** and **Load Target** to open CSV or text files. To use a measurement from
+another site, download the file first and open it with **Load Measurement**.
 
 ## Headless Processing
 

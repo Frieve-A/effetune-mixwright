@@ -34,6 +34,8 @@ list(APPEND effetune_ui_source_files
   "${EFFETUNE_UPSTREAM_SOURCE_DIR}/effetune.html"
   "${EFFETUNE_UPSTREAM_SOURCE_DIR}/features/measurement/dataStorage.js"
   "${EFFETUNE_UPSTREAM_SOURCE_DIR}/features/measurement/measurement-model.js"
+  "${EFFETUNE_UPSTREAM_SOURCE_DIR}/features/measurement/speaker-distortion-chart.js"
+  "${EFFETUNE_UPSTREAM_SOURCE_DIR}/features/measurement/speaker-distortion-figures.js"
   "${EFFETUNE_UPSTREAM_SOURCE_DIR}/features/measurement/audio-utils/channel-selection.js"
   "${EFFETUNE_UPSTREAM_SOURCE_DIR}/features/measurement/audio-utils/output-routing.js")
 add_custom_command(

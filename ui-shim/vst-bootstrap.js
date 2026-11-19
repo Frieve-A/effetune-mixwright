@@ -506,42 +506,47 @@
     }
     return measurementStoragePromise;
   };
-  const roomEqPlugins = () => {
+  const isDistortionCorrection = plugin =>
+    !!plugin && plugin.constructor === window.SpeakerDistortionCorrectionPlugin;
+  const measurementIdFor = plugin => isDistortionCorrection(plugin) ? plugin.ms : plugin?.measurementId;
+  const measurementSelect = 'select[id^="room-eq-measurement-"], select[id^="sdc-measurement-"]';
+  const measurementPlugins = () => {
     const audio = window.audioManager;
     return [...new Set([...(audio?.pipelineA || []), ...(audio?.pipelineB || [])])]
-      .filter(plugin => plugin?.constructor === window.RoomEqPlugin);
+      .filter(plugin => plugin && (plugin.constructor === window.RoomEqPlugin || isDistortionCorrection(plugin)));
   };
-  const roomEqPluginFor = select => {
-    const pluginId = Number(select?.id?.slice('room-eq-measurement-'.length));
-    return roomEqPlugins().find(plugin => plugin.id === pluginId) || null;
+  const measurementPluginFor = select => {
+    const pluginId = Number(select.id.slice(select.id.lastIndexOf('-') + 1));
+    return measurementPlugins().find(plugin => plugin.id === pluginId) || null;
   };
   const updateImportedDeleteButtons = () => {
     for (const row of document.querySelectorAll('.room-eq-measurement-row')) {
       const button = row.querySelector('.vst-measurement-delete');
-      const select = row.querySelector('select[id^="room-eq-measurement-"]');
+      const select = row.querySelector(measurementSelect);
       if (!button || !select) continue;
-      const plugin = roomEqPluginFor(select);
       button.disabled = true;
-      const measurementId = plugin?.measurementId;
+      const measurementId = measurementIdFor(measurementPluginFor(select));
       if (!measurementId) continue;
       void getMeasurementStorage().then(storage => {
-        if (button.isConnected && roomEqPluginFor(select)?.measurementId === measurementId) {
+        if (button.isConnected && measurementIdFor(measurementPluginFor(select)) === measurementId) {
           button.disabled = storage.getMeasurementById(measurementId)?.imported !== true;
         }
       }).catch(() => {});
     }
   };
+  const refreshMeasurementList = plugin =>
+    isDistortionCorrection(plugin) ? plugin._refresh() : plugin._refreshMeasurements(false);
   const refreshImportedMeasurement = async (measurementId, targetPlugin, storage) => {
-    const plugins = roomEqPlugins();
-    await Promise.all(plugins.map(plugin => plugin._refreshMeasurements(false)));
+    const plugins = measurementPlugins();
+    await Promise.all(plugins.map(refreshMeasurementList));
     if (targetPlugin && plugins.includes(targetPlugin)) {
       const measurement = storage.getMeasurementById(measurementId);
-      targetPlugin.setParameters({
-        ms: measurementId,
-        mn: measurement?.name || 'Measurement',
-        rp: 0
-      });
-      await targetPlugin._renderMeasurement();
+      if (isDistortionCorrection(targetPlugin)) {
+        targetPlugin.setParameters(targetPlugin._selectionParameters(measurement));
+      } else {
+        targetPlugin.setParameters({ ms: measurementId, mn: measurement.name, rp: 0 });
+        await targetPlugin._renderMeasurement();
+      }
     }
     updateImportedDeleteButtons();
   };
@@ -554,7 +559,13 @@
     const measurementId = await storage.importMeasurementFromJSON(jsonText, measurement => {
       if (measurement.effectPipeline !== undefined) {
         throw new Error(translatedText('roomEq.import.corrected',
-          'Room EQ needs an uncorrected measurement. Export the original measurement from the desktop app and try again.'));
+          'Export the original measurement from the desktop app and try again.'));
+      }
+      if (isDistortionCorrection(targetPlugin) && !measurement.speakerModel) {
+        throw new Error('Export a speaker distortion measurement from the desktop app and try again.');
+      }
+      if (targetPlugin && !isDistortionCorrection(targetPlugin) && !measurement.points.length) {
+        throw new Error('Export a frequency response measurement from the desktop app and try again.');
       }
     });
     if (!measurementId) {
@@ -612,9 +623,13 @@
     cancel.focus();
   });
   const clearDeletedMeasurementReferences = async measurementId => {
-    const plugins = roomEqPlugins();
+    const plugins = measurementPlugins();
     const referencingPlugins = [];
     for (const plugin of plugins) {
+      if (isDistortionCorrection(plugin)) {
+        if (plugin.ms === measurementId) plugin.setParameters({ ms: '', mn: '', mr: 0 });
+        continue;
+      }
       const parameters = {};
       if (plugin.measurementId === measurementId) {
         parameters.ms = '';
@@ -634,7 +649,7 @@
     return plugins;
   };
   const deleteImportedMeasurement = async targetPlugin => {
-    const measurementId = targetPlugin?.measurementId;
+    const measurementId = measurementIdFor(targetPlugin);
     if (!measurementId) return false;
     const storage = await getMeasurementStorage();
     const measurement = storage.getMeasurementById(measurementId);
@@ -642,12 +657,12 @@
       throw new Error('Only measurements imported into this plug-in can be deleted here.');
     }
     if (!await confirmImportedMeasurementDeletion(measurement)) return false;
-    const plugins = await clearDeletedMeasurementReferences(measurementId);
     if (!await storage.deleteMeasurement(measurementId)) {
       throw new Error(translatedText(
         'roomEq.delete.error', 'The imported measurement could not be deleted.'));
     }
-    await Promise.all(plugins.map(plugin => plugin._refreshMeasurements(false)));
+    const plugins = await clearDeletedMeasurementReferences(measurementId);
+    await Promise.all(plugins.map(refreshMeasurementList));
     updateImportedDeleteButtons();
     return true;
   };
@@ -658,13 +673,13 @@
     importText: importMeasurementText
   };
 
-  const enhanceRoomEqMeasurementRows = root => {
+  const enhanceMeasurementRows = root => {
     const rows = [];
     if (root?.matches?.('.room-eq-measurement-row')) rows.push(root);
     rows.push(...(root?.querySelectorAll?.('.room-eq-measurement-row') || []));
     for (const row of rows) {
       if (row.querySelector('.vst-measurement-import')) continue;
-      const select = row.querySelector('select[id^="room-eq-measurement-"]');
+      const select = row.querySelector(measurementSelect);
       if (!select) continue;
       const input = document.createElement('input');
       input.type = 'file';
@@ -680,7 +695,7 @@
         const file = input.files?.[0];
         input.value = '';
         if (!file) return;
-        const targetPlugin = roomEqPluginFor(select);
+        const targetPlugin = measurementPluginFor(select);
         button.disabled = true;
         void importMeasurementFile(file, targetPlugin)
           .catch(error => {
@@ -701,7 +716,7 @@
       deleteButton.disabled = true;
       deleteButton.addEventListener('click', () => {
         deleteButton.disabled = true;
-        void deleteImportedMeasurement(roomEqPluginFor(select))
+        void deleteImportedMeasurement(measurementPluginFor(select))
           .catch(error => {
             console.error('Measurement deletion failed:', error);
             window.uiManager?.setError?.(
@@ -717,11 +732,11 @@
 
   document.addEventListener('DOMContentLoaded', () => {
     document.body.classList.remove('view-library');
-    enhanceRoomEqMeasurementRows(document);
+    enhanceMeasurementRows(document);
     new MutationObserver(records => {
       for (const record of records) {
         for (const node of record.addedNodes) {
-          if (node.nodeType === Node.ELEMENT_NODE) enhanceRoomEqMeasurementRows(node);
+          if (node.nodeType === Node.ELEMENT_NODE) enhanceMeasurementRows(node);
         }
       }
     }).observe(document.body, { childList: true, subtree: true });

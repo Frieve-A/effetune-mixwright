@@ -1443,6 +1443,13 @@ test('Room EQ imports the original measurement and rejects corrected exports bef
   assert.equal(plugin.measurementId, id);
   await assert.rejects(importText(JSON.stringify({ ...measurement, name: 'Corrected',
     effectPipeline: { pluginNames: ['Room EQ'] } }), plugin), /Export the original measurement/);
+  await assert.rejects(importText(JSON.stringify({ name: 'Speaker model', points: [] }), plugin),
+    /frequency response measurement/);
+  window.SpeakerDistortionCorrectionPlugin = class {};
+  const distortion = new window.SpeakerDistortionCorrectionPlugin();
+  await assert.rejects(importText(JSON.stringify(measurement), distortion), /speaker distortion measurement/);
+  await assert.rejects(importText(JSON.stringify({ name: 'Damaged model', points: [], speakerModel: {} }), distortion),
+    /speaker distortion measurement/);
   assert.equal(plugin.measurementId, id);
   assert.deepEqual(stored.map(entry => entry.name), ['Original']);
 });

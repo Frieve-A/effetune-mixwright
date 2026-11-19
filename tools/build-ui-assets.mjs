@@ -76,7 +76,7 @@ const vstLocaleAdditions = {
   en: {
     'roomEq.action.import': 'Import\u2026',
     'roomEq.import.corrected':
-      'Room EQ needs an uncorrected measurement. Export the original measurement from the desktop app and try again.',
+      'Export the original measurement from the desktop app and try again.',
     'roomEq.delete.title': 'Delete imported measurement',
     'roomEq.delete.confirm':
       'Delete imported measurement \u201c{name}\u201d? This cannot be undone.',
@@ -85,7 +85,7 @@ const vstLocaleAdditions = {
   ja: {
     'roomEq.action.import': '測定をインポート\u2026',
     'roomEq.import.corrected':
-      'Room EQには補正前の測定が必要です。デスクトップアプリで元の測定をエクスポートしてから、もう一度お試しください。',
+      '補正前の測定が必要です。デスクトップアプリで元の測定をエクスポートしてから、もう一度お試しください。',
     'roomEq.delete.title': 'インポートした測定を削除',
     'roomEq.delete.confirm':
       'インポートした測定「{name}」を削除しますか？この操作は元に戻せません。',
@@ -147,19 +147,20 @@ await cp(path.join(projectRoot, 'ui-shim', 'vst-audio-manager.js'),
 await cp(path.join(projectRoot, 'ui-shim', 'vst-space-key.js'),
          path.join(output, 'vst-space-key.js'));
 await mkdir(path.join(output, 'features', 'measurement'), { recursive: true });
-// Let Room EQ check the parsed export before storage assigns an ID or writes it.
+// Let the receiving effect check the decoded export before it is stored.
 const measurementStorage = await readText(path.join(source, 'features', 'measurement', 'dataStorage.js'));
 const measurementImport = '    async importMeasurementFromJSON(jsonString) {';
-const measurementImportId = '        // Give the imported measurement a new ID.';
+const decodedMeasurement = '        data = withImportedSpeakerModel(data);';
 if (measurementStorage.split(measurementImport).length !== 2 ||
-    measurementStorage.split(measurementImportId).length !== 2) {
+    measurementStorage.split(decodedMeasurement).length !== 2) {
   throw new Error('Unable to locate the upstream measurement import validation');
 }
 await writeFile(path.join(output, 'features', 'measurement', 'dataStorage.js'), measurementStorage
   .replace(measurementImport, '    async importMeasurementFromJSON(jsonString, validateMeasurement) {')
-  .replace(measurementImportId, `        validateMeasurement?.(data);\n\n${measurementImportId}`), 'utf8');
-await cp(path.join(source, 'features', 'measurement', 'measurement-model.js'),
-         path.join(output, 'features', 'measurement', 'measurement-model.js'));
+  .replace(decodedMeasurement, `${decodedMeasurement}\n        validateMeasurement?.(data);`), 'utf8');
+for (const entry of ['measurement-model.js', 'speaker-distortion-chart.js', 'speaker-distortion-figures.js']) {
+  await cp(path.join(source, 'features', 'measurement', entry), path.join(output, 'features', 'measurement', entry));
+}
 await mkdir(path.join(output, 'features', 'measurement', 'audio-utils'), { recursive: true });
 for (const entry of ['channel-selection.js', 'output-routing.js']) {
   await cp(path.join(source, 'features', 'measurement', 'audio-utils', entry),
@@ -184,7 +185,7 @@ html = applyProductBranding(html)
   .replace('</head>', '    <link rel="stylesheet" href="css/effetune-library.css">\n</head>')
   .replace(/\s*<link rel="manifest" href="manifest\.json">/g, '')
   .replace(/<meta http-equiv="Content-Security-Policy"[^>]*>/,
-    `<meta http-equiv="Content-Security-Policy" content="default-src 'self' blob: data:; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:; connect-src 'self' blob:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline' blob:;">`)
+    `<meta http-equiv="Content-Security-Policy" content="default-src 'self' blob: data:; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:; connect-src 'self' blob: https://raw.githubusercontent.com/jaakkopasanen/AutoEq/; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline' blob:;">`)
   .replace(/\s*<script>\s*\(function\(\) \{\s*var measurementId =[\s\S]*?<\/script>/, '')
   .replace(/\s*<script>\s*\/\/ Apply the Web startup view preference[\s\S]*?<\/script>/, '')
   .replace(/\s*<button class="pipeline-menu-item" id="doubleBlindTestButton"[^>]*>[\s\S]*?<\/button>/, '')
@@ -242,14 +243,36 @@ app = app.replace(startupDspPrefetch, '');
 // The standalone measurement page and its pipeline handoff are not bundled.
 const saveMeasurementHandoff = /\/\/ A suspended or monitoring context[^\n]*\n\/\/ default wait[^\n]*\nconst MEASUREMENT_HANDOFF_ASSET_TIMEOUT_MS = \d+;\n\nasync function saveMeasurementPipelineHandoff\([^\n]*\) \{[\s\S]*?\n\}\n\n/;
 const configureMeasurementHandoff = /        this\.savePipelineHandoff = dependencies\.savePipelineHandoff \|\|\n[\s\S]*?\n            \)\);\n/;
-const measurementHandoffMethod = /    \/\/ Runs while the live pipeline is still intact\.[\s\S]*?\n    async handOffPipelineToMeasurement\(\) \{[\s\S]*?\n    \}\n\n/;
-const runMeasurementHandoff = /^ +await this\.handOffPipelineToMeasurement\(\);\n/gm;
+const measurementNavigation = /    async openFeaturePage\([^\n]*\) \{[\s\S]*?\n    async handOffPipelineToMeasurement\([^\n]*\) \{[\s\S]*?\n    \}\n/;
 if (!saveMeasurementHandoff.test(app) || !configureMeasurementHandoff.test(app) ||
-    !measurementHandoffMethod.test(app) || [...app.matchAll(runMeasurementHandoff)].length !== 2) {
+    !measurementNavigation.test(app)) {
   throw new Error('Unable to locate the standalone measurement pipeline handoff');
 }
 app = app.replace(saveMeasurementHandoff, '').replace(configureMeasurementHandoff, '')
-  .replace(measurementHandoffMethod, '').replace(runMeasurementHandoff, '');
+  .replace(measurementNavigation, `    openFeaturePage() {
+        this.uiManager.setError('Measure or check the speakers in the desktop app. Export the measurement as JSON and choose Import in Distortion Correction.', false);
+    }
+`);
+// The desktop measurement handoff can auto-adopt the next saved model.
+// Mixwright imports and selects the user's chosen file directly.
+const distortionPath = path.join(output, 'plugins', 'others', 'speaker_distortion_correction.js');
+const distortion = await readText(distortionPath);
+const requestTime = '            if (!this.ms) this.mr = Date.now();';
+if (distortion.split(requestTime).length !== 2) throw new Error('Unable to locate the distortion measurement handoff');
+await writeFile(distortionPath, distortion.replace(requestTime, ''), 'utf8');
+const headphonePath = path.join(output, 'plugins', 'eq', 'headphone_eq.js');
+const headphone = await readText(headphonePath);
+const loadHeadphoneUrl = '    const load = ++this._measurementLoad;';
+if (headphone.split(loadHeadphoneUrl).length !== 2) throw new Error('Unable to locate the Headphone EQ download');
+await writeFile(headphonePath, headphone
+  .replace('Search headphones (AutoEQ) or paste a URL', 'Search headphones or paste an AutoEQ link')
+  .replace('or paste a link to a measurement file', 'or paste an official AutoEQ link. For other sources, use Load Measurement')
+  .replace(loadHeadphoneUrl, `${loadHeadphoneUrl}
+    if (!url.startsWith('https://raw.githubusercontent.com/jaakkopasanen/AutoEq/')) {
+      this._setStatus('For measurements outside the AutoEQ project, download the file and choose Load Measurement.', 'error');
+      this._renderStatus();
+      return false;
+    }`), 'utf8');
 const spaceGuardImport = "import { installSpaceKeyGuard } from './utils/space-key-guard.js';";
 if (app.split(spaceGuardImport).length !== 2 || app.split('installSpaceKeyGuard();').length !== 2) {
   throw new Error('Unable to locate the upstream Space key guard installation');
@@ -1325,7 +1348,7 @@ const requiredPages = `    const required = [];
         required.push(Object.freeze({ sample, pageIndex }));
     const minimum = storage ? maximumPlan.minimumSlots : required.length + 1;`;
 const providerPreload = '        await provider.preload(required);';
-const providerReady = '    descriptor.materializeForContext = async (context, nextBudget, nextEstimate) => {';
+const providerReady = '    descriptor.materializeForContext = async function(context, nextBudget, nextEstimate) {';
 for (const pattern of [residentRanges, buildStreamedBank, requiredPages, providerPreload, providerReady]) {
   if (streamedBank.split(pattern).length !== 2) throw new Error('Unable to configure a fully resident native instrument');
 }

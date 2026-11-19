@@ -1422,7 +1422,7 @@ export class AudioManager extends BrowserAudioManager {
       .catch(error => console.error('[EffeTune Mixwright] SoundFont meters could not be updated', error));
   }
 
-  async sendSoundFontMixerAction(plugin, { type, channel, value, bank, program, controller }, reportAppliedFrame = false) {
+  async sendSoundFontMixerAction(plugin, { type, channel, value, bank, program, controller, xg }, reportAppliedFrame = false) {
     if (!this.getCurrentPipeline().includes(plugin) || !plugin.sf ||
         !Number.isInteger(channel) || channel < 0 || channel > 15) {
       throw new Error('The SoundFont channel is unavailable.');
@@ -1433,9 +1433,11 @@ export class AudioManager extends BrowserAudioManager {
     let payload;
     if ((type === 'mute' || type === 'solo') && typeof value === 'boolean') {
       payload = { ...target, kind: 'mix', action: (type === 'solo' ? 2 : 0) + Number(value) };
-    } else if (type === 'program' && byte(program) && (channel === 9 ? bank === 128 : byte(bank))) {
-      payload = { ...target, kind: 'channel', messages: [midi(0xb0, 0, channel === 9 ? 0 : bank),
-        midi(0xb0, 32), midi(0xc0, program)] };
+    } else if (type === 'program' && byte(program) && (bank === 128 || byte(bank))) {
+      const messages = bank === 128 ? [] :
+        [midi(0xb0, 0, xg === true ? 0 : bank), midi(0xb0, 32, xg === true ? bank : 0)];
+      messages.push(midi(0xc0, program));
+      payload = { ...target, kind: 'channel', messages };
     } else if (type === 'control' && [7, 10, 11, 91, 93].includes(controller) && byte(value)) {
       payload = { ...target, kind: 'channel', messages: [midi(0xb0, controller, value)] };
     } else throw new Error('The SoundFont channel control is invalid.');

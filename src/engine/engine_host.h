@@ -84,6 +84,8 @@ struct SoundFontMixerChannel {
 
 struct SoundFontMixerState {
   std::array<SoundFontMixerChannel, 16> channels{};
+  std::uint8_t system = ET_MIDI_SYSTEM_GM;
+  std::uint16_t drumParts = 1u << 9u;
   SoundFontMixerState() noexcept { channels[9].selectedBank = 128; }
 };
 
@@ -350,6 +352,7 @@ private:
     bool sampleAssetUnavailable = false;
     bool soundFont = false;
     bool midiRendering = false;
+    std::uint16_t drumParts = 1u << 9u;
     SoundFontMixerProjection *soundFontMixer = nullptr;
     AnalysisRole analysisRole = AnalysisRole::other;
     float minimumMidi = 0.0f;

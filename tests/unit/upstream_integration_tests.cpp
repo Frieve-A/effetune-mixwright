@@ -1000,7 +1000,7 @@ void testSoundFontMixerControlAcknowledgement(const PipelineState &pipeline,
     std::vector<std::uint8_t> packet(EngineHost::kDefaultTelemetryBytes);
     std::uint32_t dropped = 0;
     std::optional<std::uint64_t> mixerEndFrame;
-    expect(engine->readTelemetry(packet, dropped, nullptr, &mixerEndFrame) >= 2u * (16u + 584u) &&
+    expect(engine->readTelemetry(packet, dropped, nullptr, &mixerEndFrame) >= 2u * (16u + 588u) &&
            mixerEndFrame == applied.appliedFrame,
            "a packet with pre-edit mixer telemetry keeps its oldest boundary");
     for (int block = 0; block < 7; ++block) render();
@@ -1029,6 +1029,7 @@ void testSoundFontHostMidiAndReplay() {
   params.maxVoices = 64;
   params.sampleQuality = 1;
   params.previewMidi = -1;
+  params.respondGm = params.respondGs = params.respondXg = 1;
   RuntimePlugin player;
   player.logicalId = soundFontId;
   player.type = "SoundFontPlayerPlugin";
@@ -1128,8 +1129,8 @@ void testSoundFontHostMidiAndReplay() {
       const auto *header = packet.data() + offset;
       const auto size = read16(header + 12u);
       if (size > bytes - offset - 16u) break;
-      if (read16(header) == 35u && read16(header + 2u) == 2u &&
-          u32(header + 4u) == soundFontId && size == 584u) {
+      if (read16(header) == 35u && read16(header + 2u) == 3u &&
+          u32(header + 4u) == soundFontId && size == 588u) {
         const auto *mixer = header + 16u;
         voices = read16(mixer);
         heldNote = (mixer[8u + 16u + noteNumber / 8u] & (1u << (noteNumber % 8u))) != 0u;
@@ -1199,14 +1200,18 @@ void testSoundFontHostMidiAndReplay() {
   };
   for (int block = 0; block < 32; ++block) render();
   const std::array mixerEdits{
-      cc(0, 1), et_midi_event{0u, 0x02c0u, 0u, 0u, 0u, 0u},
+      et_midi_event{0u, 0u, ET_MIDI_SYSTEM_XG, ET_MIDI_SYSTEM_RESET, 0u, 0u},
+      et_midi_event{0u, 0x010100u, 0u, ET_MIDI_DRUM_MODE, 0u, 0u},
+      cc(32, 1), et_midi_event{0u, 0x02c0u, 0u, 0u, 0u, 0u},
       cc(0, 0), cc(32, 3), cc(7, 77), cc(10, 55), cc(11, 84), cc(91, 31), cc(93, 9)};
   render(mixerEdits);
   for (int block = 0; block < 8; ++block) render();
   const auto matchesMixer = [](const std::optional<SoundFontMixerState> &state) {
     if (!state) return false;
     const auto &row = state->channels[0];
-    return row.selectedBank == 1 && row.program == 2 && row.bankMsb == 0 && row.bankLsb == 3 &&
+    return state->system == ET_MIDI_SYSTEM_XG && state->drumParts == 0x202u &&
+           state->channels[1].selectedBank == 128u &&
+           row.selectedBank == 1 && row.program == 2 && row.bankMsb == 0 && row.bankLsb == 3 &&
            row.volume == 77 && row.pan == 55 && row.expression == 84 &&
            row.reverb == 31 && row.chorus == 9;
   };
@@ -1222,6 +1227,24 @@ void testSoundFontHostMidiAndReplay() {
   for (int block = 0; block < 8; ++block) render();
   expect(matchesMixer(engine->soundFontMixerState(soundFontId)),
          "restored mixer preserves active patch and pending bank independently");
+
+  params.midiChannelsOff = 1u << 4u;
+  player.packedParameters = packedFixture(params);
+  expect(engine->updateParameters(soundFontId, player.packedParameters, params.kHash),
+         "disable another MIDI channel while an XG drum part is assigned");
+  for (int block = 0; block < 8; ++block) render();
+  const auto resetParts = engine->soundFontMixerState(soundFontId);
+  expect(resetParts && resetParts->system == ET_MIDI_SYSTEM_GM && resetParts->drumParts == 0x200u &&
+         resetParts->channels[1].selectedBank != 128u,
+         "a channel-mask edit captures the kernel's reset to the default GM rhythm part");
+  engine->replaceSoundFontMixerStates({{soundFontId, *resetParts}});
+  expect(engine->prepare(rate, channels, frames, EngineHost::kDefaultTelemetryBytes, &error) &&
+         engine->rebuild(pipeline, {player, volume}, &error), "reload the mixer after a channel-mask edit");
+  for (int block = 0; block < 8; ++block) render();
+  const auto reloadedParts = engine->soundFontMixerState(soundFontId);
+  expect(reloadedParts && reloadedParts->drumParts == 0x200u &&
+         reloadedParts->channels[1].selectedBank != 128u,
+         "restoring the saved mixer keeps the former XG drum part melodic");
 }
 
 void testNoteAnalysisSharing() {

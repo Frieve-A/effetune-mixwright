@@ -54,6 +54,9 @@ namespace effetune::vst::plugin {
 
 class PluginProcessorTestAccess {
 public:
+  [[nodiscard]] static const auto &midiEvents(const EffeTuneProcessor &processor) {
+    return processor.midiEvents_;
+  }
   [[nodiscard]] static auto soundFontMixerState(const EffeTuneProcessor &processor,
                                                  const std::uint32_t id) {
     return processor.engine_.soundFontMixerState(id);
@@ -11828,6 +11831,7 @@ void testSoundFontMixerProjectState() {
   params.maxVoices = 256;
   params.automaticFallback = 1;
   params.previewMidi = -1;
+  params.respondGm = params.respondGs = params.respondXg = 1;
   std::array<float, Params::kFloatCount> packed{};
   std::memcpy(packed.data(), &params, sizeof(params));
   auto values = choc::value::createEmptyArray();
@@ -11852,13 +11856,21 @@ void testSoundFontMixerProjectState() {
   const auto restored = PluginProcessorTestAccess::soundFontMixerState(*processor, 1);
   expect(restored && restored->channels[0].program == 12 && restored->channels[0].volume == 87 &&
              restored->channels[0].bankMsb == 3 && restored->channels[0].selectedBank == 1 &&
-             restored->channels[9].selectedBank == 128,
+             restored->channels[9].selectedBank == 128 && restored->system == ET_MIDI_SYSTEM_GM &&
+             restored->drumParts == (1u << 9),
          "project restoration installs the saved mixer before a bank is loaded");
+  extras.setMember("soundFontMidiSystem", static_cast<int>(ET_MIDI_SYSTEM_XG));
+  extras.setMember("soundFontDrumParts", 3);
+  project.pipelineA.plugins.front().extraJson = choc::json::toString(extras);
+  load();
   ResizableMemoryIBStream saved;
   expect(processor->getState(&saved) == kResultOk, "save mixer while awaiting the bank");
   const auto savedJson = choc::json::parse(std::string_view(
       static_cast<const char *>(saved.getData()), saved.getCursor()));
-  expect(savedJson["pipelineA"][0]["soundFontMixerV1"][0][3].getWithDefault<int>(-1) == 87,
+  const auto savedPlugin = savedJson["pipelineA"][0];
+  expect(savedPlugin["soundFontMixerV1"][0][3].getWithDefault<int>(-1) == 87 &&
+             savedPlugin["soundFontMidiSystem"].getWithDefault<int>(0) == ET_MIDI_SYSTEM_XG &&
+             savedPlugin["soundFontDrumParts"].getWithDefault<int>(0) == 3,
          "saved host state retains the mixer while awaiting the bank");
 
   extras.setMember("soundFontMixerV1", choc::value::createEmptyArray());
@@ -11907,7 +11919,7 @@ void testInstrumentBusAndDefaultPipeline() {
   rig.data.inputs = nullptr;
   for (int32 channel = 0; channel < rig.data.outputs[0].numChannels; ++channel)
     std::fill_n(rig.data.outputs[0].channelBuffers32[channel], rig.data.numSamples, 1.0f);
-  EventList events(1);
+  EventList events(8);
   Event note{};
   note.type = Event::kNoteOnEvent;
   note.sampleOffset = 17;
@@ -11915,6 +11927,25 @@ void testInstrumentBusAndDefaultPipeline() {
   note.noteOn.velocity = 1.0f;
   note.noteOn.noteId = 9;
   expect(events.addEvent(note) == kResultOk, "queue a host note");
+  const auto addSysEx = [&](std::span<const uint8_t> packet, int32 offset) {
+    Event event{};
+    event.type = Event::kDataEvent;
+    event.sampleOffset = offset;
+    event.data = {static_cast<uint32>(packet.size()), DataEvent::kMidiSysEx, packet.data()};
+    expect(events.addEvent(event) == kResultOk, "queue a host SysEx packet");
+  };
+  constexpr uint8_t gm[]{0xf0, 0x7e, 0x7f, 0x09, 1, 0xf7};
+  constexpr uint8_t gs[]{0xf0, 0x41, 0x10, 0x42, 0x12, 0x40, 0, 0x7f, 0, 0x41, 0xf7};
+  constexpr uint8_t badChecksum[]{0xf0, 0x41, 0x10, 0x42, 0x12, 0x40, 0, 0x7f, 0, 0, 0xf7};
+  constexpr uint8_t gsPart[]{0xf0, 0x41, 0x10, 0x42, 0x12, 0x40, 0x11, 0x15, 2, 0x18, 0xf7};
+  constexpr uint8_t xg[]{0xf0, 0x43, 0x10, 0x4c, 0, 0, 0x7e, 0, 0xf7};
+  constexpr uint8_t xgPart[]{0xf0, 0x43, 0x10, 0x4c, 8, 3, 7, 1, 0xf7};
+  addSysEx(gm, 0);
+  addSysEx(gs, 2);
+  addSysEx(badChecksum, 3);
+  addSysEx(gsPart, 4);
+  addSysEx(xg, 17);
+  addSysEx(xgPart, 17);
   rig.data.inputEvents = &events;
   ParameterChanges controls(3);
   int32 index = 0;
@@ -11935,6 +11966,15 @@ void testInstrumentBusAndDefaultPipeline() {
   { effetune::allocation_guard::Scope guard; result = processor->process(rig.data); }
   expect(result == kResultOk && rig.data.outputs[0].silenceFlags == 3,
          "an unloaded instrument initializes the audio buffers without allocating");
+  const auto &nativeMidi = PluginProcessorTestAccess::midiEvents(*processor);
+  expect(nativeMidi[0].note_id == ET_MIDI_SYSTEM_GM && nativeMidi[0].flags == ET_MIDI_SYSTEM_RESET &&
+             nativeMidi[2].note_id == ET_MIDI_SYSTEM_GS && nativeMidi[2].flags == ET_MIDI_SYSTEM_RESET &&
+             nativeMidi[3].message == 0x020000 && nativeMidi[3].flags == ET_MIDI_DRUM_MODE &&
+             nativeMidi[4].note_id == ET_MIDI_SYSTEM_XG && nativeMidi[4].flags == ET_MIDI_SYSTEM_RESET &&
+             nativeMidi[5].message == 0x010300 && nativeMidi[5].flags == ET_MIDI_DRUM_MODE &&
+             nativeMidi[6].message == 0x0300b0 && nativeMidi[7].message == 0x0005c0 &&
+             nativeMidi[8].message == 0x7f3c90,
+         "host SysEx normalizes valid resets and part modes before co-timed bank, program and note events");
   const auto telemetry = choc::json::parse(processor->handleUiMessage(R"({"type":"telemetry/read"})"));
   const auto midiEvents = telemetry["midiEvents"];
   const auto hostTransport = telemetry["hostTransport"];

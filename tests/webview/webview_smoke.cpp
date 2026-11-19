@@ -419,6 +419,7 @@ LRESULT CALLBACK parentWindowProcedure(HWND window, const UINT message,
 }
 
 struct SmokeState {
+  std::filesystem::path distortionMeasurement;
   std::filesystem::path sfzFolder;
   std::filesystem::path sfzRegistry;
   std::unique_ptr<effetune::vst::SfzLibrary> sfzLibrary;
@@ -445,6 +446,16 @@ struct SmokeState {
 };
 
 [[nodiscard]] std::string responseFor(const std::string_view request, SmokeState &state) {
+  if (request.find("test/distortionMeasurement") != std::string_view::npos) {
+    if (state.distortionMeasurement.empty()) return R"({"ok":true})";
+    std::error_code error;
+    if (std::filesystem::file_size(state.distortionMeasurement, error) > 128u * 1024u * 1024u || error)
+      return R"({"ok":false,"error":"Invalid test measurement file"})";
+    std::ifstream file(state.distortionMeasurement, std::ios::binary);
+    if (!file) return R"({"ok":false,"error":"Cannot read test measurement file"})";
+    const std::string json{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+    return choc::json::toString(choc::json::create("ok", true, "text", json));
+  }
   if (request.find("sfz/") != std::string_view::npos) {
     const auto message = choc::json::parse(request);
     const auto type = message["type"].getWithDefault<std::string>({});
@@ -793,8 +804,9 @@ int main(const int argc, char **argv) {
   }
   const bool startupOnly = argc == 4 && std::string_view(argv[1]) == "--visualizer-startup-only" &&
       std::string_view(argv[2]) == "--assets";
-  if (argc != 1 && !startupOnly) {
-    std::cerr << "Usage: effetune_webview_smoke [--visualizer-startup-only --assets <directory>]\n";
+  const bool hasMeasurement = argc == 3 && std::string_view(argv[1]) == "--distortion-measurement";
+  if (argc != 1 && !startupOnly && !hasMeasurement) {
+    std::cerr << "Usage: effetune_webview_smoke [--distortion-measurement <file> | --visualizer-startup-only --assets <directory>]\n";
     return 1;
   }
   if (!startupOnly && !runNonPumpingOwnerWatchdog()) {
@@ -1036,6 +1048,7 @@ int main(const int argc, char **argv) {
   }
 
   SmokeState smokeState;
+  if (hasMeasurement) smokeState.distortionMeasurement = argv[2];
   smokeState.sfzFolder = webViewProfile.path() / "sfz-source";
   smokeState.sfzRegistry = webViewProfile.path() / "sfz-registry.json";
   std::error_code sfzError;
@@ -1800,6 +1813,65 @@ int main(const int argc, char **argv) {
                 const deletedOption = document.querySelector(
                   `#room-eq-measurement-${plugin.id} option[value="${measurementId}"]`
                 );
+                const waitUntil = async (predicate, failure) => {
+                  const deadline = performance.now() + 45000;
+                  while (!predicate()) {
+                    if (performance.now() > deadline) throw new Error(failure);
+                    await new Promise(resolve => setTimeout(resolve, 20));
+                  }
+                };
+                const pipeline = window.audioManager.getCurrentPipeline();
+                const inactiveKey = pipeline === window.audioManager.pipelineA ? 'pipelineB' : 'pipelineA';
+                const previousInactive = window.audioManager[inactiveKey];
+                const headphone = window.pluginManager.createPlugin('Headphone EQ');
+                const speaker = window.pluginManager.createPlugin('Distortion Correction');
+                const otherSpeaker = window.pluginManager.createPlugin('Distortion Correction');
+                pipeline.push(headphone, speaker);
+                window.audioManager[inactiveKey] = [...(previousInactive || []), otherSpeaker];
+                try {
+                  window.uiManager.pipelineManager.updatePipelineUI(true);
+                  headphone.setParameters({ tp: 8192, pm: 'lin', lt: '256' });
+                  await headphone._loadFile(new File(['20 0\n200 6\n1000 0\n20000 -4'], 'headphone.txt'), 'measurement');
+                  await headphone._loadFile(new File(['20 0\n20000 0'], 'target.txt'), 'target');
+                  await waitUntil(() => headphone._lastDesign?.response && headphone.getWasmAssets().get(0)?.headBlock === 256,
+                    'Headphone EQ did not design a correction from the imported curves');
+                  const fir = headphone.getWasmAssets().get(0);
+                  const taps = new Float32Array(fir.payload, 32);
+                  if (taps.length !== 8192 || !taps.every(Number.isFinite) ||
+                      !taps.some((value, i) => i !== 4096 && Math.abs(value) > 0.001) ||
+                      headphone._packedParameters().fd !== 4096) throw new Error('Incorrect Headphone EQ filter or delay');
+
+                  const select = document.getElementById(`sdc-measurement-${speaker.id}`);
+                  const row = select?.parentElement;
+                  if (!row?.querySelector('.vst-measurement-import')) throw new Error('No distortion measurement import control');
+                  const { text } = await window.__effetuneHostCall('test/distortionMeasurement');
+                  if (text) {
+                    const id = await importer.importFile(new File([text], 'speaker.json'), speaker);
+                    await waitUntil(() => speaker.ms === id && speaker.getWasmAssets().has(0) && select.value === id,
+                      'Distortion Correction did not stage the selected measurement');
+                    const length = speaker.fl.toLowerCase();
+                    const channel = speaker._model.channels.find(entry => entry.on[length] && entry.weights[length]);
+                    const { payload } = speaker.getWasmAssets().get(0);
+                    const [, channels, frames] = new Uint32Array(payload, 0, 3);
+                    const weights = new Float32Array(payload, 32);
+                    if (channels !== 16 || !channel || !channel.weights[length].some(value => value !== 0) ||
+                        !channel.weights[length].every((value, i) => weights[channel.index * frames + i] === value)) {
+                      throw new Error('The staged distortion coefficients do not match the exported model');
+                    }
+                    otherSpeaker.setParameters({ ms: id, mn: 'Second pipeline' });
+                    const deleting = importer.deleteImported(speaker);
+                    await waitUntil(() => document.querySelector('.vst-measurement-delete-confirm'),
+                      'No distortion measurement delete confirmation');
+                    document.querySelector('.vst-measurement-delete-confirm').click();
+                    if (!await deleting || speaker.ms || otherSpeaker.ms || speaker.getWasmAssets().has(0))
+                      throw new Error('Deleted distortion correction remains in a pipeline');
+                  }
+                } finally {
+                  pipeline.splice(pipeline.indexOf(headphone), 2);
+                  window.audioManager[inactiveKey] = previousInactive;
+                  for (const effect of [headphone, speaker, otherSpeaker]) effect.cleanup();
+                  window.uiManager.pipelineManager.updatePipelineUI(true);
+                }
                 window.__vstMeasurementImportReady = importedUiReady && confirmationReady &&
                   measurementDeleted && measurementSelect?.value === '' && !deletedOption;
                 window.__vstMeasurementImportDiagnostics = {

@@ -49,10 +49,13 @@ struct EngineHost::PreparedAssetUpdate::Storage {
 struct EngineHost::SoundFontMixerProjection {
   std::atomic<std::uint64_t> sequence{0};
   std::array<std::atomic<std::uint64_t>, 16> rows{};
+  std::atomic<std::uint32_t> systemAndParts{0};
 
   void publish(const SoundFontMixerState &state) noexcept {
     static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
     sequence.fetch_add(1u, std::memory_order_acq_rel);
+    systemAndParts.store((std::uint32_t{state.drumParts} << 8u) | state.system,
+                         std::memory_order_release);
     for (std::size_t index = 0; index < rows.size(); ++index) {
       const auto &row = state.channels[index];
       const std::array values{row.bankMsb, row.bankLsb, row.program, row.volume,
@@ -84,6 +87,9 @@ struct EngineHost::SoundFontMixerProjection {
 private:
   [[nodiscard]] SoundFontMixerState readRows() const noexcept {
     SoundFontMixerState result;
+    const auto settings = systemAndParts.load(std::memory_order_acquire);
+    result.system = static_cast<std::uint8_t>(settings & 0xffu);
+    result.drumParts = static_cast<std::uint16_t>(settings >> 8u);
     for (std::size_t index = 0; index < rows.size(); ++index) {
       const auto packed = rows[index].load(std::memory_order_acquire);
       const auto field = [packed](unsigned bit) {
@@ -1481,18 +1487,28 @@ void EngineHost::restoreSoundFontMixerUnlocked(InstanceEntry &entry) noexcept {
   if (engine_->setInstanceMidiEvents(entry.instance, nullptr, 0u, generation, ET_MIDI_RETIME) != ET_OK)
     return;
 
-  std::array<et_midi_event, 16u * 10u> events{};
+  std::array<et_midi_event, 1u + 16u * 11u> events{};
   std::uint32_t count = 0;
+  events[count++] = {0u, 0u, state->system, ET_MIDI_SYSTEM_RESET, 0u, 0u};
+  const bool xg = state->system == ET_MIDI_SYSTEM_XG;
   for (std::uint32_t channel = 0; channel < state->channels.size(); ++channel) {
     const auto &row = state->channels[channel];
-    const auto percussion = row.selectedBank == 128u;
-    events[count++] = {0u, (channel << 8u) | (percussion ? 0x10000u : 0u), 0u,
+    const bool drumPart = ((state->drumParts >> channel) & 1u) != 0;
+    events[count++] = {0u, (channel << 8u) | (drumPart ? 0x10000u : 0u), 0u,
                        ET_MIDI_DRUM_MODE, 0u, 0u};
     const auto cc = [&](const std::uint32_t controller, const std::uint32_t value) {
       events[count++] = {0u, 0xb0u | channel | (controller << 8u) | (value << 16u), 0u,
                          ET_MIDI_HYDRATE_CHANNEL_ONLY, 0u, 0u};
     };
-    cc(0, percussion ? row.bankMsb : row.selectedBank);
+    if (xg) {
+      // An XG bank can select percussion even on a melodic part. Replaying
+      // it as a permanent drum part would prevent a later melodic patch.
+      const bool drumBank = row.selectedBank == 128u;
+      cc(0, drumBank && (!drumPart || row.bankMsb >= 126u) ? 127u : 0u);
+      cc(32, drumBank ? row.bankLsb : row.selectedBank);
+    } else {
+      cc(0, drumPart ? row.bankMsb : row.selectedBank);
+    }
     events[count++] = {0u, 0xc0u | channel | (std::uint32_t{row.program} << 8u), 0u,
                        ET_MIDI_HYDRATE_CHANNEL_ONLY, 0u, 0u};
     // Pending Bank Select can differ from the bank that the program selected.
@@ -1504,8 +1520,9 @@ void EngineHost::restoreSoundFontMixerUnlocked(InstanceEntry &entry) noexcept {
     cc(91, row.reverb);
     cc(93, row.chorus);
   }
-  (void)engine_->setInstanceMidiEvents(entry.instance, events.data(), count, generation,
-                                       ET_MIDI_HYDRATE_CHANNEL_STATE);
+  if (engine_->setInstanceMidiEvents(entry.instance, events.data(), count, generation,
+                                    ET_MIDI_HYDRATE_CHANNEL_STATE) == ET_OK)
+    entry.drumParts = state->drumParts;
 }
 
 void EngineHost::resetSoundFontInputUnlocked(InstanceEntry &entry) noexcept {
@@ -1542,6 +1559,16 @@ void EngineHost::stageMidiUnlocked(const std::span<const et_midi_event> events,
             generation == 0u ? static_cast<std::uint32_t>(ET_MIDI_RETIME) : 0u) != ET_OK) {
       recordProcessFailure(ProcessError::midiEventsRejected);
       continue;
+    }
+    // Telemetry exposes effective percussion, which includes XG Bank Select.
+    // Remember the independent SysEx part designation for project restoration.
+    for (const auto &event : events) {
+      if (event.flags == ET_MIDI_SYSTEM_RESET) entry->drumParts = 1u << 9u;
+      if (event.flags == ET_MIDI_DRUM_MODE) {
+        const auto bit = 1u << ((event.message >> 8u) & 15u);
+        entry->drumParts = static_cast<std::uint16_t>(
+            (event.message >> 16u) ? entry->drumParts | bit : entry->drumParts & ~bit);
+      }
     }
     if (engine_->setInstanceMidiClock(instance, engine_->instanceMidiClock(instance),
                                      attached, ET_MIDI_CLOCK_RUNNING) == ET_OK)
@@ -2125,7 +2152,7 @@ bool EngineHost::updateSoundFontMixerTelemetryUnlocked(
     const auto frameBytes = (16u + size + 3u) & ~3u;
     if (frameBytes > bytes.size() - offset) break;
     offset += frameBytes;
-    if (readUint16(header) != 35u || readUint16(header + 2u) != 2u || size != 584u) continue;
+    if (readUint16(header) != 35u || readUint16(header + 2u) != 3u || size != 588u) continue;
     const auto found = soundFontMixerTaps_.find(readUint32(header + 4u));
     if (found == soundFontMixerTaps_.end()) continue;
     hasMixerFrame = true;
@@ -2136,15 +2163,23 @@ bool EngineHost::updateSoundFontMixerTelemetryUnlocked(
         (engine_->instanceAssetState(entry.instance, 0) & 0xffu) != ET_ASSET_STATE_ACTIVE)
       continue;
     SoundFontMixerState mixer;
+    mixer.system = header[16u + 584u];
+    mixer.drumParts = 0;
     for (std::size_t channel = 0; channel < mixer.channels.size(); ++channel) {
       const auto *row = header + 16u + 8u + 32u * channel;
       const auto bank = readUint16(row);
       const auto resolved = bank <= 128u && row[2] <= 127u;
+      const bool percussion = (row[8] & 4u) != 0;
+      if (percussion) mixer.drumParts |= static_cast<std::uint16_t>(1u << channel);
       mixer.channels[channel] = {row[14], row[15], resolved ? row[2] : row[9],
                                  row[3], row[4], row[5], row[6], row[7],
                                  static_cast<std::uint8_t>(
-                                     resolved ? bank : channel == 9u ? 128u : row[14])};
+                                     percussion ? 128u : resolved ? bank :
+                                     row[mixer.system == ET_MIDI_SYSTEM_XG ? 15 : 14])};
     }
+    // GM/GS report the part designation directly. XG can also reach the drum
+    // bank with CC0, without changing the part's designation.
+    if (mixer.system == ET_MIDI_SYSTEM_XG) mixer.drumParts &= entry.drumParts;
     entry.soundFontMixer->publish(mixer);
   }
   return hasMixerFrame;

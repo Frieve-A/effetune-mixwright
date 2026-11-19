@@ -80,6 +80,44 @@ void traceRestartComponent(IComponentHandler &handler, const int32 flags,
   }
 }
 
+// Normalize the complete GM/GS/XG packets understood by the upstream MIDI ABI.
+[[nodiscard]] bool translateSystemExclusive(const DataEvent &data, et_midi_event &result) noexcept {
+  const auto *b = data.bytes;
+  if (data.type != DataEvent::kMidiSysEx || !b ||
+      (data.size != 6 && data.size != 9 && data.size != 11) ||
+      b[0] != 0xf0 || b[data.size - 1] != 0xf7 ||
+      std::any_of(b + 1, b + data.size - 1, [](auto byte) { return byte >= 128; }))
+    return false;
+  const auto reset = [&](uint32 system) {
+    result.flags = ET_MIDI_SYSTEM_RESET;
+    result.note_id = system;
+    return true;
+  };
+  const auto partMode = [&](uint32 channel, uint32 mode) {
+    result.flags = ET_MIDI_DRUM_MODE;
+    result.message = (channel << 8u) | (mode << 16u);
+    return true;
+  };
+  if (data.size == 6 && b[1] == 0x7e && b[3] == 9 && (b[4] == 1 || b[4] == 3))
+    return reset(ET_MIDI_SYSTEM_GM);
+  if (b[2] < 0x10 || b[2] > 0x1f) return false;
+  if (data.size == 9 && b[1] == 0x43 && b[3] == 0x4c) {
+    if (b[4] == 0 && b[5] == 0 && b[6] == 0x7e && b[7] == 0)
+      return reset(ET_MIDI_SYSTEM_XG);
+    if (b[4] == 8 && b[5] < 16 && b[6] == 7 && b[7] <= 3)
+      return partMode(b[5], b[7]);
+  }
+  if (data.size == 11 && b[1] == 0x41 && b[3] == 0x42 && b[4] == 0x12 && b[5] == 0x40 &&
+      ((b[5] + b[6] + b[7] + b[8] + b[9]) & 127) == 0) {
+    if (b[6] == 0 && b[7] == 0x7f && b[8] == 0) return reset(ET_MIDI_SYSTEM_GS);
+    if (b[6] >= 0x10 && b[6] <= 0x1f && b[7] == 0x15 && b[8] <= 2) {
+      const auto part = b[6] & 15u;
+      return partMode(part == 0 ? 9u : part <= 9 ? part - 1u : part, b[8]);
+    }
+  }
+  return false;
+}
+
 [[nodiscard]] bool translateMidiEvent(const Event &event, et_midi_event &result) noexcept {
   uint32 status = 0;
   int16 channel = 0;
@@ -87,6 +125,10 @@ void traceRestartComponent(IComponentHandler &handler, const int32 flags,
   float value = 0.0f;
   int32 noteId = -1;
   switch (event.type) {
+  case Event::kDataEvent:
+    result = {};
+    result.offset_frames = static_cast<uint32>(event.sampleOffset);
+    return translateSystemExclusive(event.data, result);
   case Event::kNoteOnEvent:
     status = 0x90;
     channel = event.noteOn.channel;
@@ -121,7 +163,7 @@ void traceRestartComponent(IComponentHandler &handler, const int32 flags,
   return true;
 }
 [[nodiscard]] bool midiEventOrder(const et_midi_event &a, const et_midi_event &b) noexcept {
-  return std::tie(a.offset_frames, a.flags) < std::tie(b.offset_frames, b.flags);
+  return std::tie(a.offset_frames, a.render_frame_low) < std::tie(b.offset_frames, b.render_frame_low);
 }
 
 [[nodiscard]] bool hasChannelPointers(const AudioBusBuffers &bus) noexcept {
@@ -507,6 +549,24 @@ std::map<std::uint32_t, SoundFontMixerState> decodeSoundFontMixerStates(
                 static_cast<std::uint8_t>(number);
         }
       }
+      const auto system = extra["soundFontMidiSystem"];
+      const auto parts = extra["soundFontDrumParts"];
+      if (system.isVoid() && parts.isVoid()) {
+        // Legacy rows encoded the rhythm part as selected bank 128.
+        mixer.drumParts = 0;
+        for (std::size_t channel = 0; channel < mixer.channels.size(); ++channel)
+          if (mixer.channels[channel].selectedBank == 128u)
+            mixer.drumParts |= static_cast<std::uint16_t>(1u << channel);
+      } else {
+        const auto systemId = system.getWithDefault<std::int64_t>(-1);
+        const auto mask = parts.getWithDefault<std::int64_t>(-1);
+        valid = valid && system.isInt() && systemId >= ET_MIDI_SYSTEM_GM &&
+                systemId <= ET_MIDI_SYSTEM_XG && parts.isInt() && mask >= 0 && mask <= 0xffff;
+        if (valid) {
+          mixer.system = static_cast<std::uint8_t>(systemId);
+          mixer.drumParts = static_cast<std::uint16_t>(mask);
+        }
+      }
       if (valid) states.emplace(plugin.id, mixer);
     }
   }
@@ -528,6 +588,8 @@ void captureSoundFontMixerStates(PluginStateDocument &document, const EngineHost
         channels.addArrayElement(std::move(row));
       }
       extra.setMember(kSoundFontMixerStateKey, std::move(channels));
+      extra.setMember("soundFontMidiSystem", static_cast<std::int32_t>(mixer->system));
+      extra.setMember("soundFontDrumParts", static_cast<std::int32_t>(mixer->drumParts));
       plugin.extraJson = choc::json::toString(extra);
     }
   }
@@ -3052,6 +3114,8 @@ void EffeTuneProcessor::publishMidiTelemetry(std::span<const et_midi_event> even
   auto lost = dropped;
   const auto firstFrame = midiPosition_.load(std::memory_order_relaxed);
   for (const auto &event : events) {
+    // This telemetry stream carries short channel messages for the Visualizer.
+    if (event.flags == ET_MIDI_SYSTEM_RESET || event.flags == ET_MIDI_DRUM_MODE) continue;
     const auto time = firstFrame + static_cast<double>(event.offset_frames) / sampleRate;
     if (!midiTelemetry_.push({generation, time, event.message})) {
       ++lost;
@@ -3247,7 +3311,10 @@ tresult PLUGIN_API EffeTuneProcessor::process(ProcessData &data) {
       if (data.inputEvents->getEvent(index, event) == kResultOk && event.busIndex == 0 &&
           event.sampleOffset >= 0 && event.sampleOffset < data.numSamples &&
           translateMidiEvent(event, translated)) {
-        translated.flags = 2u * static_cast<uint32>(midiEvents_.size()) + static_cast<uint32>(index);
+        // Host input has no absolute render clock. Temporarily use its low word
+        // to order setup packets, mapped CCs, programs and notes at one offset.
+        const auto order = translated.flags ? 0u : 3u;
+        translated.render_frame_low = order * static_cast<uint32>(midiEvents_.size()) + static_cast<uint32>(index);
         midiEvents_[midiCount++] = translated;
       }
     }
@@ -3257,10 +3324,9 @@ tresult PLUGIN_API EffeTuneProcessor::process(ProcessData &data) {
   const auto appendMidiControl = [&](const uint32 offset, const uint32 message) noexcept {
     // At one offset, bank and other controllers must precede patch selection,
     // and both must precede a note starting there.
-    const auto programOrder = (message & 0xf0u) == 0xc0u ? midiEvents_.size() : 0u;
-    midiEvents_[midiCount] = {offset, message, 0u,
-                             static_cast<uint32>(programOrder + midiCount - firstControl),
-                             0u, 0u};
+    const auto order = (message & 0xf0u) == 0xc0u ? 2u : 1u;
+    midiEvents_[midiCount] = {offset, message, 0u, 0u,
+                             static_cast<uint32>(order * midiEvents_.size() + midiCount - firstControl), 0u};
     ++midiCount;
   };
   if (!flushOnly && pendingMidiFlush_) {
@@ -3667,7 +3733,7 @@ tresult PLUGIN_API EffeTuneProcessor::process(ProcessData &data) {
            midiEvents_[nextMidiEvent].offset_frames < slice.hostOffset + slice.hostFrames) {
       auto &event = midiEvents_[nextMidiEvent++];
       event.offset_frames = (event.offset_frames - slice.hostOffset) * oversamplingFactor;
-      event.flags = 0;
+      event.render_frame_low = 0;
     }
     et_host_transport transport{};
     if (const auto *context = data.processContext; context != nullptr) {

@@ -194,7 +194,8 @@ if(WIN32 AND TARGET effetune_ui_assets)
     EFFETUNE_WEBVIEW_ASSET_DIR="${CMAKE_BINARY_DIR}/webview-assets")
   target_compile_options(effetune_webview_smoke PRIVATE /W4 /WX /utf-8)
   add_dependencies(effetune_webview_smoke effetune_ui_assets)
-  add_test(NAME effetune_webview_smoke COMMAND effetune_webview_smoke)
+  add_test(NAME effetune_webview_smoke COMMAND "${EFFETUNE_NODE_EXECUTABLE}"
+    "${PROJECT_SOURCE_DIR}/tests/webview/run-smoke.mjs" "$<TARGET_FILE:effetune_webview_smoke>")
   # Local runs have taken under four minutes, including concurrent analysis.
   # Leave at least ten times that upper bound, including child-process cleanup.
   set_tests_properties(effetune_webview_smoke PROPERTIES TIMEOUT 2400)
